@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""急停 —— 薄封装 GR00T 原生急停（不自造策略）。
+"""急停 —— 封装 GR00T 原生急停行为。
 
 GR00T 原生急停行为（官方实现，见 gear_sonic_deploy）：
   command(stop=True) 或 键盘 O / 手柄 Select
@@ -13,7 +13,7 @@ GR00T 原生急停行为（官方实现，见 gear_sonic_deploy）：
                     (has_upper_body_control_=false, 上肢回到策略默认, 安全站立)
 
 下发通道(按序回退, 2026-10-09 修复 mujoco 环境缺 msgpack 导致的必失败):
-  1) 桥接守护进程 TCP 控制口(station 启动后常驻, 独占 ZMQ 5556)
+  1) 执行守护进程 TCP 控制口(station 启动后常驻, 独占 ZMQ 5556)
   2) GR00T venv 子进程直发官方 command(需部署未占用端口)
   3) 部署进程 stdin FIFO 注入官方 'O' 键
 
@@ -47,7 +47,7 @@ def _groot_py():
 
 
 def daemon_call(req, timeout=4.0):
-    """经桥接守护进程的本地 TCP 控制口发请求(一行应答)."""
+    """经执行守护进程的本地 TCP 控制口发请求(一行应答)."""
     port = int(_cfg("daemon_port", 5558))
     try:
         s = socket.create_connection(("127.0.0.1", port), timeout=timeout)

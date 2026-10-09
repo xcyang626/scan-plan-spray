@@ -103,7 +103,7 @@ class _GrootDaemon:
                 return True
             script = os.path.join(BASE, "scripts", "exec", "groot_daemon.py")
             if not os.path.exists(GROOT_PY) or not os.path.exists(script):
-                log(f"⚠ 桥接守护进程文件缺失: {script}")
+                log(f"⚠ 执行守护进程文件缺失: {script}")
                 return False
             try:
                 lg = open(os.path.join(BASE, "output", "groot_daemon.log"), "a")
@@ -115,14 +115,14 @@ class _GrootDaemon:
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=lg,
                     text=True, bufsize=1)
             except Exception as ex:
-                log(f"⚠ 桥接守护进程启动失败: {ex}")
+                log(f"⚠ 执行守护进程启动失败: {ex}")
                 return False
             threading.Thread(target=self._reader, daemon=True).start()
         r = self.call("ping", timeout=10)
         if r.get("ok"):
-            log("★ 桥接守护进程已就绪 (官方协议发布端, 独占 ZMQ 端口)")
+            log("★ 执行守护进程已就绪 (官方协议发布端, 独占 ZMQ 端口)")
             return True
-        log(f"⚠ 桥接守护进程无响应: {r.get('err')} (命令走子进程兜底)")
+        log(f"⚠ 执行守护进程无响应: {r.get('err')} (命令走子进程兜底)")
         return False
 
     def call(self, cmd, timeout=15.0, **kw):
@@ -174,7 +174,7 @@ def _daemon_event(m):
     elif ev == "stream_error":
         log(f"⚠ 动作流异常: {m.get('err')}")
     elif ev == "fatal":
-        log(f"⚠ 桥接守护进程致命错误: {m.get('err')}")
+        log(f"⚠ 执行守护进程致命错误: {m.get('err')}")
 
 
 def groot_command(kind):
@@ -374,7 +374,7 @@ def kill_deploy(soft_wait=8.0):
         t0 = time.time()
         while time.time() - t0 < wait and _robot_pid():
             time.sleep(0.5)
-    try:      # 清兜底路径遗留的发布器(官方脚本/旧桥接, 可能占 ZMQ 端口)
+    try:      # 清兜底路径遗留的发布器(官方脚本/旧发布端, 可能占 ZMQ 端口)
         subprocess.run(["pkill", "-f", "send_upper_body_trajector[y]"], timeout=5)
         subprocess.run(["pkill", "-f", "groot_bridge"], timeout=5)
     except Exception:

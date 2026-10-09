@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""GR00T 桥接守护进程 —— 常驻的官方协议发布端（唯一 ZMQ 5556 持有者）。
+"""GR00T 执行守护进程 —— 常驻的官方协议发布端（唯一 ZMQ 5556 持有者）。
 
 为什么需要它（连接/控制稳定性修复，2026-10-09）：
   旧实现里每次 命令/动作流 都新建 PUB socket 并 bind 5556，存在三个问题：
@@ -45,7 +45,7 @@ if GROOT_ROOT not in sys.path:
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-# 复用 GR00T 官方发送端模块（不自造协议）—— 本文件必须在 GR00T venv 下运行
+# GR00T 官方发送端模块 —— 本文件必须在 GR00T venv 下运行
 import groot_bridge as gb  # noqa: E402
 
 

@@ -22,10 +22,12 @@
 
 同一个任务——**让机器人在壁面上自动走线 / 喷涂**——的两条完整技术线：
 
-- **人形机器人线（宇树 G1）**：舱室点云配准 → 喷涂工位与站位点规划 → 等宽之字形轨迹 + 逐点 IK → 网页工作站 → GR00T 全身控制执行，MuJoCo 仿真与实机一键切换；
-- **机械臂线（OpenArm 七轴）**：零点标定 → 仿真 → 真机，MPC / 强化学习 / ILC 三层推进，把一次 36 路点走线从 ~300 s 压到 **143.6 s**，全程零急停。
+- **人形机器人线（宇树 G1）**：舱室点云配准 → 喷涂工位与站位点规划 → 等宽之字形轨迹 + 逐点 IK → 网页工作站 → 全身控制执行（策略基于 NVIDIA **GEAR-SONIC**），MuJoCo 仿真与实机一键切换；
+- **机械臂线（基于 OpenArm v1 的七轴臂）**：零点标定 → 仿真 → 真机，MPC / 强化学习 / ILC 三层推进，把一次 36 路点走线从 ~300 s 压到 **143.6 s**，全程零急停。
 
 四个模块相互独立、均可单独运行；其中 `g1-wall-spray` 的点云输入就是 `pointcloud-registration` 的输出，工作区计算方法承自 `station-planning`。
+
+本仓库是以上工作的归档记录：每个模块都留下可运行的代码、实测数据与设计文档。
 
 ## 模块导航
 
@@ -33,7 +35,7 @@
 |---|---|---|
 | [pointcloud-registration](pointcloud-registration/) | 黑白机器人扫描点云 ↔ 语义参考地图的**配准 + 语义标签传播**，纯 numpy 手写 | `python register_and_label.py` |
 | [station-planning](station-planning/) | 喷涂**工位区域划分（BCD）与站位点规划**，可达域蒙特卡洛 | `station_planning.m`（MATLAB） |
-| [g1-wall-spray](g1-wall-spray/) | G1 壁面喷涂**网页工作站 + 全身控制**，复用 GR00T 官方执行栈 | `./启动工作站.sh` → `127.0.0.1:8090` |
+| [g1-wall-spray](g1-wall-spray/) | G1 壁面喷涂**网页工作站 + 全身控制**（策略基于 GEAR-SONIC） | `./启动工作站.sh` → `127.0.0.1:8090` |
 | [openarm-zigzag](openarm-zigzag/) | OpenArm 七轴**标定 → 仿真 → 真机**全链路，MPC/RL/ILC | 见模块 [README](openarm-zigzag/README.md) |
 
 ## 成绩单
@@ -68,7 +70,7 @@ scan-plan-spray/
 │   ├── docs/                  #   设计方案 V2.0（PDF）+ 原方案（MD）
 │   └── figures/
 ├── g1-wall-spray/             # G1 壁面喷涂工作站（网页 + 全身控制）
-│   ├── scripts/               #   00–13 编号流水线 + exec/（守护/桥接/急停）
+│   ├── scripts/               #   00–13 编号流水线 + exec/（守护/推流/急停）
 │   ├── station/               #   配置、NN-IK 模型、three.js 前端静态件
 │   ├── media/                 #   结果图 + MuJoCo 回放视频
 │   ├── README.md              #   模块详解（含仿真/实机切换）
@@ -136,9 +138,9 @@ cat README.md            # 按「快速上手」五步：标定 → MoveIt2 仿�
 
 <img src="station-planning/figures/fig_bcd.png" width="70%"/>
 
-### g1-wall-spray — 网页工作站 + GR00T 全身控制，"零自造策略"
+### g1-wall-spray — 网页工作站 + 基于 SONIC 的全身控制
 
-单文件 Python 网页工作站（标准库 HTTP 服务 + 内嵌 three.js 3D 预览）串起点云解析、轨迹规划、动作导出、执行打包；执行侧**不自造控制策略**——下肢平衡交给 GR00T-SONIC 官方策略，自写件只有 ZMQ 守护进程与协议桥（直接复用官方 `zmq_planner_sender` 构造消息），上肢以 17 关节 @50 Hz + 速度前馈注入。MuJoCo 仿真与实机 DDS 共享同一条规划链，切换只改 `env.json` 一个字段。
+单文件 Python 网页工作站（标准库 HTTP 服务 + 内嵌 three.js 3D 预览）串起点云解析、轨迹规划、动作导出、执行打包。**全身控制策略基于 NVIDIA GEAR-SONIC**（GR00T-WholeBodyControl 官方栈）：下肢平衡由 SONIC 策略承担，上肢以 17 关节 @50 Hz + 速度前馈经官方 `zmq_planner_sender` 协议注入。MuJoCo 仿真与实机 DDS 共享同一条规划链，切换只改 `env.json` 一个字段。
 
 <p>
 <img src="g1-wall-spray/media/fig_3d_scene.png" width="49%"/>
@@ -155,25 +157,10 @@ OpenArm v1 七轴（达妙 DM 电机 + CAN-FD）上的全链路工程：纯 Pyth
 
 <img src="openarm-zigzag/assets/figures/moveit_zigzag_right_route.png" width="90%"/>
 
-## 知乎系列（写作中）
-
-| # | 篇目 | 状态 |
-|---|---|---|
-| 一 | 七轴机械臂之字形走线实战（一）：达妙 CAN 适配器的坑，与 MoveIt2 + 数值 IK 仿真跑通 | 成稿 |
-| 二 | （二）从仿真到真机：第一次全程走线 | 写作中 |
-| 三 | （三）把 JTC 槽位换成 MPC 控制器插件 | 写作中 |
-| 四 | （四）上强化学习：Isaac Lab 训练 → MuJoCo 验证 → 真机 | 写作中 |
-| 五 | （五）把 300 秒压到 143.6 秒：抖动治理与 ILC 前馈 | 写作中 |
-| 六 | 纯 numpy 手写点云配准：墙角、门框与自适应 ICP | 写作中 |
-| 七 | 人形机器人喷涂工位规划：可达域蒙特卡洛 + 牛耕分解 + 12 个站位点 | 写作中 |
-| 八 | G1 壁面喷涂工作站：网页 + GR00T 全身控制 + 仿真/实机切换 | 写作中 |
-
-发布后在此更新链接。
-
 ## 上游与致谢
 
 - [enactic/openarm](https://github.com/enactic/openarm) — OpenArm v1 硬件与官方 ROS 2 工作区，本仓 `openarm-zigzag` 在其上构建
-- [NVlabs/GR00T-WholeBodyControl](https://github.com/NVlabs/GR00T-WholeBodyControl) — `g1-wall-spray` 的全身控制执行栈（GEAR-SONIC），本仓不自造策略、只做规划与桥接
+- [NVlabs/GR00T-WholeBodyControl](https://github.com/NVlabs/GR00T-WholeBodyControl) — `g1-wall-spray` 全身控制策略（GEAR-SONIC）的来源；上肢注入沿用其官方 `zmq_planner_sender` 协议
 - 宇树 Unitree G1 官方 URDF / SDK2；达妙 DM 电机系列
 - 之字形（boustrophedon）走线方式参考了开源项目 spray-coating-robot 的实现
 - PD 整定经验公式来自 arXiv:2508.08241

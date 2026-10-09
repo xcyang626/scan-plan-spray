@@ -117,7 +117,7 @@ class TrajectoryServer(Node):
         self._cancel_evt = threading.Event()
 
         self.get_logger().info(
-            f"桥接就绪: 轨迹 action=follow_joint_trajectory, 关节={JOINT_NAMES}")
+            f"执行接入就绪: 轨迹 action=follow_joint_trajectory, 关节={JOINT_NAMES}")
 
     # ---------- Action 回调 ----------
     def _goal_cb(self, goal_request):

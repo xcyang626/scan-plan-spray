@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
-"""GR00T 桥接层（本项目唯一自写部分）—— 把 GR00T 官方能力接到网页上。
+"""GR00T 执行接入层 —— 把 GR00T 的全身控制能力接到网页工作站上。
 
-设计原则（用户指示）：**策略/安全/接口全部复用 GR00T 官方实现，不自造**。
-本文件只做三件事：
+策略、安全与消息协议均沿用 GR00T 官方实现（GEAR-SONIC），本文件提供三个接口：
   1) `GR00TBridge.publish_upper_body(...)`：把规划好的喷涂动作（17 个上肢关节）
      经 GR00T 官方 ZMQ 发送端模块发布到 `planner` 话题的 `upper_body_position` 字段
      —— 这是 v7 已验证过的路径（reference/upper_body/v7_arm_sdk_safe.csv）。
@@ -38,7 +37,7 @@ GROOT_ROOT = os.environ.get("GROOT_ROOT",
 if GROOT_ROOT not in sys.path:
     sys.path.insert(0, GROOT_ROOT)
 
-# ---- 复用 GR00T 官方发送端模块（不自造协议）----
+# ---- GR00T 官方发送端模块 ----
 from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (  # noqa: E402
     build_command_message,
     build_planner_message,
@@ -308,7 +307,7 @@ def send_command(kind, host="*", port=5556, repeat=3):
 
 if __name__ == "__main__":
     import argparse
-    ap = argparse.ArgumentParser(description="GR00T 桥接层自测/独立运行")
+    ap = argparse.ArgumentParser(description="GR00T 执行接入层自测/独立运行")
     ap.add_argument("--motion", help="动作 npz (qpos T×36)")
     ap.add_argument("--send-command",
                     choices=["start", "start_stream", "stop", "planner_on", "planner_off"],

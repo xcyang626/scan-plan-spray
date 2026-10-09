@@ -22,10 +22,12 @@
 
 Two complete technical tracks for the same task — **automatic line-tracing / spraying on walls**:
 
-- **Humanoid track (Unitree G1)**: cabin point-cloud registration → spray station & stance planning → constant-width zigzag trajectories with per-point IK → a web workstation → whole-body control execution on the official GR00T stack, with one-switch sim/real modes.
-- **Robot-arm track (OpenArm, 7-DOF)**: zero calibration → simulation → real robot, pushed through three layers (MPC / reinforcement learning / ILC), cutting one 36-waypoint run from ~300 s down to **143.6 s** with zero e-stops.
+- **Humanoid track (Unitree G1)**: cabin point-cloud registration → spray station & stance planning → constant-width zigzag trajectories with per-point IK → a web workstation → whole-body control execution, with the control policy based on NVIDIA **GEAR-SONIC** and one-switch sim/real modes.
+- **Robot-arm track (OpenArm v1, 7-DOF)**: zero calibration → simulation → real robot, pushed through three layers (MPC / reinforcement learning / ILC), cutting one 36-waypoint run from ~300 s down to **143.6 s** with zero e-stops.
 
 The four modules are independent and each runs on its own. `g1-wall-spray` consumes exactly the output of `pointcloud-registration`, and its workspace computation inherits the method from `station-planning`.
+
+This repository is an archival record of that work: every module keeps its runnable code, measured results and design documents.
 
 ## Modules
 
@@ -33,7 +35,7 @@ The four modules are independent and each runs on its own. `g1-wall-spray` consu
 |---|---|---|
 | [pointcloud-registration](pointcloud-registration/) | Register a grayscale robot scan against a semantic reference map + **label transfer**, hand-written in pure numpy | `python register_and_label.py` |
 | [station-planning](station-planning/) | **Spray cell decomposition (BCD) and stance planning** on Monte-Carlo reachability | `station_planning.m` (MATLAB) |
-| [g1-wall-spray](g1-wall-spray/) | G1 wall-spraying **web workstation + whole-body control** on the official GR00T stack | `./启动工作站.sh` → `127.0.0.1:8090` |
+| [g1-wall-spray](g1-wall-spray/) | G1 wall-spraying **web workstation + whole-body control** (policy based on GEAR-SONIC) | `./启动工作站.sh` → `127.0.0.1:8090` |
 | [openarm-zigzag](openarm-zigzag/) | OpenArm 7-DOF **calibration → simulation → real robot**, with MPC/RL/ILC | see the module [README](openarm-zigzag/README.en.md) |
 
 ## Results at a glance
@@ -68,7 +70,7 @@ scan-plan-spray/
 │   ├── docs/                  #   design doc V2.0 (PDF) + original plan (MD)
 │   └── figures/
 ├── g1-wall-spray/             # G1 wall-spraying workstation (web + WBC)
-│   ├── scripts/               #   numbered pipeline 00–13 + exec/ (daemon/bridge/estop)
+│   ├── scripts/               #   numbered pipeline 00–13 + exec/ (daemon/streaming/estop)
 │   ├── station/               #   config, NN-IK models, three.js frontend assets
 │   ├── media/                 #   result figures + MuJoCo replay video
 │   └── README.md              #   module deep-dive (incl. sim/real switch)
@@ -134,9 +136,9 @@ Monte-Carlo FK on the Tiangong 3.0 URDF yields the wrist reachability (alpha-sha
 
 <img src="station-planning/figures/fig_bcd.png" width="70%"/>
 
-### g1-wall-spray — web workstation + GR00T whole-body control, zero home-grown policies
+### g1-wall-spray — web workstation + whole-body control based on SONIC
 
-A single-file Python web workstation (stdlib HTTP + embedded three.js 3D preview) chains cloud parsing, trajectory planning, motion export and execution packaging. On the execution side, **no policy is invented**: lower-body balance is the official GR00T-SONIC policy; the custom parts are only a ZMQ daemon and a protocol bridge that reuses the official `zmq_planner_sender` message builders, injecting the upper body as 17 joints @50 Hz with velocity feedforward. MuJoCo simulation and the real DDS link share one planning chain — switching is one field in `env.json`.
+A single-file Python web workstation (stdlib HTTP + embedded three.js 3D preview) chains cloud parsing, trajectory planning, motion export and execution packaging. The **whole-body control policy is based on NVIDIA GEAR-SONIC** (the official GR00T-WholeBodyControl stack): lower-body balance is handled by the SONIC policy, and the upper body is injected as 17 joints @50 Hz with velocity feedforward through the official `zmq_planner_sender` protocol. MuJoCo simulation and the real DDS link share one planning chain — switching is one field in `env.json`.
 
 <p>
 <img src="g1-wall-spray/media/fig_3d_scene.png" width="49%"/>
@@ -153,21 +155,10 @@ A full-chain project on the OpenArm v1 7-DOF arm (Damiao DM motors + CAN-FD): a 
 
 <img src="openarm-zigzag/assets/figures/moveit_zigzag_right_route.png" width="90%"/>
 
-## Zhihu series (in Chinese, links to be added)
-
-1. Zigzag line-tracing on a 7-DOF arm, part 1: the Damiao USB-CAN trap, and getting MoveIt2 + numerical IK running in sim — done
-2. Part 2: from simulation to the first full run on the real arm
-3. Part 3: replacing the JTC slot with an MPC controller plugin
-4. Part 4: reinforcement learning — Isaac Lab training → MuJoCo validation → real deployment
-5. Part 5: 300 s → 143.6 s: sway taming and the ILC feedforward
-6. Hand-written point-cloud registration in pure numpy: wall corners, door frames and adaptive ICP
-7. Spray station planning for humanoids: Monte-Carlo reachability + BCD + 12 stances
-8. The G1 wall-spraying workstation: web UI + GR00T whole-body control + sim/real switch
-
 ## Upstream & credits
 
 - [enactic/openarm](https://github.com/enactic/openarm) — OpenArm v1 hardware and the official ROS 2 workspace that `openarm-zigzag` builds upon
-- [NVlabs/GR00T-WholeBodyControl](https://github.com/NVlabs/GR00T-WholeBodyControl) — the whole-body-control execution stack (GEAR-SONIC) behind `g1-wall-spray`; this repo adds planning and bridging, not policies
+- [NVlabs/GR00T-WholeBodyControl](https://github.com/NVlabs/GR00T-WholeBodyControl) — source of the whole-body control policy (GEAR-SONIC) used by `g1-wall-spray`; upper-body injection follows its official `zmq_planner_sender` protocol
 - Unitree G1 official URDF / SDK2; Damiao DM motor family
 - The boustrophedon line-tracing scheme references the open-source spray-coating-robot project
 - PD-tuning formulas from arXiv:2508.08241
