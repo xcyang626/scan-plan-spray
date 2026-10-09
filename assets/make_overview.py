@@ -40,7 +40,7 @@ BLUE, ORANGE, GRAY = "#1d4ed8", "#c2410c", "#6b7280"
 
 fig, ax = plt.subplots(figsize=(16.5, 7.2), dpi=150)
 ax.set_xlim(0, 100)
-ax.set_ylim(0, 44)
+ax.set_ylim(0, 37)
 ax.axis("off")
 
 def box(x, y, w, h, title, sub, color, fs=12.5):
@@ -63,7 +63,7 @@ def lane_label(x, y, text, color):
 
 # ================= 上层：G1 人形机器人喷涂线 =================
 yA = 27
-lane_label(1.5, yA + 7.2, "人形机器人喷涂线 · 宇树 G1（点云 → 规划 → 全身控制）", BLUE)
+lane_label(1.5, yA + 8.0, "人形机器人喷涂线 · 宇树 G1（点云 → 规划 → 全身控制）", BLUE)
 boxesA = [
     ("舱室语义点云", "500 万点 · 6 类标签"),
     ("特征匹配配准", "墙角/门框地标 + 自适应 ICP\n对齐 RMSE 0.34 mm"),
@@ -81,7 +81,7 @@ for i, (t, s) in enumerate(boxesA):
 
 # ================= 下层：OpenArm 七轴机械臂控制线 =================
 yB = 8
-lane_label(1.5, yB + 7.2, "机械臂走线控制线 · OpenArm 七轴（标定 → 仿真 → 真机）", ORANGE)
+lane_label(1.5, yB + 8.0, "机械臂走线控制线 · OpenArm 七轴（标定 → 仿真 → 真机）", ORANGE)
 boxesB = [
     ("零点标定", "纯 Python CAN-FD\nvcan0 无硬件可跑"),
     ("仿真", "MoveIt2 + 自研数值 IK\n1237 点稠密轨迹"),
