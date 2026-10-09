@@ -1,0 +1,31 @@
+{
+  "_说明": "机器人登记表: 新型号机器人加一个条目即可在工作站下拉框中出现。ik_chain 为说明性字段; 03 的解析 FK 链当前为 G1, 新模型需在 scripts/ 下提供对应 FK/IK 模块(见 README-扩展新机器人)。",
+  "g1": {
+    "name": "Unitree G1 (29dof, 右臂喷枪)",
+    "urdf": "g1_29dof_nohand.urdf",
+    "mjcf": "/home/yang/.cache/huggingface/hub/models--elijahgalahad--g1_xmls/snapshots/1c1d082f299126b9272e81c04121ff347c97fa8f/g1-mode_13_15.xml",
+    "arm": "right",
+    "dof": {
+      "waist": 3,
+      "arm": 7,
+      "legs": 12,
+      "total_qpos": 36
+    },
+    "waist_roll_pitch_limit_rad": 0.0872665,
+    "pelvis_stand_m": [
+      0.77,
+      0.79
+    ],
+    "stance_band_m": [
+      0.7,
+      0.78
+    ],
+    "d_wrist_m": 0.4,
+    "gun_len_m": 0.12,
+    "workspace_npz": "output/g1_workspace.npz",
+    "motion_ver": "v5_stand_zigzag",
+    "nn_ik_file": "station/nn_ik/g1_nn_ik.npz",
+    "model_dir": "/home/yang/桌面/遥操/g1_model",
+    "urdf_file": "g1_29dof_nohand.urdf"
+  }
+}
