@@ -1,0 +1,43 @@
+# 真机动力学限位(2026-09-04 调整):
+# 速度/加速度设为温和值, MoveIt 规划的关节空间移动(回家/去起点等)
+# 以约 0.1-0.2 rad/s 的慢速执行, 与 move_small 微动同量级。
+# 位置限位不在此处——真机 URDF 的 limit 已由 gen_real_config.py 写入
+# zero 实测软限位, MoveIt 直接读 URDF。
+default_velocity_scaling_factor: 1.0
+default_acceleration_scaling_factor: 1.0
+joint_limits:
+  openarm_left_joint1:
+    has_velocity_limits: true
+    max_velocity: 0.15
+    has_acceleration_limits: true
+    max_acceleration: 0.20
+  openarm_left_joint2:
+    has_velocity_limits: true
+    max_velocity: 0.15
+    has_acceleration_limits: true
+    max_acceleration: 0.20
+  openarm_left_joint3:
+    has_velocity_limits: true
+    max_velocity: 0.15
+    has_acceleration_limits: true
+    max_acceleration: 0.20
+  openarm_left_joint4:
+    has_velocity_limits: true
+    max_velocity: 0.15
+    has_acceleration_limits: true
+    max_acceleration: 0.20
+  openarm_left_joint5:
+    has_velocity_limits: true
+    max_velocity: 0.20
+    has_acceleration_limits: true
+    max_acceleration: 0.30
+  openarm_left_joint6:
+    has_velocity_limits: true
+    max_velocity: 0.20
+    has_acceleration_limits: true
+    max_acceleration: 0.30
+  openarm_left_joint7:
+    has_velocity_limits: true
+    max_velocity: 0.20
+    has_acceleration_limits: true
+    max_acceleration: 0.30

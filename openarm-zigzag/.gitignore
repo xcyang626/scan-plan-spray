@@ -1,0 +1,108 @@
+# ============================================================================
+# OpenArm 之字形走线实验平台 —— Git 排除规则
+# ----------------------------------------------------------------------------
+# 原则: 只入库"人写的代码 / 配置 / 文档 / 少量产物"; 一切可重建的构建产物、
+#       缓存、大体量原始日志都不入库。每条规则后面注明理由与重建方式。
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# 1. 构建产物 (colcon / CMake) —— 全部可由源码重建
+#    重建: 标定/openarm_calibration/build.sh ;
+#          real/common/ws 下 colcon build ; 仿真/build.sh
+#    注意: real/common/ws/install 是真机运行依赖, 但体积大且可由
+#          ws/src 重建, 故不入库; 拉取后需本地 colcon build 一次。
+# ---------------------------------------------------------------------------
+build/
+install/
+log/
+.colcon/
+
+# ---------------------------------------------------------------------------
+# 2. Python / 编辑器缓存
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.vscode/
+.idea/
+*.swp
+*~
+
+# ZCode 编辑器工作区忽略规则(个人工具配置, 非项目内容)
+.zcodeignore
+
+# 维护者内部文档: 记录"本机哪些入库/哪些不入库/怎么重建", 属作者个人工作
+# 习惯, 不进公开仓库。公开侧的等价信息已由本 .gitignore 自带注释承担。
+docs/仓库维护说明.md
+
+# ---------------------------------------------------------------------------
+# 3. 备份与半成品
+#    例: real/right/config/*.bak_* (重标定前留档)、标定/zero_right.partial
+#        (2026-09-11 一次中止的标定记录)
+# ---------------------------------------------------------------------------
+*.bak
+*.bak_*
+*.orig
+*.rej
+/标定/zero_right.partial
+
+# ---------------------------------------------------------------------------
+# 4. 图件: 统一归档在 assets/figures/ 并入库(文档要引用);
+#    脚本运行时的旧位置残留不再跟踪。
+#    例外: RL 每次训练 run 目录里的 play_report.png 属于该次 run 的产物,
+#          随 logs/ 规则处理, 不进 assets/figures/。
+# ---------------------------------------------------------------------------
+/ilc_sim/ilc_sim_curves.png
+/仿真/moveit_sim/zigzag_right_route.png
+/仿真/isaaclab_sim/workspace.svg
+/仿真/isaaclab_sim/workspace_right.svg
+/仿真/isaaclab_sim/rl/ref_right_profile.png
+/real/right/rl_track/real_run_report.png
+/real/right/rl_track/ilc_learn_curves.png
+
+# ---------------------------------------------------------------------------
+# 5. 大体量原始数据 (真机 100Hz 关节流记录, 单文件 3~280MB)
+#    重建: 运行 real/common/js_blackbox.py 或 rl_exec.py --log-csv 重新采集。
+#    入库的替代物: real/right/rl_track/rl_exec_*.csv (每次运行的指令侧记录,
+#    体积小, 是 analyze_real_run.py 的输入)。
+# ---------------------------------------------------------------------------
+real/common/js_blackbox_*.csv
+real/right/rl_track/blackbox_*.csv
+
+# ---------------------------------------------------------------------------
+# 6. RL 训练输出 (logs/rsl_rl/...)
+#    保留: VERSIONS.md、各 run 的 actor_final.npz (策略可完整追溯)、
+#          三个里程碑 run 的 model_*.pt 与 tfevents 训练曲线
+#          (v1=600迭代基准 / v2=反粘滑 / v3=课程化, 当前部署)。
+#    排除: 其余中间检查点 model_*.pt (每个 2.7MB) 与历史 run 的 tfevents。
+# ---------------------------------------------------------------------------
+仿真/isaaclab_sim/rl/logs/**/model_*.pt
+!仿真/isaaclab_sim/rl/logs/rsl_rl/openarm_zigzag/v1_2026-09-17_11-47-10/model_588.pt
+!仿真/isaaclab_sim/rl/logs/rsl_rl/openarm_zigzag/v2_2026-09-17_15-54-58/model_147.pt
+!仿真/isaaclab_sim/rl/logs/rsl_rl/openarm_zigzag/v3_2026-09-17_16-39-03/model_343.pt
+
+仿真/isaaclab_sim/rl/logs/**/events.out.tfevents.*
+!仿真/isaaclab_sim/rl/logs/rsl_rl/openarm_zigzag/v1_2026-09-17_11-47-10/events.out.tfevents.*
+!仿真/isaaclab_sim/rl/logs/rsl_rl/openarm_zigzag/v2_2026-09-17_15-54-58/events.out.tfevents.*
+!仿真/isaaclab_sim/rl/logs/rsl_rl/openarm_zigzag/v3_2026-09-17_16-39-03/events.out.tfevents.*
+
+# 训练过程 stdout 日志
+仿真/isaaclab_sim/rl/train_*.log
+archive/scan_new.log
+
+# ---------------------------------------------------------------------------
+# 7. Isaac Sim 生成的二进制几何资产 (USD)
+#    URDF → USD 的转换产物, 其中 *_base.usd 单个 78MB。
+#    重建: 仿真/isaaclab_sim/1_import_urdf.py (基础资产) 与
+#          rl/make_rl_usd.py (RL 专用, 夹爪 fixed)。
+#    入库的源: *.urdf + *.usda (地面) + 生成脚本。
+#    若希望随仓库分发, 建议改用 Git LFS 单独托管本目录。
+# ---------------------------------------------------------------------------
+/仿真/isaaclab_sim/openarm_right.usd
+/仿真/isaaclab_sim/configuration/
+/仿真/isaaclab_sim/rl/openarm_right_rl.usd
+/仿真/isaaclab_sim/rl/configuration/
+
+# 资源转换缓存指纹 (脚本自动生成)
+.asset_hash

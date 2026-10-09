@@ -1,0 +1,36 @@
+<?xml version="1.0"?>
+<!-- 单臂(左臂) SRDF: 只定义 left_arm 7 关节组, 不含右臂/手指 -->
+<robot name="openarm_left">
+  <group name="left_arm">
+    <joint name="openarm_left_joint1"/>
+    <joint name="openarm_left_joint2"/>
+    <joint name="openarm_left_joint3"/>
+    <joint name="openarm_left_joint4"/>
+    <joint name="openarm_left_joint5"/>
+    <joint name="openarm_left_joint6"/>
+    <joint name="openarm_left_joint7"/>
+  </group>
+  <group_state name="zero" group="left_arm">
+    <joint name="openarm_left_joint1" value="0"/>
+    <joint name="openarm_left_joint2" value="0"/>
+    <joint name="openarm_left_joint3" value="0"/>
+    <joint name="openarm_left_joint4" value="0"/>
+    <joint name="openarm_left_joint5" value="0"/>
+    <joint name="openarm_left_joint6" value="0"/>
+    <joint name="openarm_left_joint7" value="0"/>
+  </group_state>
+
+  <!-- 相邻/常接触链接的碰撞豁免(照抄官方 bimanual SRDF 的 left 部分;
+       缺了会被 CheckStartStateBounds 报 6 contacts 直接拒规划) -->
+  <disable_collisions link1="openarm_body_link0" link2="openarm_left_link0" reason="Adjacent"/>
+  <disable_collisions link1="openarm_left_link0" link2="openarm_left_link1" reason="Adjacent"/>
+  <disable_collisions link1="openarm_left_link1" link2="openarm_left_link2" reason="Adjacent"/>
+  <disable_collisions link1="openarm_left_link2" link2="openarm_left_link3" reason="Adjacent"/>
+  <disable_collisions link1="openarm_left_link3" link2="openarm_left_link4" reason="Adjacent"/>
+  <disable_collisions link1="openarm_left_link4" link2="openarm_left_link5" reason="Adjacent"/>
+  <disable_collisions link1="openarm_left_link5" link2="openarm_left_link6" reason="Adjacent"/>
+  <disable_collisions link1="openarm_left_link6" link2="openarm_left_link7" reason="Adjacent"/>
+  <disable_collisions link1="openarm_left_link7" link2="openarm_left_left_finger" reason="Adjacent"/>
+  <disable_collisions link1="openarm_left_link7" link2="openarm_left_right_finger" reason="Adjacent"/>
+  <disable_collisions link1="openarm_left_left_finger" link2="openarm_left_right_finger" reason="Adjacent"/>
+</robot>

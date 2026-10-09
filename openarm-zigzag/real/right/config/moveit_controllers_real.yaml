@@ -1,0 +1,19 @@
+# MoveIt 侧控制器管理(真机): 接 right_joint_trajectory_controller 槽位
+# (2026-09-14 起该槽位由 OpenArmMpcController 插件填充——MPC 接管,
+#  本文件无需改动; 回滚见 ros2_controllers_real.yaml 注释)
+moveit_controller_manager: moveit_simple_controller_manager/MoveItSimpleControllerManager
+moveit_simple_controller_manager:
+  controller_names:
+    - right_joint_trajectory_controller
+  right_joint_trajectory_controller:
+    type: FollowJointTrajectory
+    joints:
+      - openarm_right_joint1
+      - openarm_right_joint2
+      - openarm_right_joint3
+      - openarm_right_joint4
+      - openarm_right_joint5
+      - openarm_right_joint6
+      - openarm_right_joint7
+    action_ns: follow_joint_trajectory
+    default: true

@@ -1,0 +1,90 @@
+# OpenArm 零点标定参数配置
+# ========================
+# 修改后重新 launch 即可生效（无需重新编译）
+
+calibration_node:
+  ros__parameters:
+    # ---------- 总线 ----------
+    can_iface: "can0"            # SocketCAN 接口（gs_usb, fd on, 1M/5M）
+    use_fd: true                 # CANFD 模式（官方 OpenArm 即 enable_fd=True）
+    control_rate_hz: 200.0       # 控制循环基准频率（官方 bump 间隔 5ms）
+
+    # ---------- 机械臂构型 ----------
+    arm_side: "left"             # 本机械臂为左臂（决定 J1 防护方向等）
+    robot_version: "v1"          # v1 / v2（v1: J1-J2=8009, J3-J4=4340, J5-J7=4310）
+
+    # 电机 CAN ID（发送 ID；反馈 ID = 发送 ID + 0x10）
+    motor_ids: [1, 2, 3, 4, 5, 6, 7, 8]
+    # 型号序号: 0=DM3507 1=DM4310 2=DM4310_48V 3=DM4340 5=DM6006 6=DM8006 7=DM8009 ...
+    motor_types: [7, 7, 3, 3, 1, 1, 1, 1]
+    joint_names: ["openarm_joint1", "openarm_joint2", "openarm_joint3",
+                  "openarm_joint4", "openarm_joint5", "openarm_joint6",
+                  "openarm_joint7", "openarm_gripper"]
+
+    # ---------- 安全 ----------
+    # 【重要】allow_motion=false 时标定服务直接拒绝，电机绝不运动。
+    # 确认机械臂姿态安全、周围无人后，再以 allow_motion:=true 启动。
+    allow_motion: false
+    bump_timeout_s: 20.0         # 单关节碰撞限位超时（秒），超时判定失败并失能
+    max_torque_scale: 1.0        # 全局转矩缩放（<1.0 可整体减小碰撞力度）
+
+    # ---------- 电机寄存器限参 ----------
+    # 启动时自动从电机读取 PMAX/VMAX/TMAX（read_limits=true），
+    # 读取失败的电机回退到下方表（序号对应 motor_types）。
+    read_limits: true
+    # 兜底限参表（照搬官方 dm_motor_constants.hpp，拍平为一维:
+    # 每型号 3 个值 [pMax rad, vMax rad/s, tMax Nm]，按 MOTOR_TYPE_NAMES 顺序:
+    # 0 DM3507, 1 DM4310, 2 DM4310_48V, 3 DM4340, 4 DM4340_48V, 5 DM6006,
+    # 6 DM8006, 7 DM8009, 8 DM10010L, 9 DM10010, 10 DMH3510, 11 DMH6215, 12 DMG6220）
+    fallback_limits: [12.5, 50.0, 5.0,
+                      12.5, 30.0, 10.0,
+                      12.5, 50.0, 10.0,
+                      12.5, 10.0, 28.0,
+                      12.5, 45.0, 20.0,
+                      12.5, 45.0, 20.0,
+                      12.5, 45.0, 40.0,
+                      12.5, 45.0, 54.0,
+                      12.5, 25.0, 200.0,
+                      12.5, 20.0, 200.0,
+                      12.5, 280.0, 1.0,
+                      12.5, 45.0, 10.0,
+                      12.5, 45.0, 10.0]
+
+    # ---------- 初始保持刚度（官方值）----------
+    hold_kp: [300.0, 300.0, 150.0, 150.0, 40.0, 40.0, 30.0]
+    hold_kd: [2.5, 2.5, 2.5, 2.5, 0.8, 0.8, 0.8]
+    grip_hold_kp: 10.0
+    grip_hold_kd: 0.9
+
+    # ---------- 逐限位(bump)默认刚度 ----------
+    bump_kp: 45.0
+    bump_kd: 1.2
+    bump_step_deg: 0.2           # 每次逼近步进（度）
+    # 到位判定阈值: |速度| < dq_th 且 |转矩| > tau_th
+    grip_dq_th: 0.3
+    grip_tau_th: 0.3
+    j1_dq_th: 0.0125
+    j1_tau_th: 5.0
+    default_dq_th: 0.1
+    default_tau_th: 2.0
+
+    # J1 碰撞专用刚度（官方 kp=280 kd=2.1）
+    j1_bump_kp: 280.0
+    j1_bump_kd: 2.1
+    # J2 复位专用刚度（官方 kp=280 kd=2.0）
+    j2_home_kp: 280.0
+    j2_home_kd: 2.0
+
+    # ---------- 插值运动默认刚度（官方值）----------
+    interp_kp: 52.0
+    interp_kd: 1.5
+    interp_time_s: 2.0           # 默认插值时长
+
+    # ---------- 新标定流程参数 ----------
+    zero_file_path: "zero"       # 标定数据文件路径（JSON，相对 launch 运行目录）
+    j1_protect_deg: 45.0         # J1 防护摆动角度（度）——负方向
+    j1_protect_dir: "negative"   # 防护方向: 实测确认为负方向（2026-09-02 实机验证）
+    return_time_s: 3.0           # 限位→零位 低速回程时长（秒）
+    # 各关节首次碰撞方向（+1=正向, -1=负向）, 顺序 J1..J7,夹爪:
+    # J1/J2/J4/夹爪先负向（重力/闭合方向），J3/J5/J6/J7 先正向
+    joint_first_dir: [-1, -1, 1, -1, 1, 1, 1, -1]

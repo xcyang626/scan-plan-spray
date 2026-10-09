@@ -1,0 +1,73 @@
+# 真机 ros2_control 配置 —— 方案切换见 docs/RL与MPC方案对比与切换.md
+# ============================================================
+# 当前方案: **RL**(纯强化学习 rl_exec 流式指令, 2026-09-15)
+#   - 槽位类型 = 旧 JTC(RL 断流回退保持器; move_small/MoveIt 零修改兼容)
+#   - 注入通道 = 开(mpc_enable=true, 话题 /right_rl_position_commands)
+# 切回 MPC 方案三步(见对比文档):
+#   1) 下面 type 行换回 openarm_mpc_controller/OpenArmMpcController
+#   2) 把"MPC 插件参数块"恢复、当前"JTC 参数块"注释(两块都在本文件)
+#   3) gen_real_config.py --side right(默认 mpc)重新生成 → 重启 control 层
+# 二者不能同时激活(都占用 position 指令接口)。
+controller_manager:
+  ros__parameters:
+    update_rate: 100
+    right_joint_trajectory_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+      # type: openarm_mpc_controller/OpenArmMpcController   # ← MPC 方案用
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+
+# ============ 当前激活: JTC 参数块(RL 方案) ============
+right_joint_trajectory_controller:
+  ros__parameters:
+    joints:
+      - openarm_right_joint1
+      - openarm_right_joint2
+      - openarm_right_joint3
+      - openarm_right_joint4
+      - openarm_right_joint5
+      - openarm_right_joint6
+      - openarm_right_joint7
+    command_interfaces: [position]
+    state_interfaces: [position, velocity]
+    constraints:
+      stopped_velocity_tolerance: 0.05
+      goal_time: 0.0
+      openarm_right_joint1: {trajectory: 0.20, goal: 0.15}
+      openarm_right_joint2: {trajectory: 0.15, goal: 0.10}
+      openarm_right_joint3: {trajectory: 0.40, goal: 0.30}
+      openarm_right_joint4: {trajectory: 0.15, goal: 0.10}
+      openarm_right_joint5: {trajectory: 0.35, goal: 0.25}
+      openarm_right_joint6: {trajectory: 0.35, goal: 0.25}
+      openarm_right_joint7: {trajectory: 0.35, goal: 0.25}
+    allow_partial_joints_goal: false
+
+# ============ 备用: MPC 插件参数块(切回 MPC 方案时恢复此块、
+# ============ 注释上面的 JTC 块; 软限位权威 = real_safety.yaml) ============
+# right_joint_trajectory_controller:
+#   ros__parameters:
+#     joints:
+#       - openarm_right_joint1
+#       - openarm_right_joint2
+#       - openarm_right_joint3
+#       - openarm_right_joint4
+#       - openarm_right_joint5
+#       - openarm_right_joint6
+#       - openarm_right_joint7
+#     # --- 预览 MPC 数学(= mpc_config.json) ---
+#     N: 25
+#     dt: 0.01                  # 必须等于 1/update_rate
+#     w_p: 1000.0
+#     w_v: 200.0
+#     w_a: 1.0
+#     a_max: 1.2
+#     speed_scale: 1.0
+#     # --- 安全 ---
+#     clearance_deg: 3.0
+#     safety_yaml: "/home/yang/桌面/openarm实验/real/right/config/real_safety.yaml"
+#     start_tolerance_rad: 0.035
+#     goal_tolerance_rad: 0.20
+#     abort_deviation_rad: 0.40
+
+joint_state_broadcaster:
+  ros__parameters: {}

@@ -1,0 +1,67 @@
+# 仿真参数（vcan0 虚拟总线 + dm_motor_sim.py 模拟 8 电机）
+# =====================================================
+# 与实机参数的唯一区别: can_iface 指向 vcan0。
+# 标定节点逻辑完全一致——仿真通过后实机只需换回 can0。
+
+calibration_node:
+  ros__parameters:
+    can_iface: "vcan0"           # 虚拟 CAN 总线
+    use_fd: true                 # vcan 支持 CANFD 帧（BRS 标志被忽略）
+
+    arm_side: "left"             # 本机械臂为左臂
+    robot_version: "v1"
+
+    motor_ids: [1, 2, 3, 4, 5, 6, 7, 8]
+    motor_types: [7, 7, 3, 3, 1, 1, 1, 1]
+    joint_names: ["openarm_joint1", "openarm_joint2", "openarm_joint3",
+                  "openarm_joint4", "openarm_joint5", "openarm_joint6",
+                  "openarm_joint7", "openarm_gripper"]
+
+    allow_motion: false          # 仿真启动也走两步制；解锁用 launch 参数
+    bump_timeout_s: 20.0
+    max_torque_scale: 1.0
+    read_limits: true            # 仿真器支持参数应答（PMAX/VMAX/TMAX/模式）
+
+    fallback_limits: [12.5, 50.0, 5.0,
+                      12.5, 30.0, 10.0,
+                      12.5, 50.0, 10.0,
+                      12.5, 10.0, 28.0,
+                      12.5, 45.0, 20.0,
+                      12.5, 45.0, 20.0,
+                      12.5, 45.0, 40.0,
+                      12.5, 45.0, 54.0,
+                      12.5, 25.0, 200.0,
+                      12.5, 20.0, 200.0,
+                      12.5, 280.0, 1.0,
+                      12.5, 45.0, 10.0,
+                      12.5, 45.0, 10.0]
+
+    hold_kp: [300.0, 300.0, 150.0, 150.0, 40.0, 40.0, 30.0]
+    hold_kd: [2.5, 2.5, 2.5, 2.5, 0.8, 0.8, 0.8]
+    grip_hold_kp: 10.0
+    grip_hold_kd: 0.9
+
+    bump_kp: 45.0
+    bump_kd: 1.2
+    bump_step_deg: 0.2
+    grip_dq_th: 0.3
+    grip_tau_th: 0.3
+    j1_dq_th: 0.0125
+    j1_tau_th: 5.0
+    default_dq_th: 0.1
+    default_tau_th: 2.0
+
+    j1_bump_kp: 280.0
+    j1_bump_kd: 2.1
+    j2_home_kp: 280.0
+    j2_home_kd: 2.0
+
+    interp_kp: 52.0
+    interp_kd: 1.5
+    interp_time_s: 2.0
+
+    zero_file_path: "zero"
+    j1_protect_deg: 45.0
+    j1_protect_dir: "auto"
+    return_time_s: 3.0
+    joint_first_dir: [-1, -1, 1, -1, 1, 1, 1, -1]

@@ -1,0 +1,86 @@
+<?xml version='1.0' encoding='utf-8'?>
+<mujoco model="openarm_right">
+  <compiler angle="radian" />
+  <option timestep="0.002" integrator="implicitfast" />
+  <visual>
+    <headlight ambient="0.4 0.4 0.4" diffuse="0.6 0.6 0.6" />
+    <map znear="0.01" />
+  </visual>
+  <asset>
+    <texture name="grid" type="2d" builtin="checker" rgb1="0.25 0.27 0.3" rgb2="0.32 0.34 0.38" width="300" height="300" />
+    <material name="mat_grid" texture="grid" texrepeat="6 6" reflectance="0.1" />
+  </asset>
+  <worldbody>
+    <light pos="1.5 -1.5 2.5" dir="-1 1 -1.2" directional="true" />
+    <geom name="floor" type="plane" size="3 3 0.1" material="mat_grid" />
+    <geom name="wall" type="box" size="0.015 1.0 0.9" pos="2.015 0 0.9" rgba="0.85 0.85 0.9 0.4" contype="0" conaffinity="0" />
+    <geom name="tcp_plane" type="box" size="0.002 0.5 0.5" pos="0.3 0 0.75" rgba="0.2 0.5 1.0 0.25" contype="0" conaffinity="0" />
+    <geom name="torso" type="box" size="0.07 0.09 0.35" pos="0 -0.02 0.35" rgba="0.4 0.42 0.46 1" contype="0" conaffinity="0" />
+    <body name="openarm_body_link0" pos="0 0 0" quat="1 0 0 0">
+      <inertial pos="0 0 0" mass="13.89" fullinertia="1.653 1.653 0.051 0 0 0" />
+      <geom type="capsule" fromto="0 0 0 0 -0.031 0.698" size="0.03" rgba="0.55 0.58 0.62 1" contype="0" conaffinity="0" />
+      <body name="openarm_right_link0" pos="0 -0.031 0.698" quat="0.707105 0.707108 0 0">
+        <inertial pos="-0.000948336 0.000158021 0.0307686" mass="1.14323" fullinertia="0.001128 0.000962 0.00147 -4e-06 -3.3e-05 -7e-06" />
+        <geom type="capsule" fromto="0 0 0 0 0 0.0625" size="0.03" rgba="0.55 0.58 0.62 1" contype="0" conaffinity="0" />
+        <body name="openarm_right_link1" pos="0 0 0.0625" quat="1 0 0 0">
+          <inertial pos="0.00114677 3.31999e-05 0.0539528" mass="1.14167" fullinertia="0.001567 0.001273 0.001016 -1e-06 -2.9e-05 1e-06" />
+          <joint name="openarm_right_joint1" type="hinge" axis="0 0 1" damping="1.0" range="-0.368940 4.428640" limited="true" />
+          <geom type="capsule" fromto="0 0 0 -0.0301 0 0.06" size="0.045" rgba="0.55 0.58 0.62 1" contype="0" conaffinity="0" />
+          <body name="openarm_right_link2" pos="-0.0301 0 0.06" quat="0.707107 0.707107 0 0">
+            <inertial pos="0.00839629 -2.01451e-08 0.0325665" mass="0.277509" fullinertia="0.000359 0.000376 0.000232 1e-06 -0.000109 1e-06" />
+            <joint name="openarm_right_joint2" type="hinge" axis="-1 0 0" damping="1.0" range="-0.168640 3.233540" limited="true" />
+            <geom type="capsule" fromto="0 0 0 0.0301 0 0.06625" size="0.045" rgba="0.55 0.58 0.62 1" contype="0" conaffinity="0" />
+            <body name="openarm_right_link3" pos="0.0301 0 0.06625" quat="1 0 0 0">
+              <inertial pos="-0.00210475 0.000554909 0.0904747" mass="1.07386" fullinertia="0.004372 0.004319 0.000661 1e-06 1.1e-05 -3.6e-05" />
+              <joint name="openarm_right_joint3" type="hinge" axis="0 0 1" damping="1.0" range="-1.406940 1.623740" limited="true" />
+              <geom type="capsule" fromto="0 0 0 -0 0.0315 0.15375" size="0.04" rgba="0.55 0.58 0.62 1" contype="0" conaffinity="0" />
+              <body name="openarm_right_link4" pos="-0 0.0315 0.15375" quat="1 0 0 0">
+                <inertial pos="-0.00290068 -0.0303058 0.0633964" mass="0.634853" fullinertia="0.000623 0.000511 0.000334 -1e-06 -1.9e-05 3.8e-05" />
+                <joint name="openarm_right_joint4" type="hinge" axis="0 1 0" damping="1.0" range="0.044960 2.413740" limited="true" />
+                <geom type="capsule" fromto="0 0 0 0 -0.0315 0.0955" size="0.04" rgba="0.55 0.58 0.62 1" contype="0" conaffinity="0" />
+                <body name="openarm_right_link5" pos="0 -0.0315 0.0955" quat="1 0 0 0">
+                  <inertial pos="-0.00304967 0.00088669 0.0430798" mass="0.615659" fullinertia="0.000423 0.000445 0.000324 -8e-06 6e-06 -6e-06" />
+                  <joint name="openarm_right_joint5" type="hinge" axis="0 0 1" damping="1.0" range="-1.518740 1.525640" limited="true" />
+                  <geom type="capsule" fromto="0 0 0 0.0375 0 0.1205" size="0.03" rgba="0.55 0.58 0.62 1" contype="0" conaffinity="0" />
+                  <body name="openarm_right_link6" pos="0.0375 0 0.1205" quat="1 0 0 0">
+                    <inertial pos="-0.0371366 0.000332305 -9.49837e-05" mass="0.475203" fullinertia="0.000143 0.000157 0.000159 1e-06 1e-06 1e-06" />
+                    <joint name="openarm_right_joint6" type="hinge" axis="1 0 0" damping="1.0" range="-0.800340 0.668840" limited="true" />
+                    <geom type="capsule" fromto="0 0 0 -0.0375 0 0" size="0.03" rgba="0.55 0.58 0.62 1" contype="0" conaffinity="0" />
+                    <body name="openarm_right_link7" pos="-0.0375 0 0" quat="1 0 0 0">
+                      <inertial pos="6.87551e-05 0.0126618 0.0695195" mass="0.465977" fullinertia="0.000639 0.000497 0.000342 1e-06 1e-06 8.9e-05" />
+                      <joint name="openarm_right_joint7" type="hinge" axis="0 1 0" damping="1.0" range="-1.591540 1.479840" limited="true" />
+%s  <geom type="sphere" size="0.015" pos="0 0 0.12" rgba="0.1 0.9 0.9 0.7" contype="0" conaffinity="0" />
+%s  <site name="tcp" pos="0 0 0.12" size="0.006" rgba="0.1 0.9 0.9 1" />
+%s  <geom type="cylinder" size="0.025 0.03" pos="0 0 0.04" rgba="0.3 0.32 0.35 1" contype="0" conaffinity="0" />
+                      <body name="finger_openarm_right_finger_joint1" pos="0 0 0.1025">
+                        <joint name="openarm_right_finger_joint1" type="slide" axis="0 -1 0" range="0 0.044" limited="true" damping="0.5" />
+                        <geom type="box" size="0.006 0.008 0.045" pos="0 -0.02 0.035" rgba="0.25 0.28 0.32 1" contype="0" conaffinity="0" />
+                      </body>
+                      <body name="finger_openarm_right_finger_joint2" pos="0 0 0.1025">
+                        <joint name="openarm_right_finger_joint2" type="slide" axis="0 1 0" range="0 0.044" limited="true" damping="0.5" />
+                        <geom type="box" size="0.006 0.008 0.045" pos="0 0.02 0.035" rgba="0.25 0.28 0.32 1" contype="0" conaffinity="0" />
+                      </body>
+                      <body name="openarm_right_hand_tcp" pos="0 0 0" quat="1 0 0 0">
+                    </body>
+                    </body>
+                  </body>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+  <actuator>
+    <position name="act_openarm_right_joint1" joint="openarm_right_joint1" kp="300.0" ctrlrange="-1.4174 3.5118" forcerange="-40 40" />
+    <position name="act_openarm_right_joint2" joint="openarm_right_joint2" kp="300.0" ctrlrange="-0.195904 3.3375" forcerange="-40 40" />
+    <position name="act_openarm_right_joint3" joint="openarm_right_joint3" kp="150.0" ctrlrange="-1.6252 1.6252" forcerange="-27 27" />
+    <position name="act_openarm_right_joint4" joint="openarm_right_joint4" kp="150.0" ctrlrange="-0.01 2.234" forcerange="-27 27" />
+    <position name="act_openarm_right_joint5" joint="openarm_right_joint5" kp="60.0" ctrlrange="-1.5891 1.5891" forcerange="-7 7" />
+    <position name="act_openarm_right_joint6" joint="openarm_right_joint6" kp="60.0" ctrlrange="-0.7716 0.7716" forcerange="-7 7" />
+    <position name="act_openarm_right_joint7" joint="openarm_right_joint7" kp="60.0" ctrlrange="-1.5952 1.5952" forcerange="-7 7" />
+    <position name="act_openarm_right_finger_joint1" joint="openarm_right_finger_joint1" kp="200" ctrlrange="0 0.044" forcerange="-100 100" />
+    <position name="act_openarm_right_finger_joint2" joint="openarm_right_finger_joint2" kp="200" ctrlrange="0 0.044" forcerange="-100 100" />
+  </actuator>
+</mujoco>

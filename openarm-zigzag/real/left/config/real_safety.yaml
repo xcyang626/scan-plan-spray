@@ -1,0 +1,27 @@
+# 真机安全配置(由 gen_real_config.py 从标定 zero 文件生成, 勿手改数值)
+# d_rad: 电机系→URDF 系综合偏移, urdf = motor - d
+zero_offsets_rad:
+  openarm_left_joint1: 0.000600000
+  openarm_left_joint2: -0.000200000
+  openarm_left_joint3: -0.000200000
+  openarm_left_joint4: 0.001000000
+  openarm_left_joint5: 0.000200000
+  openarm_left_joint6: -0.000200000
+  openarm_left_joint7: 0.000200000
+soft_limits_rad:
+  openarm_left_joint1: [-4.427940122, 0.390640122]
+  openarm_left_joint2: [-3.270140122, 0.138940122]
+  openarm_left_joint3: [-1.561540122, 1.565640122]
+  openarm_left_joint4: [0.001359878, 2.377740122]
+  openarm_left_joint5: [-1.610640122, 1.441640122]
+  openarm_left_joint6: [-1.151740122, 0.325840122]
+  openarm_left_joint7: [-1.583940122, 1.482140122]
+home_rad: [-0.000600000, 0.000200000, 0.000200000, 0.036266463, -0.000200000, 0.000200000, -0.000200000]
+# 安全回位关节速度上限(rad/s)——保守值, 宁慢勿快
+return_speed: 0.25
+# 异常运动判定阈值(rad/s), 连续 3 帧超限触发急停
+max_joint_vel: 4.0
+# 软限位触发额外余量(rad)
+trip_margin_rad: 0.035
+# 触发判定需要连续帧数
+trip_consecutive: 5

@@ -1,0 +1,45 @@
+# 真机 ros2_control 配置
+# 差异(vs 仿真): JTC 状态接口无 effort(模拟无此需求), 轨迹跟踪容差放宽
+# (真实 MIT 位置跟踪有稳态误差, 太严会 ABORT), goal_time 0 = 不限到位时间
+controller_manager:
+  ros__parameters:
+    update_rate: 100
+    left_joint_trajectory_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+
+left_joint_trajectory_controller:
+  ros__parameters:
+    joints:
+      - openarm_left_joint1
+      - openarm_left_joint2
+      - openarm_left_joint3
+      - openarm_left_joint4
+      - openarm_left_joint5
+      - openarm_left_joint6
+      - openarm_left_joint7
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position
+      - velocity
+    constraints:
+      stopped_velocity_tolerance: 0.05
+      goal_time: 0.0
+      # 2026-09-04: J5-J7 kp=10, 水平附近重力下垂可达 6-10°,
+      # 0.10 rad 容差会触发 PATH_TOLERANCE_VIOLATED 中止, 按刚度分档放宽
+      # J1 肩俯仰: 抬臂重力下垂实测爬到 0.15 压线中止, 放宽到 0.20
+      openarm_left_joint1: {trajectory: 0.20, goal: 0.15}
+      openarm_left_joint2: {trajectory: 0.15, goal: 0.10}
+      # J3=肩滚转: 竖直悬挂时滚转轴接近铅垂(奇异), 重力无杠杆, 转不动
+      # 是物理特性, 容差单独放宽; 走线段 J3 远离奇异区, 不受影响
+      openarm_left_joint3: {trajectory: 0.40, goal: 0.30}
+      openarm_left_joint4: {trajectory: 0.15, goal: 0.10}
+      openarm_left_joint5: {trajectory: 0.35, goal: 0.25}
+      openarm_left_joint6: {trajectory: 0.35, goal: 0.25}
+      openarm_left_joint7: {trajectory: 0.35, goal: 0.25}
+    allow_partial_joints_goal: false
+
+joint_state_broadcaster:
+  ros__parameters: {}

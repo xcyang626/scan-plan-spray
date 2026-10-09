@@ -1,0 +1,8 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+"""场景节点启动入口（ros2 run / launch 用）。
+固定 /usr/bin/python3: ROS2 Jazzy 绑定系统 Python3.12（含 numpy/rclpy），
+env python3 可能命中 conda python3.14 导致 ABI/模块不匹配。"""
+from openarm_sim.scene_node import main
+
+main()

@@ -1,0 +1,17 @@
+# MoveIt 轨迹执行: 只接左臂 JTC
+moveit_controller_manager: moveit_simple_controller_manager/MoveItSimpleControllerManager
+moveit_simple_controller_manager:
+  controller_names:
+    - left_joint_trajectory_controller
+  left_joint_trajectory_controller:
+    type: FollowJointTrajectory
+    joints:
+      - openarm_left_joint1
+      - openarm_left_joint2
+      - openarm_left_joint3
+      - openarm_left_joint4
+      - openarm_left_joint5
+      - openarm_left_joint6
+      - openarm_left_joint7
+    action_ns: follow_joint_trajectory
+    default: true

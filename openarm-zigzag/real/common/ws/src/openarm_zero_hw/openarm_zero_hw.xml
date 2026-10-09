@@ -1,0 +1,10 @@
+<library path="openarm_zero_hw">
+  <class name="openarm_zero_hw/ZeroOffsetHW"
+         type="openarm_zero_hw::ZeroOffsetHW"
+         base_class_type="hardware_interface::SystemInterface">
+    <description>
+      OpenArm hardware interface with zero-calibration offsets
+      (urdf = motor - d) and lock-on-activate behavior.
+    </description>
+  </class>
+</library>

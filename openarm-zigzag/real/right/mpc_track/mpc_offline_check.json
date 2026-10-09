@@ -1,0 +1,50 @@
+{
+  "ref": "/home/yang/桌面/openarm实验/仿真/moveit_sim/dense_zigzag_right.json",
+  "speed_scale": 0.4,
+  "ref_total_s": 377.7,
+  "n_commands": 37768,
+  "a_saturation_frac": 0.0022,
+  "n_clip_events": 220,
+  "min_soft_margin_deg": 3.0,
+  "track_cmd_max_deg": 1.0,
+  "track_plant_max_deg": 4.633,
+  "plant_track_max_deg_per_joint": [
+    2.88,
+    4.63,
+    2.62,
+    2.35,
+    2.63,
+    3.61,
+    1.74
+  ],
+  "ident_r2_per_joint": [
+    0.983,
+    0.058,
+    0.486,
+    0.005,
+    0.055,
+    0.065,
+    0.017
+  ],
+  "track_plant_weave_mean_deg": 2.401,
+  "cmd_rate_peak_deg_s": 100.0,
+  "cmd_rate_p99_deg_s": 17.25,
+  "rate_spike_event": [
+    1,
+    4,
+    100.00000022853332,
+    [
+      0.0,
+      0.0001,
+      -0.0001,
+      0.0799,
+      -0.0001,
+      -0.0001,
+      -0.0001
+    ],
+    "CLIPPED"
+  ],
+  "cmd_hf_step_mean_deg_s": 0.025,
+  "cmd_hf_step_max_deg_s": 100.0,
+  "plant": "代表性闭环二阶环 wn=12.0 ζ=1 + 重力/摩擦等效指令偏移; 右臂辨识 J2-J7 R²≈0 不可用(留档 ident_r2_per_joint)"
+}

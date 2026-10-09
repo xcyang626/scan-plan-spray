@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- Fast DDS 仅 UDP 传输: 标定节点以 root 运行(sudo), 默认 SHM 段为
+     root 属主, 普通用户 CLI 与节点 SHM 不互通(发现通、数据不通,
+     2026-09-09 实测服务调用全部无响应)。禁 SHM 走 UDP 回环后,
+     root/用户环境互相调用均正常。对 CLI 同样 export 本文件亦可。 -->
+<profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS/Profiles">
+  <transport_descriptors>
+    <transport_descriptor>
+      <transport_id>udp_v4_only</transport_id>
+      <type>UDPv4</type>
+    </transport_descriptor>
+  </transport_descriptors>
+  <participant profile_name="calibration_udp_only" is_default_profile="true">
+    <rtps>
+      <userTransports>
+        <transport_id>udp_v4_only</transport_id>
+      </userTransports>
+      <useBuiltinTransports>false</useBuiltinTransports>
+    </rtps>
+  </participant>
+</profiles>

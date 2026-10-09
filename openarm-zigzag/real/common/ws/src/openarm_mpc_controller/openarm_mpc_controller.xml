@@ -1,0 +1,13 @@
+<library path="openarm_mpc_controller">
+  <class name="openarm_mpc_controller/OpenArmMpcController"
+         type="openarm_mpc_controller::OpenArmMpcController"
+         base_class_type="controller_interface::ControllerInterface">
+    <description>
+      Preview-MPC trajectory controller (Route-1 plugin): accepts
+      FollowJointTrajectory like JTC, executes it with the closed-form
+      preview MPC (per-joint double integrator) at the controller-manager
+      rate, outputs position commands. Drop-in replacement for
+      joint_trajectory_controller/JointTrajectoryController.
+    </description>
+  </class>
+</library>

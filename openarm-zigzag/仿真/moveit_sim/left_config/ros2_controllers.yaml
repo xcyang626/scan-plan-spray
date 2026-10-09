@@ -1,0 +1,28 @@
+# ros2_control: fake 硬件 + 左臂 JTC + 关节状态广播
+controller_manager:
+  ros__parameters:
+    update_rate: 100
+    left_joint_trajectory_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+
+left_joint_trajectory_controller:
+  ros__parameters:
+    joints:
+      - openarm_left_joint1
+      - openarm_left_joint2
+      - openarm_left_joint3
+      - openarm_left_joint4
+      - openarm_left_joint5
+      - openarm_left_joint6
+      - openarm_left_joint7
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position
+      - velocity
+    # 注: jazzy JTC 不接受 effort 状态接口(会 init 失败)
+
+joint_state_broadcaster:
+  ros__parameters: {}

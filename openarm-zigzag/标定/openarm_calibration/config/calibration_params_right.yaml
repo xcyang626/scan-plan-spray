@@ -1,0 +1,101 @@
+# OpenArm 零点标定参数 —— 右臂(7 电机, 无夹爪 ESC8)
+# ========================
+# 由 calibration_params.yaml 派生, 差异仅:
+#   1. motor 表 7 台(ID 1-7), joint_names/joint_first_dir 去掉夹爪
+#   2. has_gripper: false(碰撞顺序不含夹爪, zero 文件 7 关节)
+#   3. zero_file_path: zero_right(与左臂 标定/zero 隔离, 防误覆盖)
+# 其余安全/刚度/时序参数与左臂完全一致。修改后重新 launch 生效。
+
+calibration_node:
+  ros__parameters:
+    # ---------- 总线 ----------
+    can_iface: "can0"
+    use_fd: true
+    control_rate_hz: 200.0
+
+    # ---------- 机械臂构型 ----------
+    arm_side: "right"            # 右臂(决定 J1/J2 碰撞方向)
+    robot_version: "v1"
+    has_gripper: false           # 右臂无夹爪电机 ESC8
+    motor_ids: [1, 2, 3, 4, 5, 6, 7]
+    motor_types: [7, 7, 3, 3, 1, 1, 1]   # J1-J2=DM8009 J3-J4=DM4340 J5-J7=DM4310
+    joint_names: ["openarm_joint1", "openarm_joint2", "openarm_joint3",
+                  "openarm_joint4", "openarm_joint5", "openarm_joint6",
+                  "openarm_joint7"]
+
+    # ---------- 安全 ----------
+    allow_motion: false
+    bump_timeout_s: 20.0
+    max_torque_scale: 1.0
+
+    # ---------- 电机寄存器限参 ----------
+    read_limits: true
+    fallback_limits: [12.5, 50.0, 5.0,
+                      12.5, 30.0, 10.0,
+                      12.5, 50.0, 10.0,
+                      12.5, 10.0, 28.0,
+                      12.5, 45.0, 20.0,
+                      12.5, 45.0, 20.0,
+                      12.5, 45.0, 40.0,
+                      12.5, 45.0, 54.0,
+                      12.5, 25.0, 200.0,
+                      12.5, 20.0, 200.0,
+                      12.5, 280.0, 1.0,
+                      12.5, 45.0, 10.0,
+                      12.5, 45.0, 10.0]
+
+    # ---------- 初始保持刚度(官方值)----------
+    hold_kp: [300.0, 300.0, 150.0, 150.0, 40.0, 40.0, 30.0]
+    hold_kd: [2.5, 2.5, 2.5, 2.5, 0.8, 0.8, 0.8]
+    grip_hold_kp: 10.0           # 无夹爪机型不使用, 保留防参数缺失
+    grip_hold_kd: 0.9
+
+    # ---------- 逐限位(bump)默认刚度 ----------
+    bump_kp: 45.0
+    bump_kd: 1.2
+    grip_dq_th: 0.3
+    grip_tau_th: 0.3
+    j1_dq_th: 0.0125
+    j1_tau_th: 5.0
+    default_dq_th: 0.1
+    default_tau_th: 2.0
+
+    # J1 防护摆 S 型缓动时长(秒): 线性匀速摆实测先慢后突快并结尾抖动,
+    # 6 秒余弦缓动两端零速, 重基座关节友好。
+    j1_protect_time_s: 6.0
+    j1_bump_kp: 280.0
+    j1_bump_kd: 2.1
+    j2_home_kp: 280.0
+    j2_home_kd: 2.0
+
+    # ---------- 插值运动默认刚度(官方值)----------
+    interp_kp: 52.0
+    interp_kd: 1.5
+    interp_time_s: 2.0
+
+    # ---------- 新标定流程参数 ----------
+    # 2026-09-09: 仅限位模式——排线修复后重测各关节停挡,
+    # 不做 set_zero, zero_position_rad 原样继承 hand-spliced-v1。
+    # 做完整零点+限位标定时改回 false。
+    limits_only: false
+    # J1 参与碰撞标定(线束二次整理后)。若 J1 实为无停挡, 逼近会持续
+    # 转动绞线——标定时人盯着线束, 出现张紧立即 /calibration_node/abort!
+    # (字符串格式: "1"=跳过 J1; 空串=全部参与)
+    no_bump_joints: ""
+    # J1 停挡若较远(上轮 20s 内未碰到处), 放宽单关节碰撞超时
+    bump_timeout_s: 30.0
+    zero_file_path: "/home/yang/桌面/openarm实验/标定/zero_right"
+    j1_protect_deg: 45.0
+    # J1 防护摆动方向(+1=正向): 左臂实测为负向; 右臂是镜像安装, 且
+    # 符号映射(FK 全 36 路点验证) J1 取反 ⇒ 右臂防护方向 = 正向。
+    # 标定时人盯着: 45° 摆动必须朝离开立柱的自由侧, 反向立即 abort!
+    j1_protect_dir: "positive"
+    zero_move_speed_deg: 10.0    # 回零限速: 比左臂(15)更慢, 首次右臂标定从缓
+    return_time_s: 3.0
+    # 各关节首次碰撞方向(+1=正向,-1=负向), 顺序 J1..J7:
+    # = 左臂实测值按符号映射 [−1,−1,−1,+1,−1,−1,−1] 逐关节翻转(J4 不变),
+    # 其中 J4 再翻为正向: 限位判定要求"先脱开起点 2°", 而折叠摆放位 J4
+    # 距下止点仅 ~1°, 负向首碰永远无法判定(2026-09-08 两次超时根因)。
+    # J4 改正向首碰(自由行程 ~130°), 下止点在回程第二碰时记录。
+    joint_first_dir: [1, 1, -1, 1, -1, -1, -1]
+    bump_step_deg: 0.1           # 碰限位步进: 比左臂(0.2)减半, 首跑更柔和

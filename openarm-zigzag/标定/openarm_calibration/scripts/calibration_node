@@ -1,0 +1,7 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+"""标定节点启动脚本（colcon 安装到 lib/openarm_calibration/）。"""
+from openarm_calibration.calibration_node import main
+
+if __name__ == "__main__":
+    main()

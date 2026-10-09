@@ -1,0 +1,26 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>openarm_calibration</name>
+  <version>1.0.0</version>
+  <description>
+    OpenArm 零点标定 ROS2 节点：基于官方 openarm_can 标定时序，
+    通过 SocketCAN/CANFD 驱动达妙电机完成 8 电机（J1-J7 + 夹爪）零点标定。
+    提供标定启停服务、关节状态与标定进度实时发布、错误处理与日志。
+  </description>
+  <maintainer email="openarm@example.com">yang</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>std_srvs</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

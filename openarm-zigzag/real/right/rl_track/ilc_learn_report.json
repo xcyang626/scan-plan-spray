@@ -1,0 +1,93 @@
+{
+ "generated": "2026-09-23 10:11:48",
+ "tool": "ilc_learn.py(欠账重构律, 2026-09-22)",
+ "source_csv": "/home/yang/桌面/openarm实验/real/right/rl_track/rl_exec_20260923_100137.csv",
+ "source_csv_sha16": "ccf636358b55cc92",
+ "base_ff": "/home/yang/桌面/openarm实验/real/right/rl_track/grav_ff_right.npz",
+ "base_ff_sha16": "8f6753ff75524241",
+ "ref": "/home/yang/桌面/openarm实验/real/right/rl_track/ref_right.npz",
+ "n_ref": 7179,
+ "covered_idx": [
+  0,
+  7175
+ ],
+ "extend": "hold",
+ "gamma": 0.6,
+ "fc_hz": 0.08,
+ "mask": [
+  1.5,
+  0.5
+ ],
+ "ramp_s": 2.0,
+ "tau_clamp": [
+  3.0,
+  3.0,
+  3.0,
+  2.0,
+  1.0,
+  1.0,
+  1.0
+ ],
+ "prev_delta": "/home/yang/桌面/openarm实验/real/right/rl_track/ilc_delta_right_iter2.npz",
+ "drive_const": {
+  "kp": [
+   120.0,
+   100.0,
+   70.0,
+   126.3,
+   30.0,
+   30.0,
+   30.0
+  ],
+  "kd": [
+   7.4,
+   12.2,
+   7.5,
+   8.04,
+   1.5,
+   1.5,
+   1.5
+  ],
+  "ki": [
+   12.0,
+   12.0,
+   12.0,
+   10.0,
+   8.0,
+   8.0,
+   8.0
+  ],
+  "iclamp": [
+   10.0,
+   10.0,
+   6.0,
+   8.0,
+   3.0,
+   3.0,
+   3.0
+  ],
+  "ema_a": 0.3
+ },
+ "note": "Δτ = clip(γ·LPF{kp·e_cmd + kd·ė_cmd + integ}, ±clamp); integ 由 CSV 按 50Hz 重构; 猎振(<0.3Hz)由 Q 滤波剔除不学习",
+ "delta_peak": [
+  1.8169151623419442,
+  1.9951843668497797,
+  0.8985595565590677,
+  0.8261539923887341,
+  0.13722191199582692,
+  0.3395940221255435,
+  0.242312848408637
+ ],
+ "tau_learn_peak": [
+  3.0281919372365738,
+  3.3253072780829664,
+  1.4975992609317796,
+  1.3769233206478901,
+  0.22870318665971154,
+  0.5659900368759059,
+  0.40385474734772836
+ ],
+ "composed_peak": 7.53730256065313,
+ "e_cmd_mean_deg": 0.30015337165106487,
+ "e_cmd_max_deg": 1.5905308392831656
+}

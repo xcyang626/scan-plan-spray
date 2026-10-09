@@ -1,0 +1,209 @@
+{
+ "checks": [
+  {
+   "name": "观测维度 == 训练观测空间",
+   "ok": true,
+   "detail": "actor 输入 67, 期望 67"
+  },
+  {
+   "name": "控制频率 == 50Hz",
+   "ok": true,
+   "detail": "ref dt = 0.0200s"
+  },
+  {
+   "name": "参考总时长在目标区间",
+   "ok": true,
+   "detail": "T_total = 143.6s"
+  },
+  {
+   "name": "参考 home == 真机 home",
+   "ok": true,
+   "detail": "ref [0.0, 0.0, 0.0, 0.0799, 0.0, 0.0, 0.0] vs yaml [0.0, 0.0, 0.0, 0.0799, 0.0, 0.0, 0.0]"
+  },
+  {
+   "name": "相位界单调且落在参考内",
+   "ok": true,
+   "detail": "i_out=423 i_back=6266 n=7179"
+  },
+  {
+   "name": "软限位来源",
+   "ok": true,
+   "detail": "real_safety.yaml"
+  },
+  {
+   "name": "真机 kp == 训练 kp",
+   "ok": true,
+   "detail": "[120.0, 100.0, 70.0, 126.3, 30.0, 30.0, 30.0]"
+  },
+  {
+   "name": "真机 kd == 训练 kd",
+   "ok": true,
+   "detail": "[7.4, 12.2, 7.5, 8.04, 1.5, 1.5, 1.5]"
+  },
+  {
+   "name": "注入话题 == rl 方案期望",
+   "ok": true,
+   "detail": "/right_rl_position_commands"
+  },
+  {
+   "name": "mpc_enable == rl 方案期望",
+   "ok": true,
+   "detail": "true"
+  },
+  {
+   "name": "控制器槽位与方案匹配",
+   "ok": true,
+   "detail": "joint_trajectory_controller/JointTrajectoryController"
+  },
+  {
+   "name": "驱动 ki 默认值 == 训练建模",
+   "ok": true,
+   "detail": "parse_list(get_param(\"ki\", \"12,12,12,10,8,8,8\"))"
+  },
+  {
+   "name": "驱动 integ_clamp == 训练建模",
+   "ok": true,
+   "detail": "±[10,10,6,8,3,3,3] Nm"
+  },
+  {
+   "name": "驱动绝对钳位 ±6.5rad",
+   "ok": true,
+   "detail": "命令超范围会被驱动截断"
+  },
+  {
+   "name": "驱动速率钳位 0.2rad/条",
+   "ok": true,
+   "detail": "防异常发布器(部署节点另加 0.05rad/条@50Hz)"
+  },
+  {
+   "name": "驱动前馈钳位 ff_clamp 默认",
+   "ok": true,
+   "detail": "±[15,15,20,20,5,5,5] Nm(0.75×额定, J2 峰值 ~7Nm)"
+  },
+  {
+   "name": "重力前馈训练↔部署配对(基线)",
+   "ok": true,
+   "detail": "训练侧 有 / 部署侧 有(两侧必须同时有/没有, 否则 sim2real 失配)"
+  },
+  {
+   "name": "前馈覆盖表存在(--ff-file)",
+   "ok": true,
+   "detail": "grav_ff_right_iter2.npz"
+  },
+  {
+   "name": "前馈表行数 ≥ 参考帧数",
+   "ok": true,
+   "detail": "7179 行 vs 参考 7179 帧"
+  },
+  {
+   "name": "前馈峰值在驱动钳位内(15/15/20/20/5³)",
+   "ok": true,
+   "detail": "峰值 8.96 Nm"
+  },
+  {
+   "name": "参考全程在指令盒内",
+   "ok": true,
+   "detail": "指令盒 = 软限位 ∓ 3°"
+  },
+  {
+   "name": "观测无 NaN/Inf",
+   "ok": true,
+   "detail": "0/7179 帧异常"
+  },
+  {
+   "name": "最坏情形单步指令增量 < 驱动钳位 0.2rad",
+   "ok": true,
+   "detail": "参考驱动理论最大 0.0086 rad/步"
+  },
+  {
+   "name": "全程关节误差 mean < 3.5°",
+   "ok": true,
+   "detail": "mean 1.20° / p95 2.18° / max 3.07°"
+  },
+  {
+   "name": "总时长 138~165s",
+   "ok": true,
+   "detail": "143.6s (转移出 8.4 + 走线 116.8 + 转移回 18.2)"
+  },
+  {
+   "name": "指令全程在 软限位−3° 盒内",
+   "ok": true,
+   "detail": "[-1.539, 3.147] rad"
+  },
+  {
+   "name": "实际关节位置未越软限位(容差0.5°)",
+   "ok": true,
+   "detail": "最差裕量 2.22° @J6 (watchdog 线在软限位外 2°)"
+  },
+  {
+   "name": "单步指令增量 < 0.2rad(驱动钳位)",
+   "ok": true,
+   "detail": "最大 0.0084 rad/步 @50Hz"
+  },
+  {
+   "name": "力矩在限值内",
+   "ok": true,
+   "detail": "|tau|max 9.9 Nm"
+  },
+  {
+   "name": "回放 HF σ(参考值, 非门限)",
+   "ok": true,
+   "detail": "J1 0.0120 / J2 0.0212 rad/s (JTC 基线 0.043/0.053)"
+  }
+ ],
+ "notes": [
+  "右臂 hand=false —— 训练时夹爪为固定件; hand=off 时 ESC8 未被使能, 夹爪可自由活动(质量 0.017kg, 影响很小)。若要严格对齐训练模型, 可重跑 gen_real_config.py --side right (--hand hold 是默认值)",
+  "部署使用覆盖前馈表 grav_ff_right_iter2.npz (基线 grav_ff_right.npz 不变, 删除 --ff-file 即回滚)"
+ ],
+ "audit_ok": true,
+ "replay_ok": true,
+ "ff_meta": {
+  "rows": 7179,
+  "peak": 8.964796677322875
+ },
+ "limits": {
+  "cmd_lo": [
+   -0.3165802444401701,
+   -0.11628024444017011,
+   -1.35458024444017,
+   0.09731975555982988,
+   -1.4663802444401701,
+   -0.7479802444401702,
+   -1.53918024444017
+  ],
+  "cmd_hi": [
+   4.37628024444017,
+   3.1811802444401702,
+   1.57138024444017,
+   2.3613802444401704,
+   1.47328024444017,
+   0.6164802444401701,
+   1.42748024444017
+  ],
+  "max_step_theory_rad": 0.00858142520372257,
+  "obs_nan_frames": 0
+ },
+ "replay": {
+  "T_total": 143.56,
+  "err_deg_mean": 1.196314578310098,
+  "err_deg_p95": 2.1765020011392258,
+  "err_deg_max": 3.067475284339403,
+  "tcp_err_mm_mean": 0.0,
+  "hf_J1": 0.012038184322795372,
+  "hf_J2": 0.021240532156772317,
+  "tau_max": 9.859242035039202,
+  "cmd_min": -1.53918024444017,
+  "cmd_max": 3.1471423495962116,
+  "cmd_in_box": true,
+  "cmd_step_max": 0.008423240910392094,
+  "q_in_soft": true,
+  "worst_margin_deg": 2.224642999910359,
+  "worst_j": 6.0,
+  "phase_dur": {
+   "transfer_out": 8.44,
+   "weave": 116.84,
+   "transfer_back": 18.239999999999995
+  }
+ },
+ "overall_ok": true
+}
