@@ -1,0 +1,27 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv*/
+
+# ---- ROS 2 / colcon 构建产物（可重建） ----
+build/
+install/
+log/
+
+# ---- g1-wall-spray 运行期产物 ----
+g1-wall-spray/output/
+g1-wall-spray/runs/
+g1-wall-spray/release/
+g1-wall-spray/station/run/
+g1-wall-spray/station/robot_status.json
+g1-wall-spray/station/robot.pid
+g1-wall-spray/station/*.fifo
+
+# ---- pointcloud-registration 运行输出（样例输入 ply 已入库，不放输出） ----
+pointcloud-registration/舱室点云/舱室地图机器人扫描版本.*
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+.DS_Store
+*.bak*
