@@ -20,6 +20,9 @@
   3) 语义标签传播：S 变换回参考系后用体素哈希最近邻迁移 M 的语义标签。
   4) 输出 舱室地图机器人扫描版本.ply（原黑白点云的语义标签地图，不覆盖原始黑白图）。
 
+注：文件中另保留一组“对照路径”函数（附件式通用方法：SI 关键点/FPFH/几何一致性/
+  RANSAC/定阈值点到面ICP），当前主管线 main() 未调用，仅用于与房间适配主管线对照。
+
 依赖：仅 numpy + matplotlib。
 """
 import os, heapq
@@ -144,8 +147,10 @@ class KDTree:
 # ------------------------------------------------------------------ 工具
 def voxel_subsample(xyz, leaf, max_n=None, seed=0):
     cell = np.floor(xyz / leaf).astype(np.int64)
-    key = cell[:,0]*1000000 + cell[:,1]*1000 + cell[:,2]
-    _, first = np.unique(key, return_index=True)
+    # 体素键直接按三维格坐标整行去重：原 c0*1e6+c1*1e3+c2 混合键在任一轴
+    # 跨度≥1000 格时发生哈希碰撞，会把不同体素的点静默合并丢点
+    # （gen_robot_scan leaf=4mm 时 y 轴可跨约 1262 格，必然触发）
+    _, first = np.unique(cell, axis=0, return_index=True)
     sel = first.astype(np.int64)
     if max_n and len(sel) > max_n:
         sel = np.random.default_rng(seed).choice(sel, max_n, replace=False)
@@ -169,6 +174,7 @@ def orient_toward_center(xyz, normals):
     normals[flip] *= -1
     return normals
 
+# ===================== 对照路径：附件式关键点检测（当前主管线未调用） =====================
 def _shape_index(xyz, normals, idx):
     """附件式形状指数(Shape Index)：对邻域做局部二次曲面拟合 z=f(x,y)，
     由Hessian特征值得主曲率κ1,κ2，SI=1/2-(1/π)arctan((κ1+κ2)/(κ1-κ2))。
@@ -189,7 +195,9 @@ def _shape_index(xyz, normals, idx):
         AtA = np.einsum("bki,bkj->bij", A, A) + 1e-8*np.eye(6)
         Atb = np.einsum("bki,bk->bi", A, z)
         coef = np.linalg.solve(AtA, Atb[...,None])[...,0]  # (b,6): a0,a1,a2,a3,a4,a5
-        a3, a4, a5 = coef[:,2], coef[:,3], coef[:,4]
+        # 二次项系数为 x²、xy、y²，即 coef 第 3/4/5 列（原代码取 2/3/4 列，
+        # 把线性 y 当二次项、丢了 y² 项，导致 Hessian 错位）
+        a3, a4, a5 = coef[:,3], coef[:,4], coef[:,5]
         tr = 2*a3 + 2*a5; det = 4*a3*a5 - a4*a4
         disc = np.abs(tr*tr - 4*det)
         kp = 0.5*(tr + np.sqrt(disc)); km = 0.5*(tr - np.sqrt(disc))
@@ -199,7 +207,8 @@ def _shape_index(xyz, normals, idx):
 
 def select_keypoints(xyz, normals, curv, frac=0.10, min_dist=150.0, seed=1,
                      kn=18, alpha=0.25, beta=0.25):
-    """附件式关键点检测（Shape Index判据，适配房间场景）。
+    """【对照路径，当前主管线未调用】附件式关键点检测（Shape Index判据，适配房间场景）。
+    注意：此处只用 (1±α)μ 阈值筛选，未实现附件式 4-29 的“SI≥邻域最大值”局部极值条件。
     保留局部SI相对邻域均值μ显著偏大/偏小的结构点（棱线、窗框、门框、加强筋等），
     并剔除位于点云边界附近支持不足的候选点（附件式边界剔除），最后空间去重。"""
     kdt = KDTree(xyz); n = len(xyz)
@@ -236,7 +245,7 @@ def select_keypoints(xyz, normals, curv, frac=0.10, min_dist=150.0, seed=1,
 
 def select_structure_keypoints(xyz, normals, min_dist=150.0, kn=28, thr2=0.12,
                                maxpts=9000, seed=1):
-    """结构化关键点：舱室墙角/墙面交线 + 门(窗)框边缘（面向室内场景的配准关键点）。
+    """【对照路径，当前主管线未调用】结构化关键点：舱室墙角/墙面交线 + 门(窗)框边缘（面向室内场景的配准关键点）。
     房间是长方体结构，法线主轴方向只有±x/±y/±z三类：
     - 墙角/墙面交线：邻域内法线主轴类别≥两类且第二占比达阈值(如相邻墙 x∩z 交线、
       三面交汇的房间角 x∩y∩z)的点即为墙角类关键点。
@@ -461,16 +470,23 @@ def floor_init(X, Y, leaf=40.0, seed=5, maxv=30000, band=200.0):
         nrm, _ = estimate_normals(sub, 17)
         nrm = orient_toward_center(sub, nrm.copy())
         Hz = np.abs(nrm[:,2]) > 0.85
-        hyp = sub[Hz]
+        hidx = np.nonzero(Hz)[0]                 # 水平面点在 sub 中的原始索引
+        hyp = sub[hidx]
         if len(hyp) < 200: return None, None
         h, e = np.histogram(hyp[:,2], bins=40)
         z0 = 0.5*(e[np.argmax(h)] + e[np.argmax(h)+1])
-        gr = hyp[np.abs(hyp[:,2]-z0) < band]
-        n = nrm[Hz].mean(0); n /= np.linalg.norm(n)
+        band_m = np.abs(hyp[:,2]-z0) < band
+        gr = hyp[band_m]
+        # 地面法向只对 z0 附近地面带(gr)取均值：Hz 同时含地面与天花两层水平面，
+        # 对全部水平点取均值会法向相互抵消，得到噪声方向
+        n = nrm[hidx[band_m]].mean(0); n /= np.linalg.norm(n)
         return gr.mean(0), n
     fs, ns = floor_part(X); fm, nm = floor_part(Y)
     if fs is None or fm is None:
-        return np.eye(3), fm[:3] - fs[:3]
+        # 地面初值不可用（至少一侧地面提取失败）：回退整体质心差平移（单位旋转），
+        # 剩余位姿差交由精配准自适应ICP收敛
+        print("[警告] 地面提取失败, 地面初值不可用, 回退整体质心差平移")
+        return np.eye(3), Y.mean(0) - X.mean(0)
     axis = np.cross(ns, nm); ang = np.arccos(np.clip(np.dot(ns, nm), -1, 1))
     R = np.eye(3)
     if np.linalg.norm(axis) > 1e-6:
@@ -510,15 +526,17 @@ def corner_registration(CS, CM, tol_ratio=0.02, flat=400.0, th=400.0):
                 q = CS@R.T + t
                 d = ((q[:,None,:]-CM[None,:,:])**2).sum(2).min(1)
                 nin = int((d < th).sum())
-                if nin > best_n: best_n = nin
+                # 先相对“当前最优”判定再收录：达到 max(最优-1,3) 才收录，收录同时更新最优。
+                # （原实现先 best_n=nin 再判定恒真、末尾过滤分支永假，属死代码）
+                # 初值 best_n=-1：首个候选仅需 nin>=3 即收录
                 if nin >= max(best_n - 1, 3):
+                    best_n = max(best_n, nin)
                     key = (np.round(R,3).tobytes(), np.round(t,0).tobytes())
                     if key not in found or found[key][2] < nin:
-                        found[key] = (R, t, nin); found = dict(sorted(found.items(),
-                                     key=lambda kv: kv[1][2], reverse=True))
-                if nin > best_n:
-                    found = {k: v for k, v in found.items() if v[2] >= nin}
-    cands = [(R, t) for (R, t, _) in list(found.values())[:8]]
+                        found[key] = (R, t, nin)
+    # 兜底：按全体角点内点数排序，取前 8 个候选变换
+    cands = [(R, t) for (R, t, _) in sorted(found.values(),
+             key=lambda v: v[2], reverse=True)[:8]]
     return cands if cands else [(np.eye(3), np.zeros(3))], best_n
 
 # ------------------------------------------------------------------ 配准
@@ -539,6 +557,7 @@ def svd_transform(src, dst):
 def apply(R, t, P):
     return P @ R.T + t
 
+# ============ 对照路径：附件式 FPFH 特征 + 几何一致性 + RANSAC 粗配准（当前主管线未调用） ============
 def fpfh_descriptors(xyz, normals, kp, kn=20):
     kdt = KDTree(xyz)
     nb, _ = kdt.query(xyz[kp], kn)
@@ -561,6 +580,7 @@ def fpfh_descriptors(xyz, normals, kp, kn=20):
     return np.stack(out)
 
 def match_features(d1, d2, ratio=0.8):
+    """【对照路径，当前主管线未调用】FPFH 最近邻比值检验匹配。"""
     corr = []
     for i in range(len(d1)):
         dd = np.sum((d2-d1[i])**2, 1)
@@ -570,7 +590,7 @@ def match_features(d1, d2, ratio=0.8):
     return np.array(corr, np.int64) if corr else np.empty((0,2),np.int64)
 
 def gc_filter(corr, ps_s, ps_m, gamma=0.20, keep_ratio=0.6, seed=0):
-    """几何一致性筛选：保留与多数对应满足刚性距离一致性的对应（附件式）。
+    """【对照路径，当前主管线未调用】几何一致性筛选：保留与多数对应满足刚性距离一致性的对应（附件式）。
     返回筛选后的对应子集。corr 行对应源/目标关键点坐标 ps_s / ps_m(与corr同序)。"""
     nc = len(corr)
     if nc <= 8: return corr, nc
@@ -603,6 +623,7 @@ def gc_filter(corr, ps_s, ps_m, gamma=0.20, keep_ratio=0.6, seed=0):
     return corr[np.array(sorted(best), np.int64)], len(best)
 
 def ransac_coarse(corr, xyz_s, xyz_m, kp_s, kp_m, iters=4000, inlier_th=0.06):
+    """【对照路径，当前主管线未调用】附件式 RANSAC 粗配准（配合 fpfh/match_features/gc_filter）。"""
     ps = xyz_s[kp_s[corr[:,0]]]; pm = xyz_m[kp_m[corr[:,1]]]
     N = len(corr)
     if N < 4:
@@ -623,6 +644,7 @@ def ransac_coarse(corr, xyz_s, xyz_m, kp_s, kp_m, iters=4000, inlier_th=0.06):
     return best_R, best_t, best_in, N
 
 def point_to_plane_icp(src, dst, dst_n, R, t, max_iter=50, tol=1e-7, max_dist=0.05):
+    """【对照路径，当前主管线未调用】定阈值点到面 ICP（主管线用 point_to_plane_icp_adaptive）。"""
     kdt = KDTree(dst); prev = 1e9
     for it in range(max_iter):
         q = apply(R, t, src)
@@ -646,13 +668,14 @@ def point_to_plane_icp(src, dst, dst_n, R, t, max_iter=50, tol=1e-7, max_dist=0.
     return R, t, float(np.sqrt(((Q-dst[qi[:,0]])**2).sum(1).mean()))
 
 def point_to_plane_icp_adaptive(src, dst, dst_n, R, t, max_iter=60,
-                                eps_rmse=1e-5, eps_inlier=1e-3, cap=150.0):
+                                eps_rmse=1e-3, eps_inlier=1e-3, cap=150.0):
     """附件式精配准：自适应距离阈值误匹配去除 + 点到面 + 李代数增量 + 双重收敛判据。
     - 误匹配去除：每轮按对应点距离分布计算自适应阈值 ε_adp=μ_d+0.1σ_d（附件4-46），
       仅保留距离<ε_adp的内点参与位姿估计；cap为安全上界，避免初期阈值过大。
     - 位姿增量：点到面残差 + 李代数(δω,δt)线性最小二乘正规方程，指数映射更新。
     - 收敛判据：残差稳定性δ_rmse≤ε_rmse 且 内点比例稳定性δ_inlier≤ε_inlier（附件4-61），
-      或达到最大迭代次数。
+      或达到最大迭代次数。数据单位为 mm，ε_rmse=1e-3 即残差变化小于 0.001mm 视为稳定
+      （原 1e-5 对应 0.00001mm，mm 尺度下几乎不可能达到，双判据永不触发）。
     房间适配：对以平面为主的室内场景，自适应阈值天然对地面/墙面的大范围对应保持宽容，
     随收敛自动收紧，抑制非重叠区域误匹配。"""
     kdt = KDTree(dst)
@@ -702,8 +725,10 @@ def label_transfer(xyz_s, xyz_m, label_m, leaf=0.02, thresh=0.02):
             cc[:,0] += dx; cc[:,1] += dy; cc[:,2] += dz
             keys = pack(cc)
             u, inv = np.unique(keys, return_inverse=True)
+            # searchsorted(side='left') 返回首个 >=u 的位置：pos==0 也可能是命中
+            # （恰为排序后第一个体素键），原 pos>0 会把该体素邻域的点全部丢标签
             pos = np.searchsorted(uniq_m, u)
-            found = (pos < len(uniq_m)) & (pos > 0) & (uniq_m[np.clip(pos,0,len(uniq_m)-1)] == u)
+            found = (pos < len(uniq_m)) & (pos >= 0) & (uniq_m[np.clip(pos,0,len(uniq_m)-1)] == u)
             for ui in np.nonzero(found)[0]:
                 k = int(pos[ui])
                 qm = inv == ui; lo = start[k]; hi = start[k+1]
@@ -759,7 +784,11 @@ def main():
         cands = cands + [(d_R, d_t)]
         print("  已加入门框候选(消歧义)")
     Rc, tc = select_by_overlap(cands, Ssub, Ms, th=250.0)   # 稠密重叠度择优，消除墙角对称歧义
-    print("  粗配准候选 %d 个, 墙角内点 %d/%d"%(len(cands), ncorner, min(len(CS), len(CM))))
+    # 墙角检测失败(CS/CM 为 None 或空)时不输出内点统计，避免 min(len,len) 崩溃
+    if CS is not None and CM is not None and len(CS) and len(CM):
+        print("  粗配准候选 %d 个, 墙角内点 %d/%d"%(len(cands), ncorner, min(len(CS), len(CM))))
+    else:
+        print("  粗配准候选 %d 个, 墙角地标未检出, 跳过墙角内点统计"%len(cands))
     # 真值：参考系(S_REF) → 机器人系由 gt_robot_scan.npy 记录；配准目标是把机器人系映射回参考系，
     # 故真变换为 GT 之逆。
     GT = np.load(os.path.join(BASE, "gt_robot_scan.npy"))

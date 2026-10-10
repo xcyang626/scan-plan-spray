@@ -32,15 +32,16 @@ def read_binary_stl(path):
     cnt = np.frombuffer(data[80:84], dtype="<u4")
     if len(cnt) == 1 and cnt[0] * 50 + 84 == len(data):
         # 二进制 STL：80字节头 + uint32 面数 + 每面50字节(法向量12 + 3顶点36 + 属性2)
-        # 每面独立解析，兼容任意三角形面数对应的字节对齐
+        # 用结构化 dtype 一次性向量化读取（每面恰 50 字节、字段紧凑无对齐填充），
+        # 替代原逐面 Python 循环，结果逐位一致
+        dt_stl = np.dtype([("n", "<f4", (3,)), ("v", "<f4", (3, 3)), ("a", "<u2")])
+        assert dt_stl.itemsize == 50
         nrec = (len(data) - 84) // 50
-        out = np.empty((nrec, 12), dtype=np.float32)
-        for k in range(nrec):
-            out[k] = np.frombuffer(data, dtype="<f4", count=12, offset=84 + 50 * k)
-        return out[:, 3:12].reshape(-1, 3, 3)  # 丢弃法向量，仅取三个顶点
-    # ASCII STL 回退
+        rec = np.frombuffer(data, dtype=dt_stl, count=nrec, offset=84)
+        return rec["v"]  # 丢弃法向量，仅取三个顶点
+    # ASCII STL 回退（原实现对 findall 的三元组逐个 float() 会 TypeError，直接整体转数组）
     text = data.decode("ascii", errors="ignore")
-    pts = np.array([float(x) for x in re.findall(r"vertex\s+([-\d.eE]+)\s+([-\d.eE]+)\s+([-\d.eE]+)", text)],
+    pts = np.array(re.findall(r"vertex\s+([-\d.eE]+)\s+([-\d.eE]+)\s+([-\d.eE]+)", text),
                    dtype=np.float64)
     return pts.reshape(-1, 3, 3)
 
@@ -82,10 +83,13 @@ def part_colors(n_parts):
     val = np.where(band == 0, 0.95, 0.75)
     h = hue / 60.0
     x = 1.0 - np.abs(h % 2 - 1.0)
+    # 标准 HSV→RGB 分段：激活段取 1、上升/下降段取 x、非激活段取 0
+    # （原实现在非激活段也取 x：R 的 h∈[2,4)、G 的 h∈[4,6)、B 的 h∈[0,2)
+    #   均应为 0，导致纯绿偏黄、紫色偏灰等色偏）
     c = (val * sat)[:, None] * np.stack([
-        np.where((h < 1) | (h >= 5), 1.0, x),                      # R
-        np.where((h < 3) & (h >= 1), 1.0, x),                      # G
-        np.where((h >= 3) & (h < 5), 1.0, x),                      # B
+        np.where((h < 1) | (h >= 5), 1.0, np.where((h < 2) | (h >= 4), x, 0.0)),  # R
+        np.where((h >= 1) & (h < 3), 1.0, np.where(h < 4, x, 0.0)),               # G
+        np.where((h >= 3) & (h < 5), 1.0, np.where(h >= 2, x, 0.0)),              # B
     ], axis=1)
     m = (val * (1.0 - sat))[:, None]                                # m = V - C (C = V·S 为纯色标量)
     rgb = c + m
@@ -144,19 +148,24 @@ def main():
     counts = [max(MIN_POINTS_PER_PART, round(TOTAL_POINTS * (m["area"] / total_area)))
               for m in metas]
 
-    # 第二遍：采样合并
+    # 第二遍：采样合并 —— 按 counts 前缀和预分配总空间后逐段填充，
+    # 替代原循环 vstack 的反复整块拷贝（O(n²) 拷贝 → O(n) 填充）
     colors = part_colors(len(metas))
-    all_xyz = np.empty((0, 3), dtype=np.float64)
-    all_id = np.empty(0, dtype=np.uint16)
-    all_rgb = np.empty((0, 3), dtype=np.uint8)
+    starts = np.concatenate(([0], np.cumsum(counts))).astype(np.int64)  # 各零件段起点(前缀和)
+    all_xyz = np.empty((int(starts[-1]), 3), dtype=np.float64)
+    all_id = np.empty(int(starts[-1]), dtype=np.uint16)
+    all_rgb = np.empty((int(starts[-1]), 3), dtype=np.uint8)
+    off = 0
     for i, (meta, cnt) in enumerate(zip(metas, counts)):
         pts = area_weighted_sample(meta["verts"], cnt)
-        color = colors[i]
-        all_xyz = np.vstack([all_xyz, pts])
-        all_id = np.hstack([all_id, np.full(cnt, i, dtype=np.uint16)])
-        all_rgb = np.vstack([all_rgb, np.tile(color, (cnt, 1))])
+        all_xyz[off:off + len(pts)] = pts
+        all_id[off:off + len(pts)] = i
+        all_rgb[off:off + len(pts)] = colors[i]
+        off += len(pts)
         print(f"[{i + 1}/{len(metas)}] {os.path.basename(meta['path'])}  "
               f"面积={meta['area']:.1f}mm2 点数={cnt}")
+    # 退化零件(面积0)返回点数可能少于分配数：截去未填充尾部，保持三数组等长
+    all_xyz, all_id, all_rgb = all_xyz[:off], all_id[:off], all_rgb[:off]
 
     print(f"\n点云总点数: {len(all_xyz)}")
     lo, hi = all_xyz.min(axis=0), all_xyz.max(axis=0)

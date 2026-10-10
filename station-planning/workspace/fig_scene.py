@@ -1,20 +1,28 @@
 """图: 舱室语义点云总览 + 示例墙(左墙)3D点云图"""
+import os
+import sys
+from pathlib import Path
+
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa
 
-plt.rcParams["font.sans-serif"] = ["Microsoft YaHei"]
+plt.rcParams["font.sans-serif"] = ["Noto Sans CJK SC", "WenQuanYi Zen Hei", "Microsoft YaHei"]
 plt.rcParams["axes.unicode_minus"] = False
 
-W = r"c:\Users\Yangon\Desktop\舱室绝缘喷涂人形机器人技术方案\喷涂点位划分\work"
-FIG = r"c:\Users\Yangon\Desktop\舱室绝缘喷涂人形机器人技术方案\喷涂点位划分\figs"
-import os
+# 数据目录: 优先环境变量 STATION_DATA; 图片目录: 优先 STATION_FIGS, 未设时取仓库内默认
+W = Path(os.environ.get("STATION_DATA", Path(__file__).resolve().parent / "数据"))
+FIG = Path(os.environ.get("STATION_FIGS", Path(__file__).resolve().parent.parent / "figures"))
+for f in ("xyz.npy", "rgb.npy"):
+    if not (W / f).exists():
+        sys.exit(f"[路径] 缺少数据文件 {W / f}: 请将点云缓存(xyz.npy/rgb.npy)放入该目录, "
+                 f"或设置环境变量 STATION_DATA 指向数据目录")
 os.makedirs(FIG, exist_ok=True)
 
-xyz = np.load(W + r"\xyz.npy") / 1000.0
-rgb = np.load(W + r"\rgb.npy")
+xyz = np.load(W / "xyz.npy") / 1000.0
+rgb = np.load(W / "rgb.npy")
 ORIGIN = np.array([209073.0, 4380.0, 57558.0]) / 1000.0
 xyz = xyz - ORIGIN
 
@@ -57,7 +65,7 @@ ax.tick_params(labelsize=8)
 ax.legend(loc="upper left", fontsize=8, framealpha=0.9, markerscale=6)
 ax.set_zlim(0, 3.92)
 plt.tight_layout()
-plt.savefig(FIG + r"\fig_scene.png", dpi=200)
+plt.savefig(FIG / "fig_scene.png", dpi=200)
 plt.close()
 print("fig_scene.png done")
 
@@ -97,6 +105,6 @@ ax.set_box_aspect((1.2, 5.06, 3.92))
 ax.set_xlim(-0.05, 0.75)
 ax.tick_params(labelsize=8)
 plt.tight_layout()
-plt.savefig(FIG + r"\fig_wall3d.png", dpi=200)
+plt.savefig(FIG / "fig_wall3d.png", dpi=200)
 plt.close()
 print("fig_wall3d.png done")

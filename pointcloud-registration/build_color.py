@@ -82,9 +82,15 @@ for p,axis in [(264,0),(287,0),(275,1),(276,1)]:
         openings.append((axis, lo[axis]+1, u0,u1, v0,v1, p))
 print(f"地面顶面Z={floor_top:.0f}  开洞总数={len(openings)}  各洞底部离地(mm): " +
       ", ".join(f"{o[4]-floor_top:.0f}({'XYZ'[o[0]]}墙{o[6]})" for o in openings))
-# 门=落地(底部离地面最近)的开洞；其余=窗
-door = min(openings, key=lambda o: abs(o[4]-floor_top))
-filled = [(*o, ("door" if o is door else "window")) for o in openings]
+if not openings:
+    # 开洞列表为空：后续 min(openings) 必然 ValueError，直接中文报错退出
+    raise SystemExit("[错误] 未检出任何开洞, 请检查墙面 part_id 配置与开洞检测参数")
+# 门=底部离地低于阈值的全部落地开洞；其余=窗。
+# 原实现只取"底部离地最近"的单一洞为门, 多门场景会漏标；
+# 阈值 450mm 与 register_and_label.detect_door_frame 的 tol_floor(门触地容差)口径一致
+DOOR_FLOOR_TOL = 450.0
+filled = [(*o, ("door" if abs(o[4]-floor_top) <= DOOR_FLOOR_TOL else "window"))
+          for o in openings]
 
 # ---- 原有点基础着色 ----
 color=np.zeros((len(pid),3),dtype=np.uint8); color[:]=C["other"]

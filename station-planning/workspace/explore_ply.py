@@ -1,7 +1,20 @@
-import numpy as np
-import struct
+"""读取语义标注 ply(字段: x,y,z float32 + part_id uint16 + r,g,b uint8),
+   导出 xyz/rgb/pid 三个 npy 缓存供 analyze_*/fig_* 脚本使用"""
+import os
+import sys
+from pathlib import Path
 
-PLY = r"c:\Users\Yangon\.trae-cn\attachments\6a87c1a056617ae4ad10f9da\d292b523-42b2-4ce1-b436-36ef35603d7f_7154ca79-a3f1-44b1-9f01-ee3b3416691a_舱室点云_语义标注.ply"
+import numpy as np
+
+# 数据目录: 优先环境变量 STATION_DATA, 未设时默认脚本同级 "数据" 目录;
+# 源 ply: 优先环境变量 STATION_PLY, 未设时默认数据目录下的 舱室点云_语义标注.ply
+# 注: 仓库内 pointcloud-registration/舱室点云/ 中的 ply 字段名为 red/green/blue
+# 且仅 30 万点, 与本脚本期望的 r/g/b 字段(约 502 万点原扫描)不同, 不能直接替代。
+W = Path(os.environ.get("STATION_DATA", Path(__file__).resolve().parent / "数据"))
+PLY = Path(os.environ.get("STATION_PLY", W / "舱室点云_语义标注.ply"))
+if not PLY.exists():
+    sys.exit(f"[路径] 缺少语义点云文件 {PLY}: 请将 舱室点云_语义标注.ply (字段 x,y,z,part_id,r,g,b) "
+             f"放入 {W}, 或设置环境变量 STATION_PLY 指向该文件")
 
 with open(PLY, "rb") as f:
     header = b""
@@ -33,7 +46,8 @@ for v in np.unique(pid):
     m = pid == v
     print(f"part_id={v}: n={m.sum()}, bbox=({xyz[m].min(axis=0).round(2)}, {xyz[m].max(axis=0).round(2)})")
 
-np.save(r"c:\Users\Yangon\Desktop\舱室绝缘喷涂人形机器人技术方案\喷涂点位划分\work\xyz.npy", xyz.astype(np.float32))
-np.save(r"c:\Users\Yangon\Desktop\舱室绝缘喷涂人形机器人技术方案\喷涂点位划分\work\rgb.npy", rgb.astype(np.uint8))
-np.save(r"c:\Users\Yangon\Desktop\舱室绝缘喷涂人形机器人技术方案\喷涂点位划分\work\pid.npy", pid)
-print("\nsaved npy caches")
+W.mkdir(parents=True, exist_ok=True)
+np.save(W / "xyz.npy", xyz.astype(np.float32))
+np.save(W / "rgb.npy", rgb.astype(np.uint8))
+np.save(W / "pid.npy", pid)
+print("\nsaved npy caches ->", W)

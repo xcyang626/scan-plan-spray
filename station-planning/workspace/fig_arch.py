@@ -1,13 +1,17 @@
 """图: 喷涂工位规划算法 总体设计框图 (分层架构, 参考图1样式)"""
+import os
+from pathlib import Path
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.patches import FancyBboxPatch, FancyArrowPatch
 
-plt.rcParams["font.sans-serif"] = ["Microsoft YaHei"]
+plt.rcParams["font.sans-serif"] = ["Noto Sans CJK SC", "WenQuanYi Zen Hei", "Microsoft YaHei"]
 plt.rcParams["axes.unicode_minus"] = False
 
-FIG = r"c:\Users\Yangon\Desktop\舱室绝缘喷涂人形机器人技术方案\喷涂点位划分\figs"
+# 图片输出目录: 优先环境变量 STATION_FIGS, 未设时默认仓库 station-planning/figures
+FIG = Path(os.environ.get("STATION_FIGS", Path(__file__).resolve().parent.parent / "figures"))
 
 fig, ax = plt.subplots(figsize=(12.4, 8.6))
 ax.set_xlim(0, 12.4)
@@ -116,6 +120,6 @@ ax.text(12.08, 2.06, "下游:\n路径规划\n喷涂轨迹\n规划", fontsize=8.8
 
 ax.set_title("喷涂工位规划算法总体设计框图", fontsize=15, fontweight="bold", pad=14)
 plt.tight_layout()
-plt.savefig(FIG + r"\fig_architecture.png", dpi=200, bbox_inches="tight")
+plt.savefig(FIG / "fig_architecture.png", dpi=200, bbox_inches="tight")
 plt.close()
 print("fig_architecture done")

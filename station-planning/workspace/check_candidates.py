@@ -1,39 +1,8 @@
-"""验证候选顺序的交叉数与长度"""
+"""验证候选顺序的交叉数与长度: 站位表见 stations.py 单一数据源
+   候选: 原始(墙面分组) / 局部交换(墙角微调, 采纳序) / 2-opt"""
 import numpy as np
 
-RX, RY = 3.228, 5.058
-D_R = 0.80
-
-stations = {
-    "right": [("R2", 1.29, "stiff"), ("R3", 1.89, "stiff"), ("R4", 2.29, "stiff"),
-              ("R5", 2.73, "stiff"), ("R6", 3.13, "stiff"), ("R7", 3.57, "stiff"),
-              ("R8", 3.97, "stiff"), ("R9", 4.41, "stiff")],
-    "back": [("B1", 0.60, "normal"), ("B2", 1.40, "normal"),
-             ("B3", 2.01, "stiff"), ("B4", 2.61, "stiff")],
-    "left": [("L1", 0.60, "stiff"), ("L2", 1.05, "stiff"), ("L3", 1.45, "stiff"),
-             ("L4", 1.89, "stiff"), ("L5", 2.29, "stiff"), ("L6", 2.73, "stiff"),
-             ("L7", 3.595, "normal"), ("L8", 4.15, "normal")],
-    "front": [("F2", 0.60, "normal"), ("F3", 1.40, "normal"),
-              ("F4", 2.01, "stiff"), ("F5", 2.61, "stiff")],
-}
-corners = {"C_FL": (0.40, 0.40), "C_FR": (RX - 0.40, 0.40),
-           "C_BL": (0.40, RY - 0.40), "C_BR": (RX - 0.40, RY - 0.40)}
-
-def station_xy(wall, s):
-    _, u, _ = s
-    if wall == "left":   return D_R, u
-    if wall == "right":  return RX - D_R, u
-    if wall == "front":  return u, D_R
-    return u, RY - D_R
-
-def get_xy(name):
-    if name in corners:
-        return corners[name]
-    for wall, lst in stations.items():
-        for s in lst:
-            if s[0] == name:
-                return station_xy(wall, s)
-    raise KeyError(name)
+from stations import ORDER, ORDER_RAW, get_xy
 
 def orient(a, b, c):
     return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
@@ -71,12 +40,11 @@ def path_len(order):
     return sum(np.linalg.norm(np.array(pts[i+1]) - np.array(pts[i])) for i in range(len(pts)-1))
 
 candidates = {
-    "原始(墙面分组)": ["R2","R3","R4","R5","R6","R7","R8","R9","C_BR",
-                     "B4","B3","B2","B1","C_BL",
-                     "L8","L7","L6","L5","L4","L3","L2","L1","C_FL",
-                     "F2","F3","F4","F5","C_FR"],
-    "局部交换(墙角微调)": ["R2","R3","R4","R5","R6","R7","R8","R9","B4","C_BR","B3","B2","C_BL","B1",
-                       "L8","L7","L6","L5","L4","L3","L2","L1","F2","C_FL","F3","F4","F5","C_FR"],
+    # 原始墙面分组: 各墙走完后经墙角站位转入下一墙 (D_R=0.80 有 3 处交叉)
+    "原始(墙面分组)": ORDER_RAW,
+    # 局部交换: 墙角站位插入墙面中间消除交叉 (B4→C_BR→B3, B2→C_BL→B1, F2→C_FL→F3)
+    "局部交换(墙角微调)": ORDER,
+    # 2-opt 结果 (由 opt2.py 对 ORDER_RAW 迭代得到, 此处静态列出供对比)
     "2-opt": ["R2","R3","R4","R5","R6","R7","R8","B4","C_BR","R9","B3","B2","C_BL","B1",
               "L8","L7","L6","L5","L4","L3","L2","F2","C_FL","L1","F3","F4","F5","C_FR"],
 }

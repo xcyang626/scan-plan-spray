@@ -59,7 +59,7 @@ def find_holes(p, axis, name):
         hch = (hmm == False)  # 洞bbox内非本洞=材料
         # 角是否被材料占据(圆角) —— 洞bbox四角
         corners = [hch[0,0], hch[0,-1], hch[-1,0], hch[-1,-1]]
-        filled_corners = sum(corners)  # 1=该角为材料(圆角)
+        filled_corners = sum(corners)  # 1=该角为材料 → 洞未填满bbox → 圆角
         w = (x1-x0+1)*(U.max()-U.min())/GRID
         ht = (y1-y0+1)*(V.max()-V.min())/GRID
         holes.append((h, w, ht, filled_corners,
@@ -68,7 +68,9 @@ def find_holes(p, axis, name):
                       (x0,x1,y0,y1)))
     print(f"\n=== 墙{name} 面内 宽{U.max()-U.min():.0f} 高{V.max()-V.min():.0f}, 开洞数={len(holes)} ===")
     for (h, w, ht, fc, cu, cv, bb) in sorted(holes, key=lambda a:-a[1]*a[2]):
-        kind = "方角(疑似门)" if fc >= 3 else ("圆角(疑似窗)" if fc <= 1 else "混合角")
+        # 方向修正：洞bbox四角被材料占据(fc大)说明洞是圆角(窗)，洞填满bbox(fc小)才是方角(门)
+        # （与 detect_door_window.py 的面板角填充方向相反：面板角有材料=方角，洞角有材料=圆角）
+        kind = "圆角(疑似窗)" if fc >= 3 else ("方角(疑似门)" if fc <= 1 else "混合角")
         print(f"  洞#{h}: {w:.0f}mm宽 x {ht:.0f}mm高, 角填充(filled_corners)={fc}/4 -> {kind}, 中心(U={cu:.0f}.., 高V={cv:.0f}..)")
 
 for p, name in walls.items():

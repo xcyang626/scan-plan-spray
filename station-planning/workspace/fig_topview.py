@@ -1,21 +1,33 @@
 """图: 整个舱室 工位点位俯视图 (四面墙全部站位, 含作业顺序编号与走位连线)
-   新规则: 墙角两墙站位合并为一个(取中心点, 距两墙各40cm, 45°面向墙角);
-   加强筋定点负责墙面(左0.2m右0.6m), 与相邻站位间距<0.4m时向筋靠拢;
-   四面墙均按同一规则调整; 作业顺序: 进门后先喷右墙(逆时针绕行), 共28站位"""
+   站位表/墙角/作业顺序均取自 stations.py 单一数据源:
+   墙角两墙站位合并为一个(对角内收, 距两墙各40cm, 45°面向墙角);
+   作业顺序 = 局部交换序(墙角站位插入墙面中间消除走位交叉), 共28站位"""
+import os
+import sys
+from pathlib import Path
+
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 
-plt.rcParams["font.sans-serif"] = ["Microsoft YaHei"]
+from stations import (RX, RY, D_R, STATIONS, CORNERS, ORDER,
+                      RIBS, WINDOWS, DOOR, get_xy, get_dir, get_type)
+
+plt.rcParams["font.sans-serif"] = ["Noto Sans CJK SC", "WenQuanYi Zen Hei", "Microsoft YaHei"]
 plt.rcParams["axes.unicode_minus"] = False
 
-W = r"c:\Users\Yangon\Desktop\舱室绝缘喷涂人形机器人技术方案\喷涂点位划分\work"
-FIG = r"c:\Users\Yangon\Desktop\舱室绝缘喷涂人形机器人技术方案\喷涂点位划分\figs"
+# 数据/图片目录: 优先环境变量, 未设时默认脚本同级 "数据" 目录与仓库 figures 目录
+W = Path(os.environ.get("STATION_DATA", Path(__file__).resolve().parent / "数据"))
+FIG = Path(os.environ.get("STATION_FIGS", Path(__file__).resolve().parent.parent / "figures"))
+for f in ("xyz.npy", "rgb.npy"):
+    if not (W / f).exists():
+        sys.exit(f"[路径] 缺少数据文件 {W / f}: 请将点云缓存(xyz.npy/rgb.npy)放入该目录, "
+                 f"或设置环境变量 STATION_DATA 指向数据目录")
 
-xyz = np.load(W + r"\xyz.npy") / 1000.0
-rgb = np.load(W + r"\rgb.npy")
+xyz = np.load(W / "xyz.npy") / 1000.0
+rgb = np.load(W / "rgb.npy")
 ORIGIN = np.array([209073.0, 4380.0, 57558.0]) / 1000.0
 xyz = xyz - ORIGIN
 
@@ -24,100 +36,9 @@ def mask_of(c):
 
 rng = np.random.default_rng(11)
 
-RX, RY = 3.228, 5.058   # 房间内尺寸 (点云实测)
-D_R = 0.80
-
-# 各墙站位: (编号, u, 类型)  u 为沿墙坐标(从墙角起)
-# 墙角规则: 相邻两面墙各有一个墙角站位(距墙端40cm), 合并为一个(取中心点, 距两墙各40cm, 45°面向墙角)
-# 加强筋定点规则: 筋左点优先距筋40cm、筋右点优先距筋20cm; 与相邻站位间距<0.4m时向筋靠拢
-stations = {
-    "right": [  # u = y (从右墙-前墙角起)
-        ("R2", 1.29, "stiff"), ("R3", 1.89, "stiff"), ("R4", 2.29, "stiff"),
-        ("R5", 2.73, "stiff"), ("R6", 3.13, "stiff"), ("R7", 3.57, "stiff"),
-        ("R8", 3.97, "stiff"), ("R9", 4.41, "stiff"),
-    ],
-    "back": [   # u = x (从后墙-左墙角起)
-        ("B1", 0.60, "normal"), ("B2", 1.40, "normal"),
-        ("B3", 2.01, "stiff"), ("B4", 2.61, "stiff"),
-    ],
-    "left": [   # u = y (从左墙-前墙角起)
-        ("L1", 0.60, "stiff"), ("L2", 1.05, "stiff"), ("L3", 1.45, "stiff"),
-        ("L4", 1.89, "stiff"), ("L5", 2.29, "stiff"), ("L6", 2.73, "stiff"),
-        ("L7", 3.53, "normal"), ("L8", 4.15, "normal"),
-    ],
-    "front": [  # u = x (从前墙-左墙角起)
-        ("F2", 0.60, "normal"), ("F3", 1.40, "normal"),
-        ("F4", 2.01, "stiff"), ("F5", 2.61, "stiff"),
-    ],
-}
-# 墙角合并站位 (取相邻两墙墙角站位中心点, 距两墙各40cm, 45°面向墙角)
-corners = {
-    "C_FL": (0.40, 0.40),          # 前-左墙角
-    "C_FR": (RX - 0.40, 0.40),     # 前-右墙角
-    "C_BL": (0.40, RY - 0.40),     # 后-左墙角
-    "C_BR": (RX - 0.40, RY - 0.40),# 后-右墙角
-}
-corner_dir = {   # 45°面向墙角的方向向量
-    "C_FL": (-0.7071, -0.7071),
-    "C_FR": (0.7071, -0.7071),
-    "C_BL": (-0.7071, 0.7071),
-    "C_BR": (0.7071, 0.7071),
-}
-stiff_pos = {"left": [0.85, 1.69, 2.53], "right": [1.69, 2.53, 3.37, 4.21],
-             "front": [2.41], "back": [2.41]}
-windows = {"left": [(3.49, 4.10)], "right": [(1.98, 4.01)],
-           "front": [(0.91, 1.51)], "back": [(0.91, 1.51)]}
-door = (0.41, 1.23)   # 右墙
-
 type_color = {"corner": "#C0392B", "stiff": "#E67E22", "normal": "#2471A3"}
 
-def station_xy(wall, s):
-    _, u, _ = s
-    if wall == "left":
-        return D_R, u, (-1, 0)
-    if wall == "right":
-        return RX - D_R, u, (1, 0)
-    if wall == "front":
-        return u, D_R, (0, -1)
-    return u, RY - D_R, (0, 1)
-
-# ===== 全局作业顺序: 进门后先喷右墙, 逆时针绕行 =====
-# 1~8 右墙(前→后) → 9 后墙右端B4 → 10 后右墙角 → 11~12 后墙(B3,B2) → 13 后左墙角 → 14 后墙左端B1
-# → 15~22 左墙(后→前) → 23 前墙左端F2 → 24 前左墙角 → 25~27 前墙(F3~F5) → 28 前右墙角(紧邻门)
-# 墙角站位插入墙面中间(局部交换)以消除走位交叉: B4→C_BR→B3, B2→C_BL→B1, F2→C_FL→F3
-order = ["R2", "R3", "R4", "R5", "R6", "R7", "R8", "R9", "B4", "C_BR",
-         "B3", "B2", "C_BL", "B1",
-         "L8", "L7", "L6", "L5", "L4", "L3", "L2", "L1", "F2", "C_FL",
-         "F3", "F4", "F5", "C_FR"]
-
-def get_xy(name):
-    if name in corners:
-        return corners[name]
-    for wall, lst in stations.items():
-        for s in lst:
-            if s[0] == name:
-                x, y, _ = station_xy(wall, s)
-                return x, y
-    raise KeyError(name)
-
-def get_dir(name):
-    if name in corners:
-        return corner_dir[name]
-    for wall, lst in stations.items():
-        for s in lst:
-            if s[0] == name:
-                _, _, d = station_xy(wall, s)
-                return d
-    raise KeyError(name)
-
-def get_type(name):
-    if name in corners:
-        return "corner"
-    for wall, lst in stations.items():
-        for s in lst:
-            if s[0] == name:
-                return s[2]
-    raise KeyError(name)
+order = ORDER
 
 # 走位长度
 pts = np.array([get_xy(n) for n in order])
@@ -135,27 +56,27 @@ if len(p) > 80000:
 ax.scatter(p[:, 0], p[:, 1], s=0.9, c="#34495E", alpha=0.28, linewidths=0, zorder=2)
 
 # 加强筋 (墙上蓝色块)
-for su in stiff_pos["left"]:
+for su in RIBS["left"]:
     ax.add_patch(Rectangle((-0.06, su - 0.03), 0.06, 0.06, fc="#1F6FEB", ec="none", zorder=5))
-for su in stiff_pos["right"]:
+for su in RIBS["right"]:
     ax.add_patch(Rectangle((RX, su - 0.03), 0.06, 0.06, fc="#1F6FEB", ec="none", zorder=5))
-for su in stiff_pos["front"]:
+for su in RIBS["front"]:
     ax.add_patch(Rectangle((su - 0.03, -0.06), 0.06, 0.06, fc="#1F6FEB", ec="none", zorder=5))
-for su in stiff_pos["back"]:
+for su in RIBS["back"]:
     ax.add_patch(Rectangle((su - 0.03, RY), 0.06, 0.06, fc="#1F6FEB", ec="none", zorder=5))
 
 # 窗 (黄色段, 画在墙外侧)
-for w0, w1 in windows["left"]:
+for w0, w1 in WINDOWS["left"]:
     ax.add_patch(Rectangle((-0.10, w0), 0.10, w1 - w0, fc="#F4D03F", ec="#B7950B", lw=0.8, zorder=5))
-for w0, w1 in windows["right"]:
+for w0, w1 in WINDOWS["right"]:
     ax.add_patch(Rectangle((RX, w0), 0.10, w1 - w0, fc="#F4D03F", ec="#B7950B", lw=0.8, zorder=5))
-for w0, w1 in windows["front"]:
+for w0, w1 in WINDOWS["front"]:
     ax.add_patch(Rectangle((w0, -0.10), w1 - w0, 0.10, fc="#F4D03F", ec="#B7950B", lw=0.8, zorder=5))
-for w0, w1 in windows["back"]:
+for w0, w1 in WINDOWS["back"]:
     ax.add_patch(Rectangle((w0, RY), w1 - w0, 0.10, fc="#F4D03F", ec="#B7950B", lw=0.8, zorder=5))
 # 门 (紫色段)
-ax.add_patch(Rectangle((RX, door[0]), 0.10, door[1] - door[0], fc="#B250C8", ec="#7D3C98", lw=0.8, zorder=5))
-ax.text(RX + 0.17, (door[0] + door[1]) / 2 + 0.30, "门", fontsize=10, color="#7D3C98",
+ax.add_patch(Rectangle((RX, DOOR[0]), 0.10, DOOR[1] - DOOR[0], fc="#B250C8", ec="#7D3C98", lw=0.8, zorder=5))
+ax.text(RX + 0.17, (DOOR[0] + DOOR[1]) / 2 + 0.30, "门", fontsize=10, color="#7D3C98",
         rotation=90, va="center", zorder=6)
 
 # 墙体
@@ -176,7 +97,7 @@ for i, name in enumerate(order, start=1):
                 arrowprops=dict(arrowstyle="-|>", color=c, lw=1.7, mutation_scale=14), zorder=7)
     ax.plot(x, y, marker="o", ms=7.5, mfc=c, mec="white", mew=1.0, zorder=8)
     # 双行标签: 顺序号(主) + 站位名 (紧贴点位房间内侧, 与朝向箭头反向)
-    if name in corners:
+    if name in CORNERS:
         # 墙角站位: 标签向房间内部偏移
         off = (dx * -0.30, dy * -0.30)
     elif name[0] == "L":
@@ -208,7 +129,7 @@ ax.text(RX / 2, -0.42, "3.23 m", ha="center", fontsize=9)
 ax.annotate("", xy=(-0.30, RY), xytext=(-0.30, 0),
             arrowprops=dict(arrowstyle="<->", color="k", lw=1.0))
 ax.text(-0.44, RY / 2, "5.06 m", va="center", rotation=90, fontsize=9)
-ax.text(RX / 2, RY + 0.24, "墙面站位距墙 d_r = 0.80 m；墙角合并站位距两墙各 0.40 m（箭头=机器人正对墙面/墙角）；圆点编号=喷涂作业顺序",
+ax.text(RX / 2, RY + 0.24, f"墙面站位距墙 d_r = {D_R:.2f} m；墙角合并站位距两墙各 0.40 m（箭头=机器人正对墙面/墙角）；圆点编号=喷涂作业顺序",
         ha="center", fontsize=10, color="#34495E")
 ax.text(RX / 2, RY + 0.44, "作业顺序：进门后先喷右墙 → 逆时针绕行（1→28，动线无交叉）",
         ha="center", fontsize=10, color="#7D3C98")
@@ -235,7 +156,7 @@ ax.set_title("舱室喷涂工位点位总览（俯视图，共28个站位点，�
 ax.set_aspect("equal")
 ax.grid(alpha=0.25, ls=":")
 plt.tight_layout()
-plt.savefig(FIG + r"\fig_topview.png", dpi=200, bbox_inches="tight")
+plt.savefig(FIG / "fig_topview.png", dpi=200, bbox_inches="tight")
 plt.close()
 print("fig_topview done")
 

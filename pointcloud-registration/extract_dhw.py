@@ -49,16 +49,23 @@ def opening(p, axis, name):
     cell_area = (U.max()-U.min())/GRID * (V.max()-V.min())/GRID   # 单格mm²
     found = []
     for h in range(1, nh+1):
-        ys,xs = np.where(hl==h); y0,y1,x0,x1 = ys.min(),ys.max(),xs.min(),xs.max()
-        cells = (hl[y0:y1+1,x0:x1+1]==h).sum()
-        w=(x1-x0+1)*(U.max()-U.min())/GRID; ht=(y1-y0+1)*(V.max()-V.min())/GRID
+        us, vs = np.where(hl == h)          # 行=U轴索引, 列=V轴索引(见上 histogram2d(U,V))
+        u0i, u1i, v0i, v1i = us.min(), us.max(), vs.min(), vs.max()
+        cells = (hl[u0i:u1i+1, v0i:v1i+1] == h).sum()
+        # 轴映射修正：U 用行索引(us)乘 U 轴格宽, V 用列索引(vs)乘 V 轴格宽
+        # （原代码用列索引算 U 方向宽、行索引算 V 方向高，宽高与坐标互换；
+        #   正确写法对照 build_color.py: rows=U 轴、cols=V 轴）
+        w = (u1i-u0i+1)*(U.max()-U.min())/GRID; ht = (v1i-v0i+1)*(V.max()-V.min())/GRID
         if cells * cell_area < 40000:      # 过滤噪声小洞 (<40k mm²)
             continue
-        cor = hl[y0:y1+1,x0:x1+1]==h
+        cor = hl[u0i:u1i+1, v0i:v1i+1] == h
         fc = sum([not cor[0,0], not cor[0,-1], not cor[-1,0], not cor[-1,-1]])
-        u0=U.min()+(x0+0.5)*(U.max()-U.min())/GRID; u1=U.min()+(x1+0.5)*(U.max()-U.min())/GRID
-        v0=V.min()+(y0+0.5)*(V.max()-V.min())/GRID; v1=V.min()+(y1+0.5)*(V.max()-V.min())/GRID
-        kind = "门(方角)" if fc>=3 else "窗(圆角)" if fc<=1 else f"混合(角{fc}/4)"
+        u0 = U.min()+(u0i+0.5)*(U.max()-U.min())/GRID; u1 = U.min()+(u1i+0.5)*(U.max()-U.min())/GRID
+        v0 = V.min()+(v0i+0.5)*(V.max()-V.min())/GRID; v1 = V.min()+(v1i+0.5)*(V.max()-V.min())/GRID
+        # 方向修正：洞 bbox 四角被材料占据(fc大) → 洞未填满 bbox → 圆角(窗)；
+        # 洞填满 bbox(fc小) → 方角(门)。与 detect_door_window.py 面板角填充方向相反
+        # （面板角有材料=方角，洞角有材料=圆角）
+        kind = "窗(圆角)" if fc >= 3 else "门(方角)" if fc <= 1 else f"混合(角{fc}/4)"
         found.append((w, ht, v0, v1, fc, kind, u0, u1))
     found.sort(reverse=True)
     for w, ht, v0, v1, fc, kind, u0, u1 in found:

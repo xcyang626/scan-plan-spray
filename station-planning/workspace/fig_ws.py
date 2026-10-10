@@ -1,5 +1,9 @@
 """图: 单工位工作范围 (腰部扭转+蹲姿对比 / 站+蹲可达区与10°覆盖区)
    采用填充区域+覆盖带矩形, 不使用点云散点, 保证清晰可读"""
+import os
+import sys
+from pathlib import Path
+
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
@@ -7,11 +11,16 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 from scipy import ndimage
 
-plt.rcParams["font.sans-serif"] = ["Microsoft YaHei"]
+plt.rcParams["font.sans-serif"] = ["Noto Sans CJK SC", "WenQuanYi Zen Hei", "Microsoft YaHei"]
 plt.rcParams["axes.unicode_minus"] = False
 
-W = r"c:\Users\Yangon\Desktop\舱室绝缘喷涂人形机器人技术方案\喷涂点位划分\work"
-FIG = r"c:\Users\Yangon\Desktop\舱室绝缘喷涂人形机器人技术方案\喷涂点位划分\figs"
+# 数据目录: 优先环境变量 STATION_DATA; 图片目录: 优先 STATION_FIGS, 未设时取仓库内默认
+W = Path(os.environ.get("STATION_DATA", Path(__file__).resolve().parent / "数据"))
+FIG = Path(os.environ.get("STATION_FIGS", Path(__file__).resolve().parent.parent / "figures"))
+for f in ("ws_s5.npy", "ws_s30.npy", "ws_s30sq.npy", "ws_s90.npy", "ws_full.npy"):
+    if not (W / f).exists():
+        sys.exit(f"[路径] 缺少数据文件 {W / f}: 请先运行 ws_fine.py/ws_squat.py 生成工作空间采样缓存, "
+                 f"或设置环境变量 STATION_DATA 指向该数据目录")
 
 D_G, D_R = 0.40, 0.80
 THETA = 10.0
@@ -45,7 +54,7 @@ sets = [
 fig, ax = plt.subplots(figsize=(8.6, 6.4))
 stats = {}
 for key, label, color in sets:
-    yz = np.load(W + rf"\ws_{key}.npy")
+    yz = np.load(W / f"ws_{key}.npy")
     M, xe, ze = grid_mask(yz)
     area = M.sum() * 0.02 * 0.02
     stats[key] = (area, yz[:, 0].min(), yz[:, 0].max(), yz[:, 1].min(), yz[:, 1].max())
@@ -55,7 +64,7 @@ for key, label, color in sets:
             fontweight="bold", zorder=6)
 
 # 推荐方案 s30sq 高亮描边
-yz = np.load(W + r"\ws_s30sq.npy")
+yz = np.load(W / "ws_s30sq.npy")
 fill_region(ax, yz, "#8E44AD", alpha=0.0, lw=2.6, res=0.02)
 ax.text(0.02, 0.05, "推荐：站+蹲·扭转±30°", transform=ax.transAxes, fontsize=10.5,
         color="#8E44AD", fontweight="bold",
@@ -76,14 +85,14 @@ ax.set_xlim(-0.95, 1.15)
 ax.set_ylim(0, 2.1)
 ax.grid(alpha=0.3, ls=":")
 plt.tight_layout()
-plt.savefig(FIG + r"\fig_ws_compare.png", dpi=200)
+plt.savefig(FIG / "fig_ws_compare.png", dpi=200)
 plt.close()
 print("fig_ws_compare done")
 for k, v in stats.items():
     print(f"  {k}: area={v[0]:.2f}, y=[{v[1]:.2f},{v[2]:.2f}], z=[{v[3]:.2f},{v[4]:.2f}]")
 
 # =============== 图2: 站+蹲可达区 (分色) + 10°喷涂覆盖区 ===============
-yzp = np.load(W + r"\ws_s30sq.npy")     # (y, z, pelvis)
+yzp = np.load(W / "ws_s30sq.npy")     # (y, z, pelvis)
 stand = yzp[yzp[:, 2] >= 0.94][:, :2]
 squat = yzp[yzp[:, 2] < 0.94][:, :2]
 
@@ -140,6 +149,6 @@ for ax in axes:
     ax.grid(alpha=0.3, ls=":")
     ax.tick_params(labelsize=10)
 plt.tight_layout()
-plt.savefig(FIG + r"\fig_ws_coverage.png", dpi=200)
+plt.savefig(FIG / "fig_ws_coverage.png", dpi=200)
 plt.close()
 print("fig_ws_coverage done")

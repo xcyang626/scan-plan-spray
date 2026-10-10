@@ -1,9 +1,14 @@
 """蹲姿(骨盆高度变化)+腰部±30°: 腕部垂直可达区与10°覆盖区计算"""
-import numpy as np
+import os
 import sys
-sys.path.insert(0, r"c:\Users\Yangon\Desktop\舱室绝缘喷涂人形机器人技术方案\喷涂点位划分\work")
+from pathlib import Path
+
+import numpy as np
 from ws_calc import J, L_FA, D_G, rotx, roty, rotz
 from scipy import ndimage
+
+# 数据目录: 优先环境变量 STATION_DATA, 未设时默认脚本同级 "数据" 目录(仓库不携带采样缓存)
+W = Path(os.environ.get("STATION_DATA", Path(__file__).resolve().parent / "数据"))
 
 rng = np.random.default_rng(2027)
 COS_TOL = 0.92
@@ -53,10 +58,13 @@ while n_done < TOTAL and sum(len(o) for o in out) < MAX_KEEP:
     n_done += BATCH
     print(f"  {n_done/1e6:.0f}M done, kept={sum(len(o) for o in out)}")
 
+if not out:
+    sys.exit("[告警] 蹲姿采样无满足约束的样本, 无结果可写, 退出")
 yzp = np.concatenate(out)
 if len(yzp) > 150000:
     yzp = yzp[rng.choice(len(yzp), 150000, replace=False)]
-np.save(r"c:\Users\Yangon\Desktop\舱室绝缘喷涂人形机器人技术方案\喷涂点位划分\work\ws_s30sq.npy", yzp)
+W.mkdir(parents=True, exist_ok=True)
+np.save(W / "ws_s30sq.npy", yzp)
 
 def grid(yz, res=0.02):
     x0, x1 = yz[:, 0].min(), yz[:, 0].max()

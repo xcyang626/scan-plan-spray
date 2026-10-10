@@ -1,8 +1,18 @@
+import os
+import sys
+from pathlib import Path
+
 import numpy as np
 
-W = r"c:\Users\Yangon\Desktop\舱室绝缘喷涂人形机器人技术方案\喷涂点位划分\work"
-xyz = np.load(W + r"\xyz.npy") / 1000.0
-rgb = np.load(W + r"\rgb.npy")
+# 数据目录: 优先环境变量 STATION_DATA, 未设时默认脚本同级 "数据" 目录(仓库不携带点云缓存)
+W = Path(os.environ.get("STATION_DATA", Path(__file__).resolve().parent / "数据"))
+for f in ("xyz.npy", "rgb.npy"):
+    if not (W / f).exists():
+        sys.exit(f"[路径] 缺少数据文件 {W / f}: 请将点云缓存(xyz.npy/rgb.npy)放入该目录, "
+                 f"或设置环境变量 STATION_DATA 指向数据目录")
+
+xyz = np.load(W / "xyz.npy") / 1000.0
+rgb = np.load(W / "rgb.npy")
 ORIGIN = np.array([209073.0, 4380.0, 57558.0]) / 1000.0
 xyz = xyz - ORIGIN
 

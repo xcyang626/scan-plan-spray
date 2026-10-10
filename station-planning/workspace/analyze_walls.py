@@ -1,8 +1,18 @@
+import os
+import sys
+from pathlib import Path
+
 import numpy as np
 
-W = r"c:\Users\Yangon\Desktop\舱室绝缘喷涂人形机器人技术方案\喷涂点位划分\work"
-xyz = np.load(W + r"\xyz.npy") / 1000.0  # -> meters
-rgb = np.load(W + r"\rgb.npy")
+# 数据目录: 优先环境变量 STATION_DATA, 未设时默认脚本同级 "数据" 目录(仓库不携带点云缓存)
+W = Path(os.environ.get("STATION_DATA", Path(__file__).resolve().parent / "数据"))
+for f in ("xyz.npy", "rgb.npy"):
+    if not (W / f).exists():
+        sys.exit(f"[路径] 缺少数据文件 {W / f}: 请将点云缓存(xyz.npy/rgb.npy)放入该目录, "
+                 f"或设置环境变量 STATION_DATA 指向数据目录")
+
+xyz = np.load(W / "xyz.npy") / 1000.0  # -> meters
+rgb = np.load(W / "rgb.npy")
 
 # 局部坐标系（m）：原点=(209073, 4380, 57558)mm 即左墙-前墙-地面交点
 ORIGIN = np.array([209073.0, 4380.0, 57558.0]) / 1000.0
@@ -45,23 +55,26 @@ print("\n=== stiffener (blue) plane assignment ===")
 # 贴墙的加强筋：按其质心最近平面分组
 planes = {"left(X=0)": (0, 0.0), "right(X~3.23)": (0, 3.228), "front(Y=0)": (1, 0.0),
           "back(Y~5.03)": (1, 5.032), "ceil(Z~3.92)": (2, 3.918)}
-# 聚类加强筋：先按DBSCAN式简单网格聚类
+# 聚类加强筋: 体素化后做真连通域(scipy.ndimage.label, 6-连通)
 from scipy import ndimage
-# 用体素降采样聚类：对stiff点做连通域
+
 def cluster(p, voxel=0.08, min_pts=300):
+    """体素连通域聚类: 点云按 voxel 体素化 -> 6-连通连通域 -> 逐点回填标签,
+    仅保留点数 >= min_pts 的连通域 (1..N), 噪声点标签为 0"""
     gi = np.floor(p / voxel).astype(int)
-    dims = gi.max(axis=0) + 2
-    keys = (gi[:, 0] * dims[1] + gi[:, 1]) * dims[2] + gi[:, 2]
-    order = np.argsort(keys)
-    ks = keys[order]
-    uniq, start = np.unique(ks, return_index=True)
+    gi -= gi.min(axis=0)                 # 平移到正象限, 缩小网格
+    dims = gi.max(axis=0) + 1
+    occ = np.zeros(dims, dtype=bool)
+    occ[gi[:, 0], gi[:, 1], gi[:, 2]] = True
+    lab_grid, n_lab = ndimage.label(occ)  # 默认结构元 = 6-连通
+    vlab = lab_grid[gi[:, 0], gi[:, 1], gi[:, 2]]
     labels = np.zeros(len(p), dtype=int)
     lab = 0
-    segs = np.split(order, start[1:])
-    for s in segs:
-        if len(s) >= min_pts:
+    for v in range(1, n_lab + 1):
+        m = vlab == v
+        if m.sum() >= min_pts:
             lab += 1
-            labels[s] = lab
+            labels[m] = lab
     return labels
 
 lab = cluster(stiff)
@@ -90,7 +103,7 @@ print("door bbox:", door.min(axis=0).round(2), door.max(axis=0).round(2), "n=", 
 
 print("\n=== obstacles (black) clusters ===")
 lab_o = cluster(obst, voxel=0.15, min_pts=500)
-print("obstacle clusters:", lab_o)
-for l in range(1, lab_o + 1):
+print("obstacle clusters:", lab_o.max())
+for l in range(1, lab_o.max() + 1):
     p = obst[lab_o == l]
     print(f"obst {l}: n={len(p)}, bbox=[{p.min(axis=0).round(2)},{p.max(axis=0).round(2)}]")

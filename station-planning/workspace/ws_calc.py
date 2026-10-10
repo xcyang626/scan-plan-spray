@@ -53,9 +53,8 @@ def fk_batch(q):  # q: (N,7)
         R = np.einsum('nij,njk->nik', Rr, Ri)
     return p, R  # 肘关节位置, 肘姿态
 
-def sample_workspace(yaw_range, n=4_000_000, cos_tol=0.90, plane_tol=0.08,
-                     pitch_cos=0.90):
-    """采样并过滤: 小臂方向(肘系-z) 垂直墙面(+x), 腕部位于 x≈D_G 平面
+def sample_workspace(yaw_range, n=4_000_000, cos_tol=0.92, plane_tol=0.08):
+    """采样并过滤: 小臂方向(肘系-z) 垂直墙面(+x, 夹角<=23°即方向余弦>=0.92), 腕部位于 x≈D_G 平面
     机器人坐标系: x指向前方墙面, y左, z上 (ROS)。墙在 x=D_R。
     """
     lo = np.array([j[4] for j in J]); hi = np.array([j[5] for j in J])
@@ -87,7 +86,6 @@ if __name__ == "__main__":
         "大扭转[-90,90]":  (-np.deg2rad(90), np.deg2rad(90)),
         "URDF全范围":      (-2.618, 3.229),
     }
-    results = {}
     for nm, yr in yaw_sets.items():
         w = sample_workspace(yr, n=3_000_000)
         # 墙面坐标: y_wall = -y_ros (正=机器人右手侧/墙右侧)
@@ -95,6 +93,4 @@ if __name__ == "__main__":
         area, _ = alpha_area(yz, 0.02)
         print(f"{nm}: kept={len(w)}, area≈{area:.2f} m², "
               f"y=[{yz[:,0].min():.2f},{yz[:,0].max():.2f}], z=[{yz[:,1].min():.2f},{yz[:,1].max():.2f}]")
-        results[nm] = yz
-    np.save(r"c:\Users\Yangon\Desktop\舱室绝缘喷涂人形机器人技术方案\喷涂点位划分\work\ws_results.npy",
-            results, allow_pickle=True)
+    # 注: 旧的 ws_results.npy 死输出已删除(无下游脚本消费该文件)

@@ -1,36 +1,24 @@
-"""验证: 调整墙面站位距墙距离 D_R 后, 原始墙面分组顺序是否无交叉"""
+"""验证: 调整墙面站位距墙距离 D_R 后, 原始墙面分组顺序是否无交叉
+   站位表见 stations.py 单一数据源 (墙角站位不随 D_R 内收)"""
 import numpy as np
 
-RX, RY = 3.228, 5.058
+from stations import ORDER_RAW, STATIONS, CORNERS, RX, RY
 
-def build(D_R):
-    stations = {
-        "right": [("R2", 1.29, "stiff"), ("R3", 1.89, "stiff"), ("R4", 2.29, "stiff"),
-                  ("R5", 2.73, "stiff"), ("R6", 3.13, "stiff"), ("R7", 3.57, "stiff"),
-                  ("R8", 3.97, "stiff"), ("R9", 4.41, "stiff")],
-        "back": [("B1", 0.60, "normal"), ("B2", 1.40, "normal"),
-                 ("B3", 2.01, "stiff"), ("B4", 2.61, "stiff")],
-        "left": [("L1", 0.60, "stiff"), ("L2", 1.05, "stiff"), ("L3", 1.45, "stiff"),
-                 ("L4", 1.89, "stiff"), ("L5", 2.29, "stiff"), ("L6", 2.73, "stiff"),
-                 ("L7", 3.595, "normal"), ("L8", 4.15, "normal")],
-        "front": [("F2", 0.60, "normal"), ("F3", 1.40, "normal"),
-                  ("F4", 2.01, "stiff"), ("F5", 2.61, "stiff")],
-    }
-    corners = {"C_FL": (0.40, 0.40), "C_FR": (RX - 0.40, 0.40),
-               "C_BL": (0.40, RY - 0.40), "C_BR": (RX - 0.40, RY - 0.40)}
-    def station_xy(wall, s):
-        _, u, _ = s
-        if wall == "left":   return D_R, u
-        if wall == "right":  return RX - D_R, u
-        if wall == "front":  return u, D_R
-        return u, RY - D_R
+def build(d_r):
     def get_xy(name):
-        if name in corners:
-            return corners[name]
-        for wall, lst in stations.items():
+        if name in CORNERS:
+            return CORNERS[name]
+        for wall, lst in STATIONS.items():
             for s in lst:
                 if s[0] == name:
-                    return station_xy(wall, s)
+                    _, u, _ = s
+                    if wall == "left":
+                        return d_r, u
+                    if wall == "right":
+                        return RX - d_r, u
+                    if wall == "front":
+                        return u, d_r
+                    return u, RY - d_r
         raise KeyError(name)
     return get_xy
 
@@ -65,14 +53,10 @@ def count_cross(order, get_xy):
                 c += 1; pairs.append((order[i], order[i+1], order[j], order[j+1]))
     return c, pairs
 
-order = ["R2","R3","R4","R5","R6","R7","R8","R9","C_BR",
-         "B4","B3","B2","B1","C_BL",
-         "L8","L7","L6","L5","L4","L3","L2","L1","C_FL",
-         "F2","F3","F4","F5","C_FR"]
+order = ORDER_RAW
 
-for D_R in [0.80, 0.70, 0.60, 0.58, 0.55, 0.50]:
-    get_xy = build(D_R)
-    c, pairs = count_cross(order, get_xy)
-    print(f"D_R={D_R:.2f}: 交叉数={c}")
+for d_r in [0.80, 0.70, 0.60, 0.58, 0.55, 0.50]:
+    c, pairs = count_cross(order, build(d_r))
+    print(f"D_R={d_r:.2f}: 交叉数={c}")
     for p in pairs:
         print("   ", p[0], "->", p[1], " 与 ", p[2], "->", p[3])
