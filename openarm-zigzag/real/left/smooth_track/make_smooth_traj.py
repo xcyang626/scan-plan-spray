@@ -27,12 +27,14 @@ import yaml
 from scipy.signal import savgol_filter
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_DENSE = os.path.join(_HERE, "..", "..", "仿真", "moveit_sim",
+# 仿真/ 在 openarm-zigzag/ 下, 本目录需上三级(对齐右臂 make_smooth_traj_right);
+# 原两级拼出 real/仿真/... 不存在, 运行即 FileNotFoundError
+_DENSE = os.path.join(_HERE, "..", "..", "..", "仿真", "moveit_sim",
                       "dense_zigzag.json")
 _SAFETY = os.path.join(_HERE, "..", "config", "real_safety.yaml")
-_ISA = os.path.abspath(os.path.join(_HERE, "..", "..", "仿真",
+_ISA = os.path.abspath(os.path.join(_HERE, "..", "..", "..", "仿真",
                                     "isaaclab_sim"))
-_PKG = os.path.abspath(os.path.join(_HERE, "..", "..", "仿真",
+_PKG = os.path.abspath(os.path.join(_HERE, "..", "..", "..", "仿真",
                                     "openarm_sim"))
 NAMES = ["openarm_left_joint%d" % i for i in range(1, 8)]
 CLEARANCE_DEG = 3.0

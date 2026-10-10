@@ -129,7 +129,11 @@ def reconstruct_feedback_tau(run, verbose=True):
     # ė_cmd: 差分 + 轻度平滑(后续 0.08Hz 低通会再压噪声)
     edot = np.gradient(e, 1.0 / TABLE_HZ, axis=0)
     edot = lpf0(edot, 1.0, TABLE_HZ)
-    # 积分器重构(zero_offset_hw.cpp 同律: EMA→钳位→累加→integ 钳位)
+    # 积分器重构(zero_offset_hw.cpp 同律: EMA→钳位→累加→integ 钳位)。
+    # 口径说明: 驱动实际在 100Hz update(update_rate=100)里做 EMA, 此处按
+    # 50Hz/TABLE_HZ 帧网格重构 —— 逐帧递推数值等价, 但 EMA 时间常数按
+    # 帧数计相差 2×(50Hz 下 α=0.3 更"慢"); 远宽于后续 0.08Hz 学习低通,
+    # 对学习结果无影响, 不改数值。
     integ = np.zeros(7)
     err_f = np.zeros(7)
     integ_rec = np.empty_like(e)
@@ -193,6 +197,10 @@ def main():
     # 学习信号: 当前总欠账 = τ̂(反馈实际供给) + 上一迭代已部署的 Δτ;
     # 只取低频(可学习)分量, γ 折扣后为新表(累积律, 对未漂移负载自动恒定)
     if prev is not None:
+        if len(prev) < int(grid[-1]) + 1:
+            raise SystemExit(
+                "prev Δτ 表长度 %d 未覆盖本跑 idx 范围(最大 %d) —— "
+                "表与 CSV 不配套, 拒绝累积" % (len(prev), int(grid[-1])))
         tau_fb = tau_fb + prev[grid]
         print("  累积: τ̂ += Δτ_prev(逐帧), 滤波 fc=%.2fHz(真 50Hz 口径)"
               % args.fc)

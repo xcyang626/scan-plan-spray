@@ -5,10 +5,12 @@ ILC 仿真验证实验（用于技术文档第 7 章）
 ========================================
 对象模型: 关节空间双积分 + 粘滞/库仑摩擦 + 重力偏置（代表性参数，
           需实测辨识替换; 解耦假设适用条件见文档 7.1 节）。
-控制器:   与真机一致的 PD 反馈(kp=70, kd=3.0, 10ms 周期) + ILC 前馈 u_k。
+控制器:   与真机一致的 PD 反馈(kp=70, kd=3.0, 10ms 周期, 反馈误差含
+          编码器测量噪声 NOISE_STD) + ILC 前馈 u_k。
 ILC:      P 型 + 时间超前采样 + 零相位 Q 滤波器（实验 A/B: 有/无滤波器，
           实验 C: 大增益发散对照）。
-轨迹:     dense_zigzag_right.json 真实 J5 关节轨迹片段(811 点中取 4.0s)。
+轨迹:     dense_zigzag_right.json 真实 J5 关节轨迹片段(811 点中取
+          [500:700) 平滑段, 重采样 10s/1000 周期)。
 输出:     ilc_sim_results.json (逐迭代误差) + assets/figures/ilc_sim_curves.png。
 """
 import json
@@ -58,7 +60,8 @@ LOAD_TORQUE = 0.25                   # 周期内慢变负载扰动 Nm
 # 按真机重定时节奏压缩: 每步 0.05s(真实 dt≈0.1s×0.4 speed-scale) → 10s/1000 周期
 with open(DENSE, encoding="utf-8") as f:
     pts = np.array(json.load(f)["points"])[:, 4]
-seg = pts[500:700]                                  # 200 点平滑段
+SEG_LO, SEG_HI = 500, 700                        # 平滑段切片(避开腕部跳变带)
+seg = pts[SEG_LO:SEG_HI]
 qd = np.interp(np.linspace(0, 1, 1000), np.arange(len(seg)), seg)
 qd_dot = np.gradient(qd, DT)
 N = len(qd)
@@ -92,9 +95,11 @@ def run_ilc(gamma, use_q, n_iter, seed=0):
         dq = 0.0
         e_rec = np.zeros(N)
         for i in range(N):
-            # 反馈 + ILC 前馈
+            # 反馈 + ILC 前馈: 反馈误差用编码器测得值(含 NOISE_STD 噪声,
+            # 进闭环 —— "含测量噪声的收敛验证"; e_rec 记录真误差作指标,
+            # 学习更新同样用真误差序列)
             e_meas = qd[i] - (q + rng.normal(0, NOISE_STD))
-            tau = KP * (qd[i] - q) + KD * (qd_dot[i] - dq) + u[i]
+            tau = KP * e_meas + KD * (qd_dot[i] - dq) + u[i]
             ddq = plant(q, dq, tau, i * DT)
             dq += ddq * DT
             q += dq * DT
@@ -134,7 +139,9 @@ out = {
                "noise_std_rad": NOISE_STD,
                "plant": {"J": J_TRUE, "B": B_TRUE, "fc": FC_TRUE,
                          "grav_bias": GRAV_BIAS, "load_amp": LOAD_TORQUE},
-               "traj": "dense_zigzag_right.json J5 前400点重采样4s"},
+               "traj": "dense_zigzag_right.json J5 pts[%d:%d] %d点重采样"
+                       "%d周期×%gms=%.0fs" % (SEG_LO, SEG_HI, len(seg),
+                                              N, DT * 1e3, N * DT)},
     "expA_main": {"rms": rmsA, "max": maxA},
     "expB_nofilter": {"rms": rmsB, "max": maxB},
     "expC_highgamma": {"rms": rmsC, "max": maxC},

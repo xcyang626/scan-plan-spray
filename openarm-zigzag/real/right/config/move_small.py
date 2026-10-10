@@ -194,9 +194,13 @@ def main():
     q_up = list(q0)
     q_up[i] += args.deg * D2R
     lo, hi = node.limits[i]
-    if not (lo <= q_up[i] <= hi):
-        raise SystemExit("目标超出软限位 [%.1f°, %.1f°], 拒绝执行"
-                         % (lo / D2R, hi / D2R))
+    # 2.5° 余量与 joint_probe.py 的 MARGIN 口径一致(大于 watchdog 2° 触发
+    # 余量): 裸软限位贴边时 watchdog 的 trip_margin 不足以兜住, 微动会被抢停
+    margin = math.radians(2.5)
+    if not (lo + margin <= q_up[i] <= hi - margin):
+        raise SystemExit("目标超出软限位 [%.1f°, %.1f°](含 2.5° 余量), "
+                         "拒绝执行"
+                         % ((lo + margin) / D2R, (hi - margin) / D2R))
     print("J%d 微动 %+.1f° (限速 %.2f rad/s): 去 → 回 ..." %
           (args.joint, args.deg, args.speed))
     node.send(node.build(interp(q0, q_up, args.speed)))

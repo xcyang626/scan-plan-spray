@@ -39,10 +39,14 @@ _DEFAULT_SAFETY = os.path.abspath(os.path.join(
 _DEFAULT_REF = os.path.join(_RL_TRACK, "ref_right.npz")
 _DEFAULT_ACTOR = os.path.join(_RL_TRACK, "actor_right.npz")
 
-# 兜底常量(real_safety.yaml 不可用时); 权威来源始终是 yaml
-_FALLBACK_LO = [-0.3490, -0.1336, -1.4069, 0.0505, -1.5189, -0.2543, -1.5049]
-_FALLBACK_HI = [4.4420, 3.2685, 1.6237, 2.4200, 1.5265, 0.9463, 1.5661]
-_FALLBACK_HOME = [0.0, 0.0, 0.0, 0.085366463, 0.0, 0.0, 0.0]
+# 兜底常量(real_safety.yaml 不可用时); 权威来源始终是 yaml。
+# ⚠ 与 real/right/config/real_safety.yaml 保持同步(2026-10-09 核对):
+# 改 yaml(重跑 gen_real_config.py)时同步此处, 否则兜底会静默用旧限位。
+_FALLBACK_LO = [-0.368940122, -0.168640122, -1.406940122, 0.044959878,
+                -1.518740122, -0.800340122, -1.591540122]
+_FALLBACK_HI = [4.428640122, 3.233540122, 1.623740122, 2.413740122,
+                1.525640122, 0.668840122, 1.479840122]
+_FALLBACK_HOME = [0.0, 0.0, 0.0, 0.079866463, 0.0, 0.0, 0.0]
 
 
 def _parse_safety_yaml(text):

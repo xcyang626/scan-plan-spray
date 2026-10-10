@@ -23,8 +23,10 @@ from launch_ros.actions import Node
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 # 单臂 MoveIt 公共配置在 仿真/moveit_sim/left_config/
+# (仿真/ 在 openarm-zigzag/ 下, 需上三级; 原两级拼出 real/仿真/... 导致
+#  FileNotFoundError —— 与右臂 right_real_moveit.launch.py 同款修复)
 _LEFT_CFG = os.path.abspath(
-    os.path.join(_HERE, "..", "..", "仿真", "moveit_sim", "left_config"))
+    os.path.join(_HERE, "..", "..", "..", "仿真", "moveit_sim", "left_config"))
 
 # jazzy 官方 move_group 实测 OMPL 管线参数(同 left_demo.launch.py)
 OMPL_PARAMS = {

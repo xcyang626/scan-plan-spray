@@ -64,7 +64,10 @@ right_joint_trajectory_controller:
 #     speed_scale: 1.0
 #     # --- 安全 ---
 #     clearance_deg: 3.0
-#     safety_yaml: "/home/yang/桌面/openarm实验/real/right/config/real_safety.yaml"
+#     # safety_yaml 不在此写死: 相对路径会被控制器进程按 CWD 解析(随启动
+#     # 目录漂移, 不可靠), 绝对路径随仓库搬迁失效(旧值即此问题)——由
+#     # right_real_control.launch.py 检测到 MPC 插件激活时注入仓库内
+#     # real_safety.yaml 的绝对路径(见该 launch 文件 safety_yaml 注入段)
 #     start_tolerance_rad: 0.035
 #     goal_tolerance_rad: 0.20
 #     abort_deviation_rad: 0.40

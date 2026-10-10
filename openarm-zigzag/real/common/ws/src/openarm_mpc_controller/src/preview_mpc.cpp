@@ -16,11 +16,14 @@ PreviewMPC::PreviewMPC(int n_joints, int N, double dt,
   const double h2 = dt * dt;
   Eigen::MatrixXd L = Eigen::MatrixXd::Zero(N, N);
   Eigen::MatrixXd Lv = Eigen::MatrixXd::Zero(N, N);
-  for (int j = 0; j < N; ++j) {
+  // 行 j-1 = 预测步 j(step() 中 e[j-1]=p_j-r_j), 循环按步 j=1..N 填表;
+  // 原按行号 0..N-1 当步号用会整体错后一步(a0 对 p_1 失效), Python 侧
+  // 同步修正, 一致性仍由 check_gain_parity.py 验收
+  for (int j = 1; j <= N; ++j) {
     for (int m = 0; m < N; ++m) {
       if (m < j) {
-        L(j, m) = h2 * (j - m - 0.5);
-        Lv(j, m) = dt;
+        L(j - 1, m) = h2 * (j - m - 0.5);
+        Lv(j - 1, m) = dt;
       }
     }
   }

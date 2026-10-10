@@ -42,6 +42,7 @@ from rl_policy import POLICY_HZ, Policy, StreamClock  # noqa: E402
 
 # RL 独立话题(--scheme rl 生成配置后驱动订阅此通道; 与 MPC 方案完全分离)
 CMD_TOPIC = "/right_rl_position_commands"
+NAMES = ["openarm_right_joint%d" % i for i in range(1, 8)]   # 本臂 7 关节名
 RATE_LIMIT = 0.05          # rad/条 @50Hz = 2.5 rad/s 附加速率保护
 HOME_TOL_DEG = 2.0
 RETURN_SPEED = 0.10        # 缓速回家峰值关节速度 [rad/s](与参考转移段同级)
@@ -132,12 +133,26 @@ class RlExec(Node):
             self.speed_target = float(m.data)
 
     def _on_js(self, m):
-        if len(m.position) < 7:
-            return
-        self.q = np.array(m.position[:7])
-        # 个别驱动不发布速度 → 退化为 0(观测中 qd 权重有限, 不影响安全)
-        self.vq = (np.array(m.velocity[:7]) if len(m.velocity) >= 7
-                   else np.zeros(7))
+        # 按关节名取(同 safety_watchdog 口径, 2026-09-09 教训: 按位切片会
+        # 被乱序关节错位 —— 双臂消息或其它 /joint_states 发布者同跑时前 7 位
+        # 未必是本臂); 名单不含本臂 7 关节 → 丢弃该条消息
+        if m.name and m.name != NAMES:
+            try:
+                idx = [m.name.index(n) for n in NAMES]
+            except ValueError:
+                return
+            q = [m.position[i] for i in idx]
+            nv = len(m.velocity)
+            v = ([m.velocity[i] for i in idx] if nv > max(idx) else [0.0] * 7)
+        else:
+            if len(m.position) < 7:
+                return
+            q = list(m.position[:7])
+            # 个别驱动不发布速度 → 退化为 0(观测中 qd 权重有限, 不影响安全)
+            v = (list(m.velocity[:7]) if len(m.velocity) >= 7
+                 else [0.0] * 7)
+        self.q = np.array(q)
+        self.vq = np.array(v)
 
     def _on_estop(self, m):
         if m.data:

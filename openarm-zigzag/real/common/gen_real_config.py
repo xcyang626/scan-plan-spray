@@ -259,15 +259,21 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--side", default="left", choices=sorted(SIDES),
                     help="目标臂: left(默认)/right")
-    ap.add_argument("--can", default="can0", help="SocketCAN 接口名")
+    ap.add_argument("--can", default="can0",
+                    help="SocketCAN 接口名(⚠ 双臂同机部署时左右臂必须用不同 "
+                         "CAN 接口, 如 can0/can1 —— 两臂共总线会相互干扰)")
     ap.add_argument("--canfd", default="true", choices=["true", "false"],
                     help="CAN-FD 开关(按你的 CAN 模块能力定)")
-    ap.add_argument("--kp", default="120,70,70,90,30,30,30",
-                    help="7 关节 MIT kp(2026-09-04: J5-J7 由 10 提到 30,"
-                         " kp=10 的腕部在竖直零位下顶不住接触/线束阻力,"
-                         " 会下垂 20° 导致 JTC 容差中止)")
-    ap.add_argument("--kd", default="3.6,3.0,2.0,2.2,1.5,1.5,1.2",
-                    help="7 关节 MIT kd(随 kp 提高相应加强阻尼)")
+    ap.add_argument("--kp", default="120,100,70,126.3,30,30,30",
+                    help="7 关节 MIT kp(默认=右臂已部署 URDF 值; ⚠ 左臂部署值"
+                         "不同: 120,70,70,90,30,30,30, 生成左臂时须显式传参, "
+                         "否则会静默回退右臂调优增益。2026-09-04: J5-J7 由 10 "
+                         "提到 30, kp=10 的腕部在竖直零位下顶不住接触/线束"
+                         "阻力, 会下垂 20° 导致 JTC 容差中止)")
+    ap.add_argument("--kd", default="7.4,12.2,7.5,8.04,1.5,1.5,1.5",
+                    help="7 关节 MIT kd(默认=右臂已部署 URDF 值, 随 kp 调优"
+                         "相应加强阻尼; ⚠ 左臂部署值不同: 3.6,3.0,2.0,2.2,"
+                         "1.5,1.5,1.2, 生成左臂时须显式传参)")
     ap.add_argument("--hand", default="hold", choices=["off", "hold"],
                     help="ESC8 夹爪: hold=control 层使能后原地锁定(默认), "
                          "off=完全不接触 ESC8(右臂无夹爪必选)")

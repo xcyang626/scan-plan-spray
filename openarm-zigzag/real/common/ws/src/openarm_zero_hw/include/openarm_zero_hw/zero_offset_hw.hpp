@@ -115,9 +115,11 @@ class ZeroOffsetHW : public hardware_interface::SystemInterface {
   // 速度+前馈。钳位: 绝对±6.5/0.2rad、vel_clamp_、ff_clamp_。
   struct InjectSrc {
     std::vector<double> cmd, vel, ff;
-    rclcpp::Time stamp{};
-    // 跨线程(订阅回调线程写 / RT write 读)标志用 atomic; 与原始实现
-    // (mpc_fresh_ atomic + stamp 普通读)保持同等级别的同步
+    // stamp 以 ns 整数原子存取: 订阅线程写 / RT write 读, 撕裂的时间戳会
+    // 把新鲜度误判成任意值。cmd/vel/ff 为多分量数组, 维持既有非原子等级
+    // (钳位带宽兜底), 见上方通道注释的同步等级声明
+    std::atomic<int64_t> stamp_ns{0};
+    // 跨线程(订阅回调线程写 / RT write 读)标志用 atomic
     std::atomic<bool> got{false};     // 曾收到消息
     std::atomic<bool> active{false};  // 上一周期被采用(上升沿检测)
   };

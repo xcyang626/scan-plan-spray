@@ -85,6 +85,8 @@ class SafetyWatchdog(Node):
     # ------------------------------------------------------------------
 
     def _on_js(self, msg):
+        # velocity 容错: 部分发布源(如 pub_home_js 零位可视化)不带速度字段,
+        # 缺失按零速处理 —— 位置越界检查不受影响, 不会误触发速度告警/崩溃
         if msg.name and msg.name != JOINTS:
             # 只认 7 臂关节顺序; 顺序不一致时按名字重排
             try:
@@ -92,10 +94,12 @@ class SafetyWatchdog(Node):
             except ValueError:
                 return
             q = [msg.position[i] for i in idx]
-            v = [msg.velocity[i] for i in idx]
+            nv = len(msg.velocity)
+            v = [msg.velocity[i] if i < nv else 0.0 for i in idx]
         else:
             q = list(msg.position[:7])
-            v = list(msg.velocity[:7])
+            v = (list(msg.velocity[:7]) if len(msg.velocity) >= 7
+                 else [0.0] * 7)
         self._last_js_time = time.monotonic()
         with self._lock:
             self._last_q = q
@@ -130,8 +134,10 @@ class SafetyWatchdog(Node):
         # 不发起自动回位(没有反馈就不该主动运动), 请人工排查后 reset。
         if (not self._tripped and not self._tripping
                 and time.monotonic() - self._last_js_time > 1.5):
+            # do_return=False: 断流时无新鲜反馈, _last_q 可能已是 1.5s 前
+            # 陈旧位形, 用它自动回位违背"没有反馈就不该主动运动"的注释语义
             self._trip("/joint_states 断流>1.5s(control 层退出或反馈丢失)"
-                       " → 锁定当前位形, 请人工排查")
+                       " → 锁定当前位形, 请人工排查", do_return=False)
 
     def _publish_status(self):
         m = String()

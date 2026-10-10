@@ -76,7 +76,7 @@ class SafetyWatchdog(Node):
             self, FollowJointTrajectory,
             "/left_joint_trajectory_controller/follow_joint_trajectory")
 
-        self.create_timer(1.0, self._publish_status)
+        self.create_timer(0.1, self._publish_status)
         self.create_timer(0.5, self._check_js_alive)
         self.get_logger().info("安全监控已启动(触发条件: 越界+%em / 速度>%.1frad/s "
                                "或 /safety/estop)"
@@ -85,6 +85,8 @@ class SafetyWatchdog(Node):
     # ------------------------------------------------------------------
 
     def _on_js(self, msg):
+        # velocity 容错: 部分发布源(如 pub_home_js 零位可视化)不带速度字段,
+        # 缺失按零速处理 —— 位置越界检查不受影响, 不会误触发速度告警/崩溃
         if msg.name and msg.name != JOINTS:
             # 只认 7 臂关节顺序; 顺序不一致时按名字重排
             try:
@@ -92,10 +94,12 @@ class SafetyWatchdog(Node):
             except ValueError:
                 return
             q = [msg.position[i] for i in idx]
-            v = [msg.velocity[i] for i in idx]
+            nv = len(msg.velocity)
+            v = [msg.velocity[i] if i < nv else 0.0 for i in idx]
         else:
             q = list(msg.position[:7])
-            v = list(msg.velocity[:7])
+            v = (list(msg.velocity[:7]) if len(msg.velocity) >= 7
+                 else [0.0] * 7)
         self._last_js_time = time.monotonic()
         with self._lock:
             self._last_q = q
@@ -125,10 +129,15 @@ class SafetyWatchdog(Node):
             self.get_logger().warn("安全状态已人工复位, 恢复监控")
 
     def _check_js_alive(self):
+        # 2026-09-18 安全强化: 断流>1.5s 从"仅日志"升级为"锁存 TRIPPED"。
+        # 无反馈 = 策略会用过期状态算指令, 必须停掉一切指令流;
+        # 不发起自动回位(没有反馈就不该主动运动), 请人工排查后 reset。
         if (not self._tripped and not self._tripping
                 and time.monotonic() - self._last_js_time > 1.5):
-            self.get_logger().error("/joint_states 断流 >1.5s! "
-                                    "control 层可能已退出, 请人工处理")
+            # do_return=False: 断流时无新鲜反馈, _last_q 可能已是 1.5s 前
+            # 陈旧位形, 用它自动回位违背"没有反馈就不该主动运动"的注释语义
+            self._trip("/joint_states 断流>1.5s(control 层退出或反馈丢失)"
+                       " → 锁定当前位形, 请人工排查", do_return=False)
 
     def _publish_status(self):
         m = String()
@@ -142,14 +151,17 @@ class SafetyWatchdog(Node):
 
     # ------------------------------------------------------------------
 
-    def _trip(self, reason):
+    def _trip(self, reason, do_return=True):
         self._tripped = True
         self.get_logger().error("=" * 60)
         self.get_logger().error("安全触发: %s → 取消目标并慢速回标定初始位形"
                                 % reason)
         self.get_logger().error("=" * 60)
-        t = threading.Thread(target=self._do_return, daemon=True)
-        t.start()
+        if do_return:
+            t = threading.Thread(target=self._do_return, daemon=True)
+            t.start()
+        else:
+            self.get_logger().error("(无反馈保护模式: 不发起自动回位)")
 
     def _do_return(self):
         """取消 JTC 当前目标, 然后发慢速回位轨迹(独立线程, 不阻塞 executor)。"""

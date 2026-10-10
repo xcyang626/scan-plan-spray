@@ -235,6 +235,18 @@ hardware_interface::CallbackReturn ZeroOffsetHW::on_init(
         [this](const std_msgs::msg::Float64MultiArray::SharedPtr msg) {
           const size_t n = msg->data.size();
           if (n != ARM_DOF && n != 2 * ARM_DOF && n != 3 * ARM_DOF) return;
+          // NaN 防护: min/max 与 NaN 比较会错误钳到边界(位置会钳到 6.5rad),
+          // 任一分量非有限即整条丢弃——保留旧值且不刷新 stamp, 持续坏流
+          // 会因"不新鲜"走既有断流回退(限速滑回 JTC)路径
+          for (double x : msg->data) {
+            if (!std::isfinite(x)) {
+              RCLCPP_WARN_THROTTLE(
+                  rclcpp::get_logger("ZeroOffsetHW"),
+                  *mpc_node_->get_clock(), 1000,
+                  "注入消息含非有限值, 丢弃该条(保留上一指令与新鲜度)");
+              return;
+            }
+          }
           const bool has_vel = n == 3 * ARM_DOF;
           const bool has_ff = n >= 2 * ARM_DOF;
           for (size_t i = 0; i < ARM_DOF; ++i) {
@@ -257,7 +269,7 @@ hardware_interface::CallbackReturn ZeroOffsetHW::on_init(
             f = std::max(inj_.ff[i] - 0.5, std::min(inj_.ff[i] + 0.5, f));
             inj_.ff[i] = f;
           }
-          inj_.stamp = mpc_node_->now();
+          inj_.stamp_ns.store(mpc_node_->now().nanoseconds());  // 原子写时间戳
           inj_.got.store(true);
         });
     mpc_exec_ = std::make_shared<rclcpp::executors::SingleThreadedExecutor>();
@@ -375,8 +387,11 @@ hardware_interface::return_type ZeroOffsetHW::write(
   // 注入源新鲜度(单话题: RL 或 MPC 由配置决定, 运行时不同时存在)
   const rclcpp::Time now = mpc_node_ ? mpc_node_->now()
                                      : rclcpp::Time(0, 0, RCL_ROS_TIME);
+  // 时间戳原子读回(ns); rclcpp::Time(ns) 默认 RCL_ROS_TIME, 与节点 now()
+  // 同钟型, 相减不会因钟型不同抛异常
+  const rclcpp::Time inj_stamp(inj_.stamp_ns.load());
   const bool use_inj = mpc_node_ && inj_.got.load() &&
-      (now - inj_.stamp).seconds() < inj_fresh_s_;
+      (now - inj_stamp).seconds() < inj_fresh_s_;
   if (use_inj && !inj_.active.load()) {
     // 上升沿: 基线重置为当前实际位置(上会话残留结构性清除)
     for (size_t i = 0; i < ARM_DOF; ++i) {
@@ -459,6 +474,14 @@ hardware_interface::return_type ZeroOffsetHW::write(
 
 hardware_interface::CallbackReturn ZeroOffsetHW::on_shutdown(
     const rclcpp_lifecycle::State& /*previous_state*/) {
+  // 先失能电机再清理线程: active 状态直接 shutdown 会让电机带着最后一条
+  // MIT 指令永久刚性锁定。disable_all 只发/收 CAN 帧, 不触碰注入线程与
+  // executor, 先于线程清理执行无死锁(节奏与 on_deactivate 同款)
+  for (int i = 0; i < 3; ++i) {
+    openarm_->disable_all();
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    openarm_->recv_all();
+  }
   if (mpc_exec_) {
     mpc_exec_->cancel();
     if (mpc_spin_.joinable()) mpc_spin_.join();

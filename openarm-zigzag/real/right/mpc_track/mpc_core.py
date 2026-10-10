@@ -29,11 +29,14 @@ class PreviewMPC:
             #   v_j = v0 + h  Σ_{m<j}          a_m
             L = np.zeros((N, N))
             Lv = np.zeros((N, N))
-            for j in range(N):
+            # 行 j-1 = 预测步 j(step() 中 e[j-1]=p_j-r_j), 按步 j=1..N 填表;
+            # 原按行号 0..N-1 当步号用会整体错后一步(a0 对 p_1 失效),
+            # 与 preview_mpc.cpp 同步修正, 一致性由 check_gain_parity.py 验收
+            for j in range(1, N + 1):
                 for m in range(N):
                     if m < j:
-                        L[j, m] = dt * dt * (j - m - 0.5)
-                        Lv[j, m] = dt
+                        L[j - 1, m] = dt * dt * (j - m - 0.5)
+                        Lv[j - 1, m] = dt
             M = np.vstack([L, Lv])                      # (2N, N)
             W = np.diag([w_p] * N + [w_v] * N)
             R = np.diag([w_a] * N)

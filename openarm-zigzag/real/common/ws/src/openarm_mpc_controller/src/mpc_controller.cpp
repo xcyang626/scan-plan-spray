@@ -212,10 +212,19 @@ controller_interface::CallbackReturn OpenArmMpcController::on_activate(
   traj_box_.writeFromNonRT(TrajSlot{});
   gh_box_.writeFromNonRT(GhSlot{});
   estop_latch_.store(false);
+  goal_busy_.store(false);  // 失活/重激活竞态下 goal_busy_ 可能悬死(on_accepted
+                            // 晚于 on_deactivate 时无人清), 重激活一律复位
   for (int i = 0; i < n_joints_; ++i) {
     const size_t k = static_cast<size_t>(i);
     meas_pos_[k] = state_interfaces_[2 * k].get_value();
     meas_vel_[k] = state_interfaces_[2 * k + 1].get_value();
+    // NaN 防护: 激活时反馈即非有限说明链路已坏, 拒绝激活(把 NaN 写进
+    // q_cmd_ 会让电机 MIT 目标非定), 宁可保守失败
+    if (!std::isfinite(meas_pos_[k]) || !std::isfinite(meas_vel_[k])) {
+      RCLCPP_ERROR(get_node()->get_logger(),
+                   "第 %d 关节状态非有限(NaN/Inf), 拒绝激活", i);
+      return controller_interface::CallbackReturn::ERROR;
+    }
     q_model_[k] = meas_pos_[k];
     v_model_[k] = meas_vel_[k];
     q_cmd_[k] = meas_pos_[k];
@@ -244,6 +253,12 @@ rclcpp_action::GoalResponse OpenArmMpcController::on_goal(
   const rclcpp_action::GoalUUID &,
   std::shared_ptr<const FollowJTrajAction::Goal> goal)
 {
+  // 生命周期检查: 失活后 action server 仍在, 但 update() 不再运行, 此时
+  // 收 goal 只会写交接盒后悬死(goal_busy_ 卡死), 必须直接拒绝
+  if (get_lifecycle_id() != lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE) {
+    RCLCPP_ERROR(get_node()->get_logger(), "拒绝 goal: 控制器未激活");
+    return rclcpp_action::GoalResponse::REJECT;
+  }
   if (estop_latch_.load()) {
     RCLCPP_ERROR(get_node()->get_logger(),
                  "拒绝 goal: estop 挂起(重启控制器清除)");
@@ -355,8 +370,20 @@ bool OpenArmMpcController::prepare_traj(
   }
 
   auto traj = std::make_shared<Traj>();
+  // 首点时间非 0(如 safety_watchdog 回位轨迹首点 0.05s)时, 头部插入
+  // "当前位形、0 时刻"点: 后续各点时间轴保持调用方原语义, 参考从测量
+  // 位形线性 blend 到原首点(起点校验已保证两者差 ≤ start_tol_), 且
+  // 消除 sample_at_ 在 tt<times[0] 段的边界情形; 相比"把首点时间平移
+  // 为 0"不改变其余点的相对时序, 对调用方更安全
+  const bool prepend_now = times.front() != 0.0;
+  if (prepend_now) {
+    times.insert(times.begin(), 0.0);
+  }
   traj->times = std::move(times);
-  traj->points.reserve(pts.size());
+  traj->points.reserve(pts.size() + (prepend_now ? 1u : 0u));
+  if (prepend_now) {
+    traj->points.push_back(m.pos);  // 测量位形(内部关节序), 与模型初始化同源
+  }
   for (const auto & p : pts) {
     std::vector<double> row(static_cast<size_t>(n_joints_), 0.0);
     for (size_t g = 0; g < order.size(); ++g) {
@@ -417,6 +444,10 @@ double OpenArmMpcController::sample_at_(
     return t.points.back()[j];
   }
   auto it = std::upper_bound(t.times.begin(), t.times.end(), tt);
+  // tt 早于首点时刻(首点非 0 的轨迹): 钳在首点, 防 i 下溢为 size_t(-1) 越界
+  if (it == t.times.begin()) {
+    return t.points.front()[j];
+  }
   const size_t i = static_cast<size_t>(it - t.times.begin()) - 1;
   const double t0 = t.times[i];
   const double t1 = t.times[i + 1];
@@ -430,9 +461,32 @@ controller_interface::return_type OpenArmMpcController::update(
   const size_t n = static_cast<size_t>(n_joints_);
 
   // ① 读硬件状态(博客线路一 update() 第一步) → 缓存供起点校验
+  bool meas_bad = false;
   for (size_t k = 0; k < n; ++k) {
     meas_pos_[k] = state_interfaces_[2 * k].get_value();
     meas_vel_[k] = state_interfaces_[2 * k + 1].get_value();
+    meas_bad = meas_bad || !std::isfinite(meas_pos_[k]) ||
+      !std::isfinite(meas_vel_[k]);
+  }
+  // NaN 防护: 反馈非有限 = 反馈链路损坏。坏值不进缓存(起点校验对 NaN 恒
+  // 放行)、本周期不推进模型; 走 estop 同款挂起路径(abort + hold 上一有限
+  // 指令 + 拒绝新 goal, 重激活清除)。不用 update 返回 ERROR 触发 CM 失活,
+  // 保持生命周期稳定, 人工排查后重激活即可恢复
+  if (meas_bad) {
+    const GhSlot mslot = *gh_box_.readFromRT();
+    if (traj_running_ && mslot.gh && mslot.gen == traj_gen_) {
+      finish_goal_(false, "状态反馈非有限(NaN/Inf)");
+    }
+    traj_.reset();
+    traj_running_ = false;
+    estop_latch_.store(true);
+    RCLCPP_ERROR_THROTTLE(
+      get_node()->get_logger(), *get_node()->get_clock(), 1000,
+      "状态反馈含非有限值: hold 上一指令并 estop 挂起(排查反馈后重激活)");
+    for (size_t k = 0; k < n; ++k) {
+      (void)command_interfaces_[k].set_value(q_cmd_[k]);
+    }
+    return controller_interface::return_type::OK;
   }
   {
     std::lock_guard<std::mutex> lock(meas_mutex_);
@@ -489,6 +543,7 @@ controller_interface::return_type OpenArmMpcController::update(
   const double t_ref =
     (time - traj_start_).seconds() / (speed_scale_ > 0.0 ? speed_scale_ : 1.0);
   const double h = period.seconds();
+  bool nonfinite = false;  // 指令/模型 NaN 防护标志(见循环内检查)
   for (size_t k = 0; k < n; ++k) {
     for (int j = 0; j <= N_; ++j) {
       ref_win_[static_cast<size_t>(j)] =
@@ -496,10 +551,39 @@ controller_interface::return_type OpenArmMpcController::update(
     }
     const double a = mpc_->step(
       static_cast<int>(k), q_model_[k], v_model_[k], ref_win_.data(), a_max_);
-    v_model_[k] += h * a;
-    q_model_[k] += h * v_model_[k] + 0.5 * h * h * a;
-    q_cmd_[k] = std::max(lo_box_[k], std::min(hi_box_[k], q_model_[k]));
+    // ZOH 积分顺序: 先用旧速度积位置、再更新速度(与 mpc_exec.py 逐点一致;
+    // 反过来等效 q←q+h·v+1.5h²a, 每步多出半步加速度位移)
+    const double q_next = q_model_[k] + h * v_model_[k] + 0.5 * h * h * a;
+    const double v_next = v_model_[k] + h * a;
+    // NaN 防护: 非有限值不得进入钳位表达式(max/min 遇 NaN 会错误钳到
+    // 上界软限位), 该关节保持上一指令, 整体走循环后的中止路径
+    if (!std::isfinite(q_next) || !std::isfinite(v_next)) {
+      nonfinite = true;
+      break;
+    }
+    q_model_[k] = q_next;
+    v_model_[k] = v_next;
+    // 模型状态本身也夹入净空盒(mpc_exec.py 对 qn 投影后既作指令也作下一
+    // 状态; 只夹指令会让模型漂出盒外、指令与模型状态脱节)
+    q_model_[k] = std::max(lo_box_[k], std::min(hi_box_[k], q_model_[k]));
+    q_cmd_[k] = q_model_[k];
     (void)command_interfaces_[k].set_value(q_cmd_[k]);
+  }
+  if (nonfinite) {
+    // NaN 中止: 与状态读入防护同一路径(abort + hold 上一有限指令 + estop
+    // 挂起拒绝新 goal, 重激活清除), 宁可保守停住也不用坏数值继续控制
+    if (gh_current) {
+      finish_goal_(false, "模型状态发散为非有限值");
+    }
+    traj_.reset();
+    traj_running_ = false;
+    estop_latch_.store(true);
+    RCLCPP_ERROR(get_node()->get_logger(),
+                 "中止 MPC 跟踪: 模型状态非有限(NaN/Inf), hold 上一指令");
+    for (size_t k = 0; k < n; ++k) {
+      (void)command_interfaces_[k].set_value(q_cmd_[k]);
+    }
+    return controller_interface::return_type::OK;
   }
 
   // 保护: 测量与指令偏差超限(替代 JTC trajectory 容差监视)

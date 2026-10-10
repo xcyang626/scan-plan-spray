@@ -12,7 +12,7 @@
 
 前置: control 层(A)在跑且臂在 home(±2°)。
 用法:
-  /usr/bin/python3 mpc_exec.py --ref ../../仿真/moveit_sim/dense_zigzag.json \
+  /usr/bin/python3 mpc_exec.py --ref ../../../仿真/moveit_sim/dense_zigzag.json \
       --speed-scale 0.4
 """
 
@@ -38,9 +38,12 @@ sys.path.insert(0, _HERE)
 from mpc_core import PreviewMPC          # noqa: E402
 
 NAMES = ["openarm_left_joint%d" % i for i in range(1, 8)]
-ISA = os.path.abspath(os.path.join(_HERE, "..", "..", "仿真", "isaaclab_sim"))
-PKG = os.path.abspath(os.path.join(_HERE, "..", "..", "仿真", "openarm_sim"))
+# 对齐右臂 ../../../仿真 结构: 仿真/ 在 openarm-zigzag/ 下, 本目录需上
+# 三级(mpc_track→left→real→openarm-zigzag); 原两级拼出 real/仿真/... 不存在
+ISA = os.path.abspath(os.path.join(_HERE, "..", "..", "..", "仿真", "isaaclab_sim"))
+PKG = os.path.abspath(os.path.join(_HERE, "..", "..", "..", "仿真", "openarm_sim"))
 CMD_TOPIC = "/left_mpc_position_commands"
+JS_TIMEOUT_S = 0.3    # /joint_states 断流保护阈值(100Hz 反馈, 丢 30 帧即停)
 
 
 class MpcExec(Node):
@@ -51,6 +54,7 @@ class MpcExec(Node):
         self.q = None
         self.status = None
         self.stop_reason = None
+        self._last_js_time = time.monotonic()   # 断流保护: 最近一帧反馈时刻
         self.create_subscription(JointState, "/joint_states",
                                  self._on_js, qos_profile_sensor_data)
         self.create_subscription(String, "/safety/status",
@@ -62,7 +66,18 @@ class MpcExec(Node):
         self.pub_done = self.create_publisher(Bool, "/mpc/finished", 10)
 
     def _on_js(self, m):
-        self.q = list(m.position[:7])
+        # 按关节名取(同 safety_watchdog/check_states 口径, 2026-09-09 教训:
+        # 按位切片会被乱序关节错位 —— 双臂消息或其它 /joint_states 发布者
+        # 同跑时前 7 位未必是本臂); 名单不含本臂 7 关节 → 丢弃该条消息
+        if m.name and m.name != NAMES:
+            try:
+                idx = [m.name.index(n) for n in NAMES]
+            except ValueError:
+                return
+            self.q = [m.position[i] for i in idx]
+        else:
+            self.q = list(m.position[:7])
+        self._last_js_time = time.monotonic()
 
     def _on_estop(self, m):
         if m.data:
@@ -185,8 +200,15 @@ class MpcExec(Node):
                 self.stop_reason = "watchdog %s" % self.status
                 self.get_logger().error("watchdog 触发(%s), 停流" % self.status)
                 break
-            if self.q is None or now - t0 > 0:      # 占位: 状态断流保护
-                pass
+            # 状态断流保护: control 层退出/反馈丢失时, MPC 继续开环推
+            # 双积分模型会失真 → 超时立即停流退出(驱动 0.2s 断流自动
+            # 回落 JTC 保持, 语义安全)
+            if now - self._last_js_time > JS_TIMEOUT_S:
+                self.stop_reason = "joint_states 断流>%.1fs" % JS_TIMEOUT_S
+                self.get_logger().error(
+                    "/joint_states 断流>%.1fs(control 层退出或反馈丢失?), "
+                    "停流退出" % JS_TIMEOUT_S)
+                break
             k += 1
             if k >= len(R) - N:
                 self.get_logger().info("参考走完, 停流保持")
@@ -225,7 +247,7 @@ class MpcExec(Node):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ref", default=os.path.join(
-        "..", "..", "仿真", "moveit_sim", "dense_zigzag.json"))
+        _HERE, "..", "..", "..", "仿真", "moveit_sim", "dense_zigzag.json"))
     ap.add_argument("--speed-scale", type=float, default=0.4)
     ap.add_argument("--config", default=os.path.join(_HERE, "mpc_config.json"))
     args = ap.parse_args()

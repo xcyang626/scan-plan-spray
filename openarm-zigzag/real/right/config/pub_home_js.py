@@ -32,6 +32,8 @@ def main():
                      for i, v in enumerate(home)), flush=True)
     msg = JointState()
     msg.name = JOINTS  # 关节名与 URDF 一致(left/right 由本目录决定)
+    msg.velocity = [0.0] * 7   # 补零速: 静止位形, 防 watchdog 等订阅方取
+                               # velocity 时 IndexError(字段缺失即崩溃)
     try:
         while rclpy.ok():
             msg.header.stamp = node.get_clock().now().to_msg()
