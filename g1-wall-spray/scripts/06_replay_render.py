@@ -5,7 +5,7 @@
 """
 import numpy as np
 import mujoco
-import os, glob
+import os, glob, re
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BASE06 = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -16,7 +16,17 @@ try:
     MJCF = _m if os.path.isabs(_m) else os.path.join(BASE06, _m)
 except Exception:
     MJCF = os.path.join(BASE06, "models", "g1_mjcf", "g1-mode_13_15.xml")
-VER = os.environ.get("MOTION_VER", sorted(glob.glob(os.path.join(BASE, "output/ufo_motion/v*")))[-1].split("/")[-1])
+
+
+def _ver_key(name):
+    # 版本目录自然排序键: 按 v 后数字排(v2<v5<v10), 字母序会把 v10 排在 v5 前
+    m = re.match(r"v(\d+)", name)
+    return int(m.group(1)) if m else -1
+
+
+_vdirs = [os.path.basename(d) for d in glob.glob(os.path.join(BASE, "output/ufo_motion/v*"))]
+VER = os.environ.get("MOTION_VER") or (max(_vdirs, key=lambda d: (_ver_key(d), d))
+                                       if _vdirs else "v1")
 FR = os.path.join(BASE, "output", "ufo_motion", VER, "replay_frames")
 os.makedirs(FR, exist_ok=True)
 
@@ -24,9 +34,11 @@ model = mujoco.MjModel.from_xml_path(MJCF)
 data = mujoco.MjData(model)
 renderer = mujoco.Renderer(model, 480, 640)
 
-_npzs = sorted(glob.glob(os.path.join(BASE, "output/ufo_motion/v*/wall_spray_motion.npz")))
-motion = np.load(_npzs[-1])
-print("回放动作:", _npzs[-1].split("/")[-2])
+# 动作文件由 VER 拼出(不再独立取 sorted 最新, 避免与显式 MOTION_VER 错位)
+_npz = os.path.join(BASE, "output", "ufo_motion", VER, "wall_spray_motion.npz")
+assert os.path.exists(_npz), f"动作文件不存在: {_npz} (先运行 05, 或用 MOTION_VER 指定版本)"
+motion = np.load(_npz)
+print("回放动作:", _npz)
 qpos = motion["qpos"].astype(float)
 T = len(qpos)
 print(f"回放 {T} 帧, 每2帧渲染1张")

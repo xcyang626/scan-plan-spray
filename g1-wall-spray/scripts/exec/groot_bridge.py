@@ -26,6 +26,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
@@ -36,6 +37,21 @@ GROOT_ROOT = os.environ.get("GROOT_ROOT",
                             "/home/yang/桌面/轨迹规划/GR00T-WholeBodyControl")
 if GROOT_ROOT not in sys.path:
     sys.path.insert(0, GROOT_ROOT)
+
+
+def _default_zmq_host():
+    """ZMQ 绑定地址: 优先 env.json 的 zmq_host(约定必须 localhost),
+    无配置时默认 127.0.0.1 —— 不再裸绑 '*'(全网卡可达). CLI --host 可显式覆盖."""
+    try:
+        _base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        h = json.load(open(os.path.join(_base, "station", "env.json"),
+                           encoding="utf8")).get("zmq_host")
+        return h or "127.0.0.1"
+    except Exception:
+        return "127.0.0.1"
+
+
+DEFAULT_ZMQ_HOST = _default_zmq_host()
 
 # ---- GR00T 官方发送端模块 ----
 from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (  # noqa: E402
@@ -60,7 +76,7 @@ KEY_TEMP = "F"         # 报告电机温度
 class Publisher:
     """发布 GR00T planner 话题（含 upper_body_position）。"""
 
-    def __init__(self, host="*", port=5556):
+    def __init__(self, host=DEFAULT_ZMQ_HOST, port=5556):
         import zmq
         self._zmq = zmq
         self.ctx = zmq.Context.instance()
@@ -171,13 +187,17 @@ def load_upper17(motion_npz):
     return u, d
 
 
-def stream_upper_body(motion_npz, host="*", port=5556, rate=30.0,
+def stream_upper_body(motion_npz, host=DEFAULT_ZMQ_HOST, port=5556, rate=30.0,
                       start_command=True, realtime=True, verbose=True):
     """把动作的上肢 17 关节按实时速率流给机器人（GR00T 官方格式）。
 
     返回 (帧数, none)。真实时间流速 = rate Hz；每条 planner 消息 1 帧。
+    发送前按官方要求做硬件序 -> SONIC 交错序重排
+    (与 groot_daemon.py _do_stream 的 to_sonic_order 一致, 速度列同步重排)。
     """
     u, d = load_upper17(motion_npz)
+    u = to_sonic_order(u)                  # (T,17) SONIC 交错序
+    d = d[:, SONIC_PERM]                   # 速度列同序重排
     n = len(u)
     pub = Publisher(host, port)
     try:
@@ -228,7 +248,7 @@ def qpos_to_v1_fields(qpos, start_index=0, fps=30.0):
     return jp, jv, bq, fi
 
 
-def stream_pose(motion_npz, host="*", port=5556, rate=30.0, chunk=1,
+def stream_pose(motion_npz, host=DEFAULT_ZMQ_HOST, port=5556, rate=30.0, chunk=1,
                 start_command=True, verbose=True):
     """用**官方 pack_pose_message(version=1)** 把全身动作按实时速率流给机器人。
     start_command=True 时先发 command(start=True, planner=False) 进入流式动作模式。"""
@@ -283,7 +303,7 @@ def send_key(fifo_path, ch):
         return False
 
 
-def send_command(kind, host="*", port=5556, repeat=3):
+def send_command(kind, host=DEFAULT_ZMQ_HOST, port=5556, repeat=3):
     """经 GR00T 官方 command 话题下发控制命令(在 GR00T venv 内运行, 依赖 msgpack)."""
     pub = Publisher(host, port)
     try:
@@ -312,7 +332,8 @@ if __name__ == "__main__":
     ap.add_argument("--send-command",
                     choices=["start", "start_stream", "stop", "planner_on", "planner_off"],
                     help="下发 GR00T 官方 command")
-    ap.add_argument("--host", default="*")
+    ap.add_argument("--host", default=DEFAULT_ZMQ_HOST,
+                    help="ZMQ 绑定地址(默认取 env.json zmq_host, 无配置 127.0.0.1)")
     ap.add_argument("--port", type=int, default=5556)
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()

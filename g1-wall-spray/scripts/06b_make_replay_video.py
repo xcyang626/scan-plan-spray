@@ -9,7 +9,17 @@ import imageio
 from PIL import Image, ImageDraw
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-VER = os.environ.get("MOTION_VER", "v2_uniform_slow")
+
+
+def _ver_key(name):
+    # 版本目录自然排序键: 按 v 后数字排(v2<v5<v10), 字母序会把 v10 排在 v5 前
+    m = re.match(r"v(\d+)", name)
+    return int(m.group(1)) if m else -1
+
+
+_vdirs = [os.path.basename(d) for d in glob.glob(os.path.join(BASE, "output/ufo_motion/v*"))]
+VER = os.environ.get("MOTION_VER") or (max(_vdirs, key=lambda d: (_ver_key(d), d))
+                                       if _vdirs else "v1")
 FR = os.path.join(BASE, "output", "ufo_motion", VER, "replay_frames")
 OUT = os.path.join(BASE, "output", "ufo_motion", VER)
 

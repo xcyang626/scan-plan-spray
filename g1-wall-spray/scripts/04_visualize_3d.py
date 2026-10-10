@@ -91,20 +91,21 @@ def rotzf(a):
 AXF = {'x': rotxf, 'y': rotyf, 'z': rotzf}
 
 
-def leg_ik(pelvis_z, base_x, base_y, side):
-    """蹲姿/站姿 腿部2连杆IK(矢状面): 足底贴地. 返回 [(hip, knee, ankle, toe)] (世界系)"""
+def leg_ik(pelvis_z, base_x, base_y, side, floor_z):
+    """蹲姿/站姿 腿部2连杆IK(矢状面): 足底贴地(floor_z=场景地面世界z, 云模式=0).
+    返回 [(hip, knee, ankle, toe)] (世界系; 骨盆高 pelvis_z 为离地高)"""
     hip_y = base_y + (0.0664 if side == 'L' else -0.0664)   # hip_pitch y 偏移
     hip_x = base_x
-    hip_z = pelvis_z - 0.1027
-    foot_z = FLOOR_Z
-    dz = hip_z - foot_z                    # hip->足底 垂直距离
+    hip_z = floor_z + pelvis_z - 0.1027     # 髋世界z = 场景地面 + 髋离地(骨盆高-0.1027)
+    foot_z = floor_z
+    dz = hip_z - foot_z                    # hip->足底 垂直距离(=髋离地高)
     r = np.hypot(dz, 0.0)                  # 足在髋正下方(前后偏移0)
     r = min(r, L_THIGH + L_SHANK - 1e-3)
     a = np.arccos(np.clip((L_THIGH**2 + r**2 - L_SHANK**2) / (2 * L_THIGH * r), -1, 1))
     knee_x = hip_x + L_THIGH * np.sin(a)
     knee_z = hip_z - L_THIGH * np.cos(a)
     ankle_z = foot_z + 0.038
-    toe_x, toe_y, toe_z = base_x + 0.12, hip_y, FLOOR_Z
+    toe_x, toe_y, toe_z = base_x + 0.12, hip_y, floor_z
     return [(hip_x, hip_y, hip_z), (knee_x, hip_y, knee_z),
             (hip_x, hip_y, ankle_z), (toe_x, toe_y, toe_z)]
 
@@ -136,7 +137,10 @@ def main():
     cls, kind, zone, mode = t["cls"], t["kind"], t["zone"], t["mode"]
     axis, conv, q, pelvis = t["axis"], t["ik_ok"], t["q"], t["pelvis"]
     u_robot = float(t["u_robot"])
-    base_x, base_y = FX - 0.74, U0v + u_robot     # 标称站位0.74m(保证带0.70~0.78)
+    # 站位统一从 03 写出的 trajectory_meta.json 取(d_robot_nominal), 不再硬编码 0.74
+    # (站位可 0.70~0.78m; 站位标记/地面网格/展示位姿共用同一组 base_x/base_y)
+    _meta = json.load(open(os.path.join(OUT, "trajectory_meta.json")))
+    base_x, base_y = FX - float(_meta["d_robot_nominal"]), U0v + u_robot
     SINGLE = "#1f7ac2"          # 统一走线颜色
     colors = dict(green=SINGLE, red=SINGLE, yellow=SINGLE)
 
@@ -156,6 +160,8 @@ def main():
     else:
         pts = sec["points"].astype(float)     # (u,h,d)
         lab = sec["label"]
+        _ok = lab != -1                       # -1=未标注点: 无对应渲染色, 直接过滤(不改变 5 色语义)
+        pts, lab = pts[_ok], lab[_ok]
         # 转世界: x = FX - d, y = U0v + u, z = FZv + h
         n_sub = min(len(pts), 60000)
         idx = np.random.default_rng(0).choice(len(pts), n_sub, replace=False)
@@ -188,19 +194,24 @@ def main():
     ax.add_collection3d(Line3DCollection(segs, colors=segc, linewidths=2.2,
                                          linestyles="dashed"))
     ax.plot(rob_xyz[:, 0], rob_xyz[:, 1], rob_xyz[:, 2], ".", color="#444", ms=2)
-    # 站位与地面
-    ax.scatter([base_x], [base_y], [0], marker="s", s=120, c="k")
-    ax.text(base_x, base_y, 0.05, "G1站位", fontsize=9)
+    # 站位与地面(标记与网格z均在场景地面上, 云模式FZv=0)
+    ax.scatter([base_x], [base_y], [FZv], marker="s", s=120, c="k")
+    ax.text(base_x, base_y, FZv + 0.05, "G1站位", fontsize=9)
     gx, gy = np.meshgrid(np.linspace(base_x - 0.7, FX, 4),
-                         np.linspace(7.589, 8.789, 4))
+                         np.linspace(base_y - 0.6, base_y + 0.6, 4))
     ax.plot_surface(gx, gy, np.full_like(gx, FZv - 0.001), alpha=0.10, color="gray")
-    # G1 展示位姿: 直接取自最终导出动作 v2 (MJCF-IK 验证过的真实帧)
-    import csv as _csv, glob as _glob
-    _meta = json.load(open(os.path.join(OUT, "trajectory_meta.json")))
-    _D = _meta["d_robot_nominal"]
-    base_x, base_y = FX - _D, U0v + _meta["u_robot"]
+    # G1 展示位姿: 直接取自最终导出动作 (MJCF-IK 验证过的真实帧)
+    import csv as _csv, glob as _glob, re as _re
+
+    def _ver_key(p):
+        # 版本目录自然排序键: 按 v 后数字排(v2<v5<v10), 字母序会把 v10 排在 v5 前
+        # (同号多 run 目录再按目录名字母序, 口径与 05_export_ufo_motion.py 一致)
+        d = os.path.basename(os.path.dirname(p))
+        m = _re.match(r"v(\d+)", d)
+        return (int(m.group(1)) if m else -1, d)
     _csvf = sorted(_glob.glob(os.path.join(OUT, "ufo_motion", "v*",
-                                           "wall_spray_motion_qpos.csv")))
+                                           "wall_spray_motion_qpos.csv")),
+                   key=_ver_key)
     kf = []
     if _csvf:
         _rows = list(_csv.reader(open(_csvf[-1])))
@@ -243,10 +254,10 @@ def main():
     poses = []
     for name, qi, pzi, wrist_w, axis_w, wall_pt, cls_name in kf:
         draw_g1(ax, qi, pzi, base_x, base_y, wrist_w, axis_w, wall_pt,
-                SINGLE, name)
+                SINGLE, name, FZv)
         poses.append(dict(name=name, q=qi.tolist(),
                           pelvis=float(pzi), wrist=wrist_w.tolist(),
-                          axis=axis_v.tolist()))
+                          axis=axis_w.tolist()))
     os.makedirs(os.path.dirname(OUT_POS), exist_ok=True)
     np.savez(os.path.join(OUT_POS), **{p["name"]: np.array(p["q"] + [p["pelvis"]])
                                        for p in poses})
@@ -318,18 +329,19 @@ def main():
     plt.close(fig)
 
 
-def draw_g1(ax, qi, pzi, base_x, base_y, wrist_w, axis_w, wall_pt, color, name):
-    """在3D图上画 G1 杆状图: 腿(2连杆IK)+躯干+臂(FK)+喷枪+喷雾锥"""
+def draw_g1(ax, qi, pzi, base_x, base_y, wrist_w, axis_w, wall_pt, color, name, floor_z):
+    """在3D图上画 G1 杆状图: 腿(2连杆IK)+躯干+臂(FK)+喷枪+喷雾锥.
+    floor_z=场景地面世界z: 上身FK的基座系z(离地高)与腿部IK统一加该偏移(两模式一致)"""
     joints, R_end, axes = fk_chain_poses(qi[None], np.array([pzi]))
     J = [j[0] for j in joints]                     # 11个原点(基座系)
-    # 基座->世界
-    off = np.array([base_x, base_y, 0.0])
+    # 基座->世界(off z=场景地面: FK骨盆z=离地高, 加地面z才落进场景zlim; 云模式floor_z=0)
+    off = np.array([base_x, base_y, floor_z])
     Jw = [np.array(j) + off for j in J]
     pelvis, waist_yaw, waist_roll, waist_pitch = Jw[0], Jw[1], Jw[2], Jw[3]
     sh_p, sh_r, sh_y, elbow, wr_r, wr_p, wr_y = Jw[4], Jw[5], Jw[6], Jw[7], Jw[8], Jw[9], Jw[10]
     # 腿
     for side in ("L", "R"):
-        hip, knee, ankle, toe = leg_ik(pzi, base_x, base_y, side)
+        hip, knee, ankle, toe = leg_ik(pzi, base_x, base_y, side, floor_z)
         ax.plot([pelvis[0], hip[0]], [pelvis[1], hip[1]], [pelvis[2], hip[2]],
                 color="#555", lw=3)
         ax.plot([hip[0], knee[0], ankle[0], toe[0]], [hip[1], knee[1], ankle[1], toe[1]],
@@ -339,9 +351,9 @@ def draw_g1(ax, qi, pzi, base_x, base_y, wrist_w, axis_w, wall_pt, color, name):
             [pelvis[2], waist_pitch[2]], color="#333", lw=6)
     ax.plot([waist_pitch[0], sh_p[0]], [waist_pitch[1], sh_p[1]],
             [waist_pitch[2], sh_p[2]], color="#333", lw=6)
-    # 臂
+    # 臂(y 分量顺序与 x/z 一致: ..., wrist_roll, wrist_pitch, wrist_yaw)
     ax.plot([sh_p[0], sh_r[0], sh_y[0], elbow[0], wr_r[0], wr_p[0], wr_y[0]],
-            [sh_p[1], sh_r[1], sh_y[1], elbow[1], wr_p[1], wr_r[1], wr_y[1]],
+            [sh_p[1], sh_r[1], sh_y[1], elbow[1], wr_r[1], wr_p[1], wr_y[1]],
             [sh_p[2], sh_r[2], sh_y[2], elbow[2], wr_r[2], wr_p[2], wr_y[2]],
             color="#c46a1f", lw=3.5)
     # 头

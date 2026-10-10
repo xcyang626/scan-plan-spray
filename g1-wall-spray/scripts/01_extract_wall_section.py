@@ -33,7 +33,7 @@ FLOOR_Z = 57563.0
 
 C = dict(ground=(128, 128, 128), wall=(150, 220, 150), door=(178, 64, 222),
          window=(255, 230, 0), rib=(0, 110, 255), other=(0, 0, 0))
-LABEL_ID = {k: i for i, k in enumerate(C.items())}
+LABEL_ID = {k: i for i, k in enumerate(C.keys())}   # 标签名->id(与 LBL_NAMES 顺序一致)
 LBL_NAMES = list(C.keys())
 
 
@@ -66,7 +66,8 @@ def write_ply(path, xyz, rgb, labels):
     out = np.empty(n, dtype=[("x", "<f4"), ("y", "<f4"), ("z", "<f4"),
                              ("label", "u1"), ("r", "u1"), ("g", "u1"), ("b", "u1")])
     out["x"], out["y"], out["z"] = xyz[:, 0], xyz[:, 1], xyz[:, 2]
-    out["label"] = labels.astype(np.uint8)
+    # uchar 属性下 -1 会回绕成 255(非法标签): 先 clip 到 0..5(未知色并入 ground)
+    out["label"] = np.clip(labels, 0, len(LBL_NAMES) - 1).astype(np.uint8)
     out["r"], out["g"], out["b"] = rgb[:, 0], rgb[:, 1], rgb[:, 2]
     with open(path, "wb") as f:
         f.write(hdr.encode("latin1")); f.write(out.tobytes())

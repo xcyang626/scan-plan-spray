@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """步骤10: 喷涂轨迹工作站 (模块化: 轨迹输出 + 动作输出 + ROS topic; 执行接口预留).
 
-启动:  python scripts/10_station_app.py [--port 8090]   (解释器见 station/env.json)
+启动:  python scripts/10_station_app.py [--port 8090] [--host 127.0.0.1]   (解释器见 station/env.json)
+       默认只绑 127.0.0.1(仅本机可访问); 需局域网访问时显式 --host 0.0.0.0
 界面:  http://127.0.0.1:8090   (浏览器弹出; 生成轨迹完成自动弹出检查页)
 
 流程(全部异步后台, 界面实时日志, 反应秒级):
@@ -13,6 +14,7 @@
 """
 import os, sys, json, time, argparse, threading, subprocess, zipfile, shutil, math
 import signal
+import atexit
 import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -23,6 +25,8 @@ RUNS = os.path.join(BASE, "runs")                    # 每次运行独立目录�
 os.makedirs(RUNS, exist_ok=True)
 UP = os.path.join(BASE, "uploads")
 os.makedirs(RUN, exist_ok=True); os.makedirs(UP, exist_ok=True)
+# /api/upload 请求体上限(点云文件足够; 超限 413, 防内存被一次请求占满)
+MAX_UPLOAD_BYTES = 200 * 1024 * 1024
 _ENV_JSON = {}
 try:
     _ENV_JSON = json.load(open(os.path.join(BASE, "station", "env.json"),
@@ -56,6 +60,8 @@ AUTO_START_ROBOT = str(_ENV_JSON.get("auto_start_robot", "true")).lower() != "fa
 AUTO_EXEC_AFTER_MOTION = str(_ENV_JSON.get("auto_exec", "false")).lower() == "true"
 # 执行速度倍率(默认; 页面下拉可覆盖). 0.5 = 半速复核
 EXEC_SPEED = float(_ENV_JSON.get("exec_speed", 1.0))
+# 实机安全限幅: 执行速度倍率上下限(越界一律夹取; groot_daemon.py 端同样限幅)
+EXEC_SPEED_MIN, EXEC_SPEED_MAX = 0.05, 1.5
 # 官方安全保持站姿(v7 首帧, SONIC 交错序) —— 启动机器人后持续保持, 防 reference 回放
 HOLD_POSE_UPPER17 = _ENV_JSON.get("hold_pose_upper17_sonic",
                                   [0.0, 0.0, 0.0, 0.2, 0.0, 0.2, 0.0, 0.0, 0.0,
@@ -110,6 +116,7 @@ class _GrootDaemon:
                 self.proc = subprocess.Popen(
                     [GROOT_PY, script], cwd=GROOT_ROOT,
                     env={**os.environ, "GROOT_ROOT": GROOT_ROOT,
+                         "G1W_ZMQ_HOST": ZMQ_HOST,
                          "G1W_ZMQ_PORT": str(ZMQ_PORT),
                          "G1W_DAEMON_PORT": str(DAEMON_PORT)},
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=lg,
@@ -173,6 +180,9 @@ def _daemon_event(m):
         log("保持流已结束 (" + str(m.get("note") or "") + ")")
     elif ev == "stream_error":
         log(f"⚠ 动作流异常: {m.get('err')}")
+    elif ev == "speed_clamped":
+        log(f"⚠ 速度倍率 {m.get('requested')} 超出安全限幅, "
+            f"已夹取为 {m.get('applied')} (实机安全限幅 [{EXEC_SPEED_MIN}, {EXEC_SPEED_MAX}])")
     elif ev == "fatal":
         log(f"⚠ 执行守护进程致命错误: {m.get('err')}")
 
@@ -189,7 +199,7 @@ def groot_command(kind):
     try:
         bridge = os.path.join(BASE, "scripts", "exec", "groot_bridge.py")
         r = subprocess.run([GROOT_PY, bridge, "--send-command", kind,
-                            "--host", "*", "--port", str(ZMQ_PORT)],
+                            "--host", ZMQ_HOST, "--port", str(ZMQ_PORT)],
                            cwd=GROOT_ROOT, capture_output=True, text=True, timeout=30)
         ok = r.returncode == 0
         log(f"GR00T command({kind}) {'已下发' if ok else '失败: ' + (r.stderr or '')[-160:]}")
@@ -232,12 +242,20 @@ def send_key(ch):
         return False
 
 
+_STATUS_LOCK = threading.Lock()     # robot_status.json 多线程(HTTP/守护事件/watchdog)共用
+
+
 def write_status_phase(phase, progress=None):
+    """原子写状态文件: 临时文件 + os.replace —— 并发写不会留下半截 JSON."""
     try:
         st = {"phase": phase, "ts": time.time()}
         if progress is not None:
             st["progress"] = progress
-        json.dump(st, open(ROBOT_STATUS_F, "w", encoding="utf8"))
+        with _STATUS_LOCK:
+            tmp = ROBOT_STATUS_F + ".tmp"
+            with open(tmp, "w", encoding="utf8") as f:
+                json.dump(st, f)
+            os.replace(tmp, ROBOT_STATUS_F)
     except Exception:
         pass
 
@@ -268,7 +286,9 @@ GROOT_LD_LIBS = [".deps/TensorRT/lib", ".deps/onnxruntime/lib",
                  "gear_sonic_deploy/thirdparty/unitree_sdk2/thirdparty/lib/x86_64",
                  "/usr/local/cuda/lib64"]
 ZMQ_PORT = int(_ENV_JSON.get("zmq_port", 5556))
-ZMQ_HOST = _ENV_JSON.get("zmq_host", "*")
+# ZMQ 发布端绑定地址: 约定必须 localhost(env.json zmq_host), 无配置时默认仅本机,
+# 不再默认 '*'(全网卡可达); 需局域网访问时在 env.json 显式指定
+ZMQ_HOST = _ENV_JSON.get("zmq_host", "127.0.0.1")
 DAEMON_PORT = int(_ENV_JSON.get("daemon_port", 5558))
 ROBOT_IFACE = _ENV_JSON.get("robot_iface", "enp8s0")
 # 输入类型: gamepad_manager=手柄(推荐, F2软急停/Select退出/F1切ZMQ流) | zmq=纯键盘
@@ -384,6 +404,8 @@ def kill_deploy(soft_wait=8.0):
 
 def start_robot():
     """启动机器人: 拉起 GR00T-WBC 仿真+策略, 机器人回到初始站姿并等待执行."""
+    global ESTOP
+    ESTOP = False               # 新会话起点: 解除急停对 stage 线程的封锁
     # 停掉可能在跑的动作流(否则机器人停在喷涂姿态, 看起来"没回初始位姿")
     try:
         subprocess.run(["pkill", "-f", "send_upper_body_trajector[y]"], timeout=5)
@@ -491,8 +513,7 @@ def start_robot():
             [GROOT_PY, ROBOT_RUNNER, "--trigger", TRIGGER_F],
             cwd=GROOT_ROOT, env=env, stdout=logf, stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL, start_new_session=True)
-    write_status_file = {"phase": "starting", "ts": time.time()}
-    json.dump(write_status_file, open(ROBOT_STATUS_F, "w", encoding="utf8"))
+    write_status_phase("starting")        # 原子写(与各线程并发写共用一把锁)
     log("★ 机器人启动中 (GR00T-WBC 仿真+策略), 等待回到初始站姿…")
     return {"ok": True, "already": False, "mode": ROBOT_MODE}
 
@@ -503,6 +524,8 @@ def stop_robot():
           保持进程持续下发 kp=0,kd=8 阻尼指令, 才是真正的"变软".
     另外: 取消进行中的规划/动作流水线, 清空本轮任务结果(界面复位)。
     彻底结束请用 exit_robot() / 网页【退出程序】。"""
+    global ESTOP
+    ESTOP = False               # 完整复位: 解除急停对 stage 线程的封锁
     # 停止 = GR00T 原生急停: command(stop=True)
     #   官方行为: 下发零力矩阻尼指令(kp=0, kd=8) -> 全身变软, 然后优雅停止
     if _DAEMON.alive():
@@ -513,14 +536,7 @@ def stop_robot():
     except Exception:
         pass
     # 取消进行中的流水线(规划/动作)
-    try:
-        if PROC is not None and PROC.poll() is None:
-            PROC.terminate(); time.sleep(0.3)
-            if PROC.poll() is None:
-                PROC.kill()
-            log("已取消进行中的任务")
-    except Exception:
-        pass
+    _cancel_proc()
     # 停止后: 机器人进程仍在(阻尼保护态), 只清空本轮任务结果
     with LOCK:
         JOB.update(state="idle", error=None, metrics={}, artifacts={},
@@ -563,16 +579,58 @@ def _npz_to_upper_csv(motion_npz, out_csv):
     return out_csv
 
 
+def _motion_path_allowed(mp):
+    """motion 白名单: 只允许 本次 run 目录(state 里的 run_dir) 与 BASE/output 之内
+    的路径 —— realpath 解析后做 base+os.sep 前缀判断(防 ../ 与同前缀目录绕过)."""
+    rp = os.path.realpath(mp)
+    for base in (JOB.get("run_dir"), os.path.join(BASE, "output")):
+        if not base:
+            continue
+        rb = os.path.realpath(base)
+        if rp == rb or rp.startswith(rb + os.sep):
+            return True
+    return False
+
+
 def exec_spray(motion_path, run_dir=None, speed=None):
     """手动执行 —— 完全对齐官方 send_upper_body_trajectory.py:
     planner 话题 17 维上肢(SONIC 交错序) @50Hz + 梯度速度 + 结束保持末姿;
     下肢由 SONIC 平衡策略控制(不发腿)。speed 可选半速复核(0.5)。
-    首选常驻守护进程, 失败回退官方脚本本体。"""
+    首选常驻守护进程, 失败回退官方脚本本体。
+    sim 模式走触发文件通道(MuJoCo runner 不订阅 ZMQ)。"""
     if not _robot_pid():
         return {"err": "机器人未启动 — 请先点【启动机器人】"}
     if not motion_path or not os.path.exists(motion_path):
         return {"err": f"动作文件不存在: {motion_path}"}
-    speed = float(speed or EXEC_SPEED)
+    try:
+        speed = EXEC_SPEED if speed is None else float(speed)
+    except (TypeError, ValueError):
+        return {"err": f"速度倍率格式错误: {speed!r}"}
+    if not math.isfinite(speed):   # NaN/inf 会穿透 min/max 夹取, 归一为默认倍率
+        log(f"⚠ 速度倍率非有限值 {speed!r}, 已按默认 ×{EXEC_SPEED} 执行")
+        speed = EXEC_SPEED
+    if not (EXEC_SPEED_MIN <= speed <= EXEC_SPEED_MAX):   # 实机安全限幅
+        clamped = min(max(speed, EXEC_SPEED_MIN), EXEC_SPEED_MAX)
+        log(f"⚠ 速度倍率 {speed} 超出安全限幅 "
+            f"[{EXEC_SPEED_MIN}, {EXEC_SPEED_MAX}], 已夹取为 {clamped}")
+        speed = clamped
+    if ROBOT_MODE != "real":
+        # sim 通道: MuJoCo runner(--trigger) 轮询触发文件, 不订阅 ZMQ ——
+        # 按 groot_spray_runner.py 约定写 JSON(字段 motion=动作 npz 路径)
+        try:
+            os.makedirs(os.path.dirname(TRIGGER_F), exist_ok=True)
+            tmp = TRIGGER_F + ".tmp"     # 原子替换, 防 runner 读到半截文件
+            with open(tmp, "w", encoding="utf8") as f:
+                json.dump({"motion": motion_path, "speed": speed}, f)
+            os.replace(tmp, TRIGGER_F)
+        except Exception as ex:
+            log(f"✘ 触发文件写入失败: {ex}")
+            return {"err": f"触发文件写入失败: {ex}"}
+        write_status_phase("executing")
+        log(f"★ 已写执行触发(仿真通道, MuJoCo 播放, 速度×{speed}): "
+            f"{os.path.basename(motion_path)}")
+        return {"ok": True, "motion": motion_path, "mode": "sim-trigger",
+                "speed": speed}
     mjcf = REGISTRY.get(JOB.get("robot", "g1"), {}).get("mjcf")
     if _DAEMON.ensure():
         r = _DAEMON.call("stream", motion=motion_path, rate=50, speed=speed,
@@ -616,6 +674,15 @@ REGISTRY = json.load(open(os.path.join(BASE, "station", "robot_registry.json"),
                           encoding="utf8"))
 for _r in REGISTRY.values():                     # 模型路径相对化(打包可移植)
     if isinstance(_r, dict):
+        # 环境变量覆盖 registry 里的本机绝对路径(换机免改运行数据文件):
+        #   G1W_MJCF_DIR  = mjcf xml 所在目录   G1W_MODEL_DIR = urdf 模型目录
+        # 未设置时原样保留 registry 登记值作缺省回退(不改 robot_registry.json 本身)
+        _mdir_env = os.environ.get("G1W_MODEL_DIR")
+        if _mdir_env and _r.get("model_dir"):
+            _r["model_dir"] = _mdir_env
+        _mjcf_env = os.environ.get("G1W_MJCF_DIR")
+        if _mjcf_env and _r.get("mjcf"):
+            _r["mjcf"] = os.path.join(_mjcf_env, os.path.basename(_r["mjcf"]))
         if _r.get("mjcf"):
             _r["mjcf"] = _p(_r["mjcf"])
         if _r.get("model_dir"):
@@ -626,6 +693,7 @@ JOB = {"state": "idle", "stage": "", "t0": None, "log": [], "error": None,
        "ros_mode": None}
 LOCK = threading.Lock()
 PROC = None
+ESTOP = False          # 急停封锁标志: /api/estop 置位; start_robot/stop_robot/退出 清除
 
 
 STATE_F = os.path.join(BASE, "station", "run", "last_job.json")
@@ -661,19 +729,52 @@ def run_stage(name, cmd, env=None, timeout=600):
     p = subprocess.Popen(cmd, cwd=os.path.join(BASE, "scripts"), env=e,
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                          text=True, bufsize=1)
-    PROC = p
+    with LOCK:                 # PROC 全局句柄: 赋值纳入锁(防 /api/train_nn 与 /api/plan 并发覆盖)
+        PROC = p
     for line in p.stdout:
         log("  " + line.rstrip())
-    rc = p.wait(timeout=timeout)
-    PROC = None
+    try:
+        rc = p.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # 超时先杀再等回收, 否则子进程变孤儿继续占资源/写文件
+        p.kill()
+        p.wait()
+        with LOCK:
+            PROC = None
+        raise RuntimeError(f"{name} 超时 (>{timeout}s), 已终止子进程")
+    with LOCK:
+        PROC = None
     if rc != 0:
         raise RuntimeError(f"{name} 失败 (exit {rc})")
     log(f"✔ {name}")
 
 
+def _cancel_proc():
+    """终止进行中的规划/动作子进程(terminate→kill) —— stop_robot 与 /api/estop 共用."""
+    with LOCK:
+        p = PROC
+    try:
+        if p is not None and p.poll() is None:
+            p.terminate(); time.sleep(0.3)
+            if p.poll() is None:
+                p.kill()
+            log("已取消进行中的任务")
+    except Exception:
+        pass
+
+
+def _estop_check(where):
+    """stage 线程关键步骤处的急停检查: 已急停则提前退出
+    (不改 state —— 急停处理已置 idle, 不能再被改回 inspect/ready)."""
+    if ESTOP:
+        log(f"⚠ 急停: 已中止 {where}")
+        return True
+    return False
+
+
 def stage_plan(cfg):
-    """任务1: (点云解析)-> 03轨迹 -> 04三维图."""
-    JOB.update(state="planning", error=None)
+    """任务1: (点云解析)-> 03轨迹 -> 04三维图.
+    注: state=planning 已由 /api/plan 在锁内置位(防快速双击并发起两个规划线程)."""
     t0 = time.time()
     try:
         run_dir = os.path.join(RUNS, "run_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
@@ -689,6 +790,8 @@ def stage_plan(cfg):
                       env={"G1W_OUT": ws_dir,
                            "G1W_WAIST_RP": str(round(cfg["waist_deg"] * math.pi / 180, 6))},
                       timeout=900)
+        if _estop_check("轨迹生成(点云解析前)"):
+            return
         env = {"G1W_CFG": os.path.join(run_dir, "cfg.json"),
                "G1W_OUT": run_dir, "G1W_IN": ws_dir,
                "G1W_ROBOT": cfg["robot"], "G1W_MJCF": REGISTRY[cfg["robot"]]["mjcf"],
@@ -713,9 +816,15 @@ def stage_plan(cfg):
             cfg["wall_x"] = cfg["dist"]
         json.dump(cfg, open(os.path.join(run_dir, "cfg.json"), "w", encoding="utf8"),
                   ensure_ascii=False, indent=1)
+        if _estop_check("轨迹生成(03 规划前)"):
+            return
         run_stage("03 轨迹规划(锚点+样条+NN种子快速IK)",
                   [ISA_PY, "03_plan_trajectories.py"], env)
+        if _estop_check("轨迹生成(04 可视化前)"):
+            return
         run_stage("04 三维可视化", [ISA_PY, "04_visualize_3d.py"], env)
+        if _estop_check("轨迹生成收尾"):
+            return
         tj = json.load(open(os.path.join(run_dir, "trajectory_meta.json"),
                             encoding="utf8"))
         JOB["metrics"]["traj"] = _traj_summary(tj)
@@ -724,18 +833,23 @@ def stage_plan(cfg):
         _persist()
         log(f"★ 轨迹已生成, 请在检查页确认 (耗时 {time.time()-t0:.1f}s)")
     except Exception as ex:
+        if ESTOP:                       # 急停导致的中止: 不覆盖急停后的 idle 状态
+            log(f"✘ 轨迹生成已因急停中止: {ex}")
+            return
         JOB.update(state="error", error=str(ex)); log(f"✘ {ex}")
 
 
 def stage_motion(cfg):
-    """任务2: 05动作导出 -> 05b时序图 -> (可选)ROS topics."""
-    JOB.update(state="motion", error=None)
+    """任务2: 05动作导出 -> 05b时序图 -> (可选)ROS topics.
+    注: state=motion 已由 /api/approve 在锁内置位(防快速双击并发起两个动作线程)."""
     t0 = time.time()
     try:
         ver = f"v5_run{datetime.datetime.now().strftime('%H%M%S')}"
         JOB["motion_ver"] = ver
         run_dir = JOB.get("run_dir") or RUN
         _ws_dir, _ = ensure_workspace(cfg["robot"], cfg.get("waist_deg", 5.0))
+        if _estop_check("动作生成(05 导出前)"):
+            return
         env = {"MOTION_VER": ver, "G1W_ROBOT": cfg["robot"],
                "G1W_MJCF": REGISTRY[cfg["robot"]]["mjcf"],
                "G1W_CFG": os.path.join(run_dir, "cfg.json"),
@@ -743,7 +857,11 @@ def stage_motion(cfg):
                "G1W_WAIST_RP": str(round(cfg.get("waist_deg", 5.0) * math.pi / 180, 6)),
                "G1W_WAIST_DEG": str(int(round(cfg.get("waist_deg", 5.0))))}
         run_stage("05 动作导出(增量MJCF-IK+NN种子)", [MUJ_PY, "05_export_ufo_motion.py"], env)
+        if _estop_check("动作生成(05b 时序图前)"):
+            return
         run_stage("05b 时间序列图", [ISA_PY, "05b_plot_motion.py"], env)
+        if _estop_check("动作生成(基座补偿验证前)"):
+            return
         run_stage("基座扰动补偿验证(世界系锁定)",
                   [ISA_PY, "13_base_compensation.py",
                    "--traj", os.path.join(run_dir, "trajectory.npz"),
@@ -778,6 +896,8 @@ def stage_motion(cfg):
                        metrics=JOB.get("metrics")),
                   open(os.path.join(run_dir, "run_manifest.json"), "w", encoding="utf8"),
                   ensure_ascii=False, indent=1, default=str)
+        if _estop_check("动作打包"):
+            return
         pkg = package()                      # 动作+打包一体: 完成即出执行包(manifest 已就位)
         JOB["artifacts"]["package"] = pkg
         # 动作就绪后直接下发给机器人执行(无需手动点“自动执行”)
@@ -788,11 +908,16 @@ def stage_motion(cfg):
                 log("★ 动作已自动下发给机器人执行")
             else:
                 log(f"自动执行未生效: {r.get('err')}")
+        if _estop_check("动作生成收尾"):
+            return
         JOB["state"] = "ready"
         JOB["artifacts"]["motion_sec"] = round(time.time() - t0, 1)
         _persist()
         log(f"★ 动作已生成 {ver} (耗时 {time.time()-t0:.1f}s)")
     except Exception as ex:
+        if ESTOP:                       # 急停导致的中止: 不覆盖急停后的 idle 状态
+            log(f"✘ 动作生成已因急停中止: {ex}")
+            return
         JOB.update(state="error", error=str(ex)); log(f"✘ {ex}")
 
 
@@ -865,9 +990,15 @@ class H(BaseHTTPRequestHandler):
             self._send(404, {"err": "not found"})
 
     def do_POST(self):
+        global ESTOP
         u = urlparse(self.path)
         n = int(self.headers.get("Content-Length", 0))
         if u.path == "/api/upload":
+            # 上传大小上限: 点云文件实际远小于此, 超限直接拒绝(防恶意/误传占满内存)
+            if n > MAX_UPLOAD_BYTES:
+                self.close_connection = True      # 丢弃未读完的请求体
+                return self._send(413, {"err": f"文件过大: {n} 字节 "
+                                              f"(上限 {MAX_UPLOAD_BYTES} 字节)"})
             fn = self._upload(n)
             return self._send(200, {"file": fn})
         body = json.loads(self.rfile.read(n) or b"{}") if n else {}
@@ -881,19 +1012,29 @@ class H(BaseHTTPRequestHandler):
                        h_top=body.get("h_top"), cloud=body.get("cloud"),
                        ros=bool(body.get("ros")))
             with LOCK:
+                if ESTOP:   # 急停悬置: 拒新任务, 否则 state 卡 planning 且后台白跑
+                    return self._send(409, {"err": "急停未复位 — 请先点【停止】或【启动机器人】"})
                 if JOB["state"] in ("planning", "motion"):
                     return self._send(409, {"err": "任务进行中"})
-                JOB.update(robot=cfg["robot"], metrics={}, artifacts={})
+                # 锁内立即置 planning: 双击并发请求会在此被 409 拦下
+                # (旧实现在新线程里才置位, 存在竞态窗口)
+                JOB.update(robot=cfg["robot"], metrics={}, artifacts={},
+                           state="planning", error=None)
             threading.Thread(target=stage_plan, args=(cfg,), daemon=True).start()
             self._send(200, {"ok": True})
         elif u.path == "/api/approve":
             if not _robot_pid():
                 return self._send(400, {"err": "机器人未启动 — 请先点【启动机器人】"})
             with LOCK:
+                if ESTOP:   # 急停悬置: 拒新任务, 否则 state 卡 motion 且后台白跑
+                    return self._send(409, {"err": "急停未复位 — 请先点【停止】或【启动机器人】"})
                 if JOB["state"] != "inspect":
                     return self._send(409, {"err": f"当前状态 {JOB['state']}, 需先完成轨迹生成"})
                 cfg = json.load(open(os.path.join(JOB.get("run_dir") or RUN,
                                                   "cfg.json"), encoding="utf8"))
+                # 锁内立即置 motion: 双击并发请求会在此被 409 拦下
+                # (旧实现在新线程里才置位, 存在竞态窗口)
+                JOB.update(state="motion", error=None)
             threading.Thread(target=stage_motion, args=(cfg,), daemon=True).start()
             self._send(200, {"ok": True})
         elif u.path == "/api/package":
@@ -903,16 +1044,18 @@ class H(BaseHTTPRequestHandler):
             robot = body.get("robot") or JOB.get("robot", "g1")
             if robot not in REGISTRY:
                 return self._send(400, {"err": f"未知机器人 {robot}"})
-            if JOB.get("nn_training"):
-                return self._send(409, {"err": "该机器人模型训练进行中"})
-            log(f"▶ NN-IK 重训启动: {robot} (按当前限位的工作区)")
-
             wd = float(body.get("waist_deg", JOB.get("waist_deg", 5.0)))
             if wd not in (5.0, 10.0, 15.0, 20.0):
                 return self._send(400, {"err": f"腰限档位仅支持 5/10/15/20°, 收到 {wd}°"})
+            with LOCK:
+                if JOB.get("nn_training"):
+                    return self._send(409, {"err": "该机器人模型训练进行中"})
+                # 锁内立即置位: 双击并发请求会在此被 409 拦下
+                # (旧实现在新线程里才置位, 存在竞态窗口 —— 与 /api/plan 同款问题)
+                JOB["nn_training"] = True
+            log(f"▶ NN-IK 重训启动: {robot} (按当前限位的工作区)")
 
             def _train():
-                JOB["nn_training"] = True
                 try:
                     ws_dir, ws_new = ensure_workspace(robot, wd)
                     if ws_new:
@@ -942,21 +1085,53 @@ class H(BaseHTTPRequestHandler):
         elif u.path == "/api/estop":
             # 急停 = 官方 command(stop) → 全身变软。经守护进程即时下发,
             # 不再进程内 import estop(mujoco 环境缺 msgpack, 旧实现必失败)。
+            ESTOP = True       # 封锁后台 stage 线程: 不再把 state 改回 inspect/ready
             try:
                 if _DAEMON.alive():
                     _DAEMON.call("cancel", timeout=5)   # 停掉动作流/保持流
                 done = groot_command("stop")
                 if not done:                   # ZMQ 通道失败 → 官方 'O' 键兜底
                     done = send_key("O")
-                log("★★ 网页软急停已触发 (机器人全身变软/阻尼保护态)"
-                    if done else "网页软急停: 下发通道均失败, 请按手柄急停")
+                # 取消进行中的规划/动作子进程(与 stop_robot 相同的 terminate+kill),
+                # 并删掉待执行的仿真触发文件(急停后不得再开始播放)
+                _cancel_proc()
+                try:
+                    os.remove(TRIGGER_F)
+                except Exception:
+                    pass
+                # 送达校验: 官方 stop 语义 = 阻尼指令 + 部署进程优雅退出;
+                # ZMQ PUB 无订阅者时"发送成功"实为丢弃 —— 必须以进程退出来确认
+                if ROBOT_MODE != "real":
+                    # sim 通道: runner 不订阅 ZMQ 也无 stdin FIFO, 进程退出确认
+                    # 不适用 —— 以上面处置的落实为准(触发文件已删, 不会再开始新播放)
+                    confirmed = not os.path.exists(TRIGGER_F)
+                else:
+                    confirmed = _robot_pid() is None
+                    t0 = time.time()
+                    while not confirmed and time.time() - t0 < 3.0:
+                        time.sleep(0.2)
+                        confirmed = _robot_pid() is None
+                if ROBOT_MODE != "real":
+                    log("★★ 网页软急停已触发(仿真通道): 执行触发已删除, "
+                        "进行中的播放将在本轮轨迹结束后停止")
+                else:
+                    log("★★ 网页软急停已触发并确认 (机器人全身变软/阻尼保护态)"
+                        if confirmed else
+                        "网页软急停: ⚠ 未确认送达(部署进程仍在运行), 请按手柄急停")
                 with LOCK:
                     JOB.update(state="idle", error=None, metrics={},
                                artifacts={}, motion_ver=None, run_dir=None)
                 write_status_phase("soft_stopped")
                 # 软急停只改状态, 保留 robot.pid —— 之后还要靠它执行"退出程序"
-                return self._send(200, {"ok": True, "soft": True, "estopped": done,
-                                        "note": "机器人已变软(阻尼保护态); 程序仍在运行"})
+                if ROBOT_MODE != "real":
+                    note = ("仿真急停: 已删除执行触发" if confirmed
+                            else "⚠ 仿真急停未落实(触发文件仍在), 请重试或退出程序")
+                else:
+                    note = ("机器人已变软(阻尼保护态); 程序仍在运行" if confirmed
+                            else "⚠ 急停未确认送达(部署进程未退出) —— 请立即按手柄急停!")
+                return self._send(200, {"ok": True, "soft": True,
+                                        "estopped": done, "confirmed": confirmed,
+                                        "note": note})
             except Exception as ex:
                 return self._send(500, {"err": f"急停执行异常: {ex}"})
         elif u.path == "/api/robot/restart":
@@ -969,6 +1144,7 @@ class H(BaseHTTPRequestHandler):
                 return self._send(500, {"err": f"重启异常: {ex}"})
         elif u.path == "/api/robot/exit":
             try:
+                ESTOP = False       # 全部退出: 解除急停封锁
                 done = kill_deploy()           # 官方 stop → 优雅退出 → 超时强杀
                 log("★★ 已退出程序 (部署进程已结束)" if done else "退出: 部署进程未能确认结束(见日志)")
                 with LOCK:
@@ -996,6 +1172,12 @@ class H(BaseHTTPRequestHandler):
                     cand = os.path.join(mdir, "wall_spray_motion.npz")
                     if os.path.exists(cand):
                         mp = cand
+            # motion 白名单: 只允许 本次 run 目录 与 output/ 之内的路径
+            # (接口无鉴权, 不能放任意路径下发)
+            if mp and not _motion_path_allowed(mp):
+                log(f"⚠ 拒绝执行白名单外的动作路径: {mp}")
+                return self._send(400, {"err": f"动作路径不在允许范围"
+                                            f"(本次 run 目录/output): {mp}"})
             r = exec_spray(mp, JOB.get("run_dir"), speed=body.get("speed"))
             self._send(200 if r.get("ok") else 400, r)
         else:
@@ -1061,11 +1243,19 @@ class H(BaseHTTPRequestHandler):
         self._send(200, open(p, "rb").read(), ct)
 
     def _file(self, p):
-        p = os.path.abspath(p)
-        ok = (p.startswith(os.path.join(BASE, "output")) or p.startswith(RUN)
-              or p.startswith(os.path.join(BASE, "station", "static"))
-              or p.startswith(os.path.join(BASE, "runs")))
-        if not ok or not os.path.exists(p):
+        """静态产物白名单: realpath 解析后做 base+os.sep 前缀判断
+        (防 ../ 与同前缀目录绕过, 写法与 _motion_path_allowed 一致)."""
+        rp = os.path.realpath(p)
+        for base in (os.path.join(BASE, "output"), RUN,
+                     os.path.join(BASE, "station", "static"),
+                     os.path.join(BASE, "runs")):
+            rb = os.path.realpath(base)
+            if rp == rb or rp.startswith(rb + os.sep):
+                p = rp
+                break
+        else:
+            return self._send(404, {"err": "no file"})
+        if not os.path.exists(p):
             return self._send(404, {"err": "no file"})
         ext = os.path.splitext(p)[1]
         ct = {".png": "image/png", ".json": "application/json",
@@ -1481,8 +1671,11 @@ $('cloud').onchange = async e=>{
   const end=`\\r\\n--${bnd}--\\r\\n`;
   const r=await fetch('/api/upload',{method:'POST',headers:{'Content-Type':'multipart/form-data; boundary='+bnd},
     body:new Blob([new TextEncoder().encode(pre), body, new TextEncoder().encode(end)])});
-  const j=await r.json(); upFile=j.file;
-  $('cloud_name').textContent='已上传: '+j.file; markStale();
+  const j=await r.json(); upFile=j.file||null;
+  // 后端契约: 点云可选 —— 上传被拒时不显示"已上传: null"误导文案
+  $('cloud_name').textContent = j.file? ('已上传: '+j.file) : '上传失败, 未使用点云(可选, 不影响生成)';
+  if(!j.file) upFile=null;
+  markStale();
   { const b=document.getElementById('b1'); if(b) b.disabled=false;   // 选完即可点(门控由轮询校正)
     const h=document.getElementById('b1_hint'); if(h) h.style.display='none'; }
 };
@@ -1503,7 +1696,7 @@ async function doPlan(){
   const j=await r.json(); if(j.err) alert(j.err);
 }
 function countUp(el){
-  const t=el.textContent; const m=t.match(/^[+-]?\d+(\.\d+)?$/); if(!m) return;
+  const t=el.textContent; const m=t.match(/^[+-]?[0-9]+([.][0-9]+)?$/); if(!m) return;
   const v=parseFloat(t); const dec=(t.split('.')[1]||'').length; const t0=performance.now();
   (function f(now){const p=Math.min((now-t0)/700,1);const e=1-Math.pow(1-p,3);
     el.textContent=(v*e).toFixed(dec);
@@ -1576,6 +1769,8 @@ function _loadUrdf(url){
       requestAnimationFrame(loop); ctr.update(); rd.render(sc,cam); })();
     function fit(){ const w=cv.clientWidth,h=cv.clientHeight;
       rd.setSize(w,h,false); cam.aspect=w/h; cam.updateProjectionMatrix(); }
+    if(window._rfit) window.removeEventListener('resize', window._rfit); // 切换模型先移除旧监听, 防泄漏堆积
+    window._rfit=fit;
     fit(); window.addEventListener('resize',fit);
   }, undefined, err=>{ hint.textContent='模型加载失败: '+err; });
 }
@@ -1594,7 +1789,9 @@ async function doEstop(){
     gi.querySelectorAll('input,select,button').forEach(el=>el.disabled=true); }
   const es=$('estop'); if(es) es.classList.add('soft');
   $('robot_stat').innerHTML='<span class=warn>已软急停 — 机器人全身变软(阻尼保护态), 程序仍在运行。恢复请点【退出程序】后重启</span>';
-  toast(j.estopped? '★ 已软急停: 机器人变软(阻尼保护态), 程序仍在运行' : '已软急停 (当前无运行中的机器人)');
+  toast(j.confirmed? '★ 已软急停: 机器人变软(阻尼保护态), 程序仍在运行'
+    : (j.estopped? '⚠ 急停已发送但未确认送达 —— 请立即按手柄急停'
+                 : '已软急停 (当前无运行中的机器人)'));
 }
 async function doRestartRobot(){
   toast('正在重启机器人(退出→重新启动, 约 15s)…');
@@ -1643,7 +1840,9 @@ async function doExec(){
     const r=await fetch('/api/exec',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({speed:+spd})});
     const j=await r.json();
-    if(j.err) toast(j.err); else toast(`已下发执行(×${spd}) — 机器人开始按轨迹喷涂`);
+    if(j.err) toast(j.err);
+    else if(j.mode==='sim-trigger') toast(`已触发仿真执行(×${spd}) — MuJoCo 按轨迹播放`);
+    else toast(`已下发执行(×${spd}) — 机器人开始按轨迹喷涂`);
   }catch(e){ toast('执行调用失败: '+e); }
 }
 function toast(msg){
@@ -1674,7 +1873,9 @@ function renderSteps(st, rstep){
   }).join('');
 }
 setInterval(async()=>{
-  const s=await (await fetch('/api/status')).json();
+  const r=await fetch('/api/status').catch(()=>null);   // 网络 reject 也捕获(重启/断连)
+  const s=r?await r.json().catch(()=>null):null;
+  if(!s) return;                        // 请求失败(重启/断连): 跳过本轮, 下轮重试
   const busy=s.state==='planning'||s.state==='motion';
   if(s.state==='planning') _stale=false;
   const eff=(_stale&&['inspect','ready','error'].includes(s.state))?'idle':s.state;
@@ -1736,15 +1937,14 @@ setInterval(async()=>{
   if(ib) ib.style.display = ((s.state==='inspect'||s.state==='ready')&&!_stale) ? 'block':'none';
   $('loglog').textContent = (s.log||[]).join('\\n');
   $('loglog').scrollTop = 1e9;
-  const cloudReady = !!upFile;                 // 已成功上传点云
-  const ready2go = (s.robot||{}).running && cloudReady
+  // 点云为可选输入(后端契约): 未上传点云也可生成轨迹, 仅要求机器人已启动
+  const ready2go = (s.robot||{}).running
                    && !['planning','motion'].includes(s.state);
   $('b1').disabled = !ready2go;
   { const h=$('b1_hint');
     if(h){
       h.style.display = ready2go? 'none':'block';
-      h.textContent = !(s.robot||{}).running? '请先启动机器人'
-        : (!cloudReady? '请先选择点云文件 (PLY/PCD/NPY/TXT)' : '');
+      h.textContent = !(s.robot||{}).running? '请先启动机器人' : '';
     } }
   // 右栏按钮: 待检查时显示"检查无误→生成动作", 动作就绪时切换为"执行动作"+速度选择
   const bEx=$('bExec'), bAp=$('bApprove'), bSp=$('exec_speed');
@@ -1859,7 +2059,9 @@ fetch('/api/init').then(r=>r.json()).then(async init=>{
   const div=document.getElementById('figs');
   const names=['fig_wall_path_2d.png','fig_robot_path_2d.png','fig_3d_scene.png'];
   if(s.metrics&&s.metrics.cloud) names.push('cloud_report.png');
-  div.innerHTML = names.map(n=>`<h3>${n}</h3><img src="${init.figs.includes(n)?'/fig/'+n:'/run/'+n}">`).join('')
+  // init.figs 元素是 {name,url} 对象: 按名字匹配取 url(includes 判对象恒 false)
+  const urlOf=n=>{ const f=(init.figs||[]).find(x=>x.name===n); return f? f.url : '/run/'+n; };
+  div.innerHTML = names.map(n=>`<h3>${n}</h3><img src="${urlOf(n)}">`).join('')
     + (s.metrics&&s.metrics.cloud?`<h3>点云报告</h3><pre>${JSON.stringify(s.metrics.cloud,null,1)}</pre>`:'');
 });
 </script></body></html>"""
@@ -1896,10 +2098,59 @@ def _deploy_watchdog():
             pass
 
 
+def _exit_cleanup():
+    """站点退出时的轻量清理(不做重活):
+    ① 部署进程 start_new_session=True 脱离会话, 站点退出不会带走它 —— 显式终止;
+    ② 守护进程关 stdin(EOF 即其退出语义)并做一次非阻塞回收, 防僵尸.多次调用安全."""
+    try:
+        pid = _robot_pid()
+        if pid:
+            os.kill(pid, signal.SIGTERM)
+            time.sleep(0.5)
+            pid = _robot_pid()
+            if pid:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    if _ROBOT_PROC is not None:
+        try:
+            _ROBOT_PROC.poll()          # 回收部署子进程, 防僵尸
+        except Exception:
+            pass
+    try:
+        p = _DAEMON.proc
+        if p is not None:
+            try:
+                p.stdin.close()         # stdin EOF -> 守护进程按设计自行退出
+            except Exception:
+                pass
+            try:
+                os.waitpid(p.pid, os.WNOHANG)   # 非阻塞回收, 防僵尸
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _on_exit_signal(signum, frame):
+    """SIGINT/SIGTERM -> 干净退出(atexit 里跑 _exit_cleanup)."""
+    raise SystemExit(0)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8090)
+    ap.add_argument("--host", default="127.0.0.1",
+                    help="HTTP 绑定地址, 默认 127.0.0.1(仅本机, 接口无鉴权); "
+                         "局域网访问需显式指定 0.0.0.0")
     a = ap.parse_args()
+    # 退出清理: Ctrl-C / kill / 正常返回 都会触发(钩子里只做轻量回收)
+    atexit.register(_exit_cleanup)
+    signal.signal(signal.SIGINT, _on_exit_signal)
+    signal.signal(signal.SIGTERM, _on_exit_signal)
     try:
         st = json.load(open(STATE_F, encoding="utf8"))
         JOB.update({k: st[k] for k in ("state", "robot", "motion_ver", "run_dir",
@@ -1909,9 +2160,9 @@ def main():
             log("已恢复上次运行: " + JOB["run_dir"])
     except Exception:
         pass
-    log("工作站启动: http://127.0.0.1:%d" % a.port)
+    log("工作站启动: http://%s:%d" % (a.host, a.port))
     threading.Thread(target=_deploy_watchdog, daemon=True).start()
-    ThreadingHTTPServer(("0.0.0.0", a.port), H).serve_forever()
+    ThreadingHTTPServer((a.host, a.port), H).serve_forever()
 
 
 if __name__ == "__main__":

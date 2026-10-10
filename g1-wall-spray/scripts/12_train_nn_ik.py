@@ -46,7 +46,7 @@ def gen_dataset(P03, n, rng):
     phi = np.radians(rng.uniform(-32.0, 32.0, n))
     p_star = np.column_stack([x, y, z])
     d_star = np.column_stack([np.cos(phi), np.zeros(n), np.sin(phi)])
-    sp = np.lexsort((z, y))                       # 空间排序: 邻接目标=同支邻域
+    sp = np.lexsort((z, y, x))                     # 空间排序: 邻接目标=同支邻域(x主键,补上x)
     p_star, d_star = p_star[sp], d_star[sp]
 
     # 单支流形采集: 邻接播种 + 连续性过滤(与上一保留解差<0.6rad) -> 数据落在

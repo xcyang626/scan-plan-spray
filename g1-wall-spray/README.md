@@ -268,7 +268,7 @@ scripts/exec/base_lock_node.py（订阅 /odom，发布 /<robot>_spray/wrist_targ
   立筋（全高凸出）自动截宽（stroke_u 截在筋面内侧），局部障碍由 03 标注穿越段
   直接通过；配置经 `G1W_CFG` 注入 03（`G1W_ROBOT`/`G1W_MJCF` 同步注入）。
 - **ROS topic 输出**：`scripts/ros_bridge.py`，话题契约
-  `/<robot>_spray/wall_path|robot_path|trajectory_info|motion/qpos|motion/meta`
+  `/<robot>_spray/wall_path|robot_path|trajectory_info|motion_qpos|motion_meta`
   （预留 `motion/stream` 与 `exec/cmd`）；rospy 可用则实发，否则落
   `output/ros_topics/<stamp>/*.jsonl` + `manifest.md`。
 - **NN-IK 提速**：`scripts/12_train_nn_ik.py` 训练（单支流形数据采集 + 输入/输出

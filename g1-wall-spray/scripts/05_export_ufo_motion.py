@@ -20,14 +20,25 @@
 """
 import numpy as np
 import mujoco
-import os, json, csv, math
+import os, json, csv, math, re
 import sys as _sys
 _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from nn_ik_hook import nn_ik
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-VER = os.environ.get("MOTION_VER", "v2_uniform_slow")            # 每版独立文件夹
+
+
+def _ver_key(name):
+    # 版本目录自然排序键: 按 v 后数字排(v2<v5<v10), 字母序会把 v10 排在 v5 前
+    m = re.match(r"v(\d+)", name)
+    return int(m.group(1)) if m else -1
+
+
 OUT_BASE = os.environ.get("G1W_OUT", os.path.join(BASE, "output"))
+_ver_dirs = ([d for d in os.listdir(os.path.join(OUT_BASE, "ufo_motion")) if d.startswith("v")]
+             if os.path.isdir(os.path.join(OUT_BASE, "ufo_motion")) else [])
+VER = os.environ.get("MOTION_VER") or (max(_ver_dirs, key=lambda d: (_ver_key(d), d))
+                                       if _ver_dirs else "v1")   # 每版独立文件夹, 默认=最新v*
 IN = os.environ.get("G1W_IN", OUT_BASE)
 OUT = os.path.join(OUT_BASE, "ufo_motion", VER)
 os.makedirs(OUT, exist_ok=True)
@@ -50,8 +61,31 @@ DWELL_S = 0.25
 SPEED = {"green": 0.05, "red": 0.05, "yellow": 0.05, "transition": 0.05}
 SMOOTH_WIN = 3     # 轻度平滑: 节点已顺序热启动连续, 重度平滑会抹坏枪轴指向
 CROUCH_PZ, STAND_PZ = 0.63, 0.77     # 骨盆高度参考(区常数)
-D_ROBOT, D_WRIST = 0.74, 0.40   # 标称站位/腕平面(腰锁定保证带 0.70~0.78m)
-GUN_NOTE = "墙内面放于 root 前方 +x 0.74m 处(机器人面向+x, 腰锁定站位保证带 0.70~0.78m)"
+D_WRIST = 0.40                       # 腕平面(距墙)
+# 站位 d_robot 解析: 优先 G1W_CFG(工作站传 cfg, 站位可 0.70~0.78) -> 其次 03 写出的
+# trajectory_meta.json 的 d_robot_nominal -> 都无才用 0.74 默认; 腕平面x/meta等派生量统一走该值
+_D_SRC, D_ROBOT = "内置默认", 0.74
+_cfg5p = os.environ.get("G1W_CFG", "")
+if _cfg5p and os.path.exists(_cfg5p):
+    try:
+        _c5 = json.load(open(_cfg5p, encoding="utf8"))
+        if "d_robot" in _c5:
+            D_ROBOT, _D_SRC = float(_c5["d_robot"]), f"G1W_CFG({_cfg5p})"
+    except Exception as _e5:
+        print(f"[站位] G1W_CFG 读取失败({_e5}), 改用 trajectory_meta.json", flush=True)
+if _D_SRC == "内置默认":
+    _meta5p = os.path.join(OUT_BASE, "trajectory_meta.json")
+    if os.path.exists(_meta5p):
+        try:
+            _m5 = json.load(open(_meta5p, encoding="utf8"))
+            if "d_robot_nominal" in _m5:      # 键名与 03 traj_meta 写出一致
+                D_ROBOT, _D_SRC = float(_m5["d_robot_nominal"]), "trajectory_meta.json"
+        except Exception:
+            pass
+print(f"[站位] d_robot={D_ROBOT:.3f}m (来源: {_D_SRC}; 保证带 0.70~0.78m), "
+      f"腕平面 x={D_ROBOT - D_WRIST:.3f}m", flush=True)
+GUN_NOTE = (f"墙内面放于 root 前方 +x {D_ROBOT:.2f}m 处(机器人面向+x, 站位取自{_D_SRC}; "
+            f"腰锁定站位保证带 0.70~0.78m)")
 
 INIT = dict(hip_pitch=-0.1, knee=0.3, ankle_pitch=-0.2,
             l_shoulder_pitch=0.2, l_shoulder_roll=0.2, l_elbow=0.6,
@@ -334,6 +368,41 @@ def main():
     if n_loose:
         print(f"[MJCF-IK] 容差档点腕位误差 <=10mm/轴0.10 (喷涂半径≥50mm, 影响可忽略)", flush=True)
 
+    # ---------- 2.6 连续性修复: 分支跳变窗口线性插值 ----------
+    # (须在时间参数化/trk_q 插值之前执行: 修复直接作用于 q_mj 本体, 插值后的
+    #  trk_q/组装 qpos 才能拿到修复后的节点解; 原先放在组装之后改 q_mj 已无效)
+    _hops = np.where(np.max(np.abs(np.diff(q_mj, axis=0)), axis=1) > 0.20)[0]
+    if len(_hops):
+        used = set()
+        for h in _hops:
+            if h in used or h + 1 in used:
+                continue
+            i0 = h
+            while i0 - 1 in _hops:
+                i0 -= 1
+            i1 = h + 1
+            while i1 + 1 in _hops:
+                i1 += 1
+            if i1 - i0 > 40:            # 窗口过长不处理(目标本身不同)
+                continue
+            qa, qb = q_mj[i0], q_mj[i1]
+            n = i1 - i0
+            for k, i in enumerate(range(i0 + 1, i1)):
+                a = smoothstep((k + 1) / n)
+                cand = qa * (1 - a) + qb * a
+                p_c, ax_c = mj_pose(np.clip(cand, alo, ahi))
+                p_t2 = np.array([D_ROBOT - D_WRIST, y_r[i], z_r[i] - pz_ref[i]])
+                if (np.linalg.norm(p_c - p_t2) < 0.03
+                        and np.dot(ax_c, axis_t[i]) > 0.95):
+                    q_mj[i] = np.clip(cand, alo, ahi)
+                    used.add(i)
+                else:
+                    used.add(i)             # 无法修复也标记, 避免重复处理
+        for i in sorted(used):              # 被处理节点的实际腕心同步刷新(弧长积分输入)
+            wp2, _ = mj_pose(q_mj[i])
+            wri_act[i] = wp2
+        print(f"[连续性] 分支跳变窗口 {len(_hops)} 处, 已线性插值修复", flush=True)
+
     # 实际腕心(世界系, z=离地高)
     rob_act_world = wri_act.copy()
     rob_act_world[:, 2] += pz_ref
@@ -449,36 +518,6 @@ def main():
         phase[k1 + i] = "retreat"
     qpos[k1 + n_ret:] = q_init_vec; phase[k1 + n_ret:] = "hold_init"
 
-    # ---------- 4.5 连续性修复: 分支跳变窗口线性插值 ----------
-    _hops = np.where(np.max(np.abs(np.diff(q_mj, axis=0)), axis=1) > 0.20)[0]
-    if len(_hops):
-        used = set()
-        for h in _hops:
-            if h in used or h + 1 in used:
-                continue
-            i0 = h
-            while i0 - 1 in _hops:
-                i0 -= 1
-            i1 = h + 1
-            while i1 + 1 in _hops:
-                i1 += 1
-            if i1 - i0 > 40:            # 窗口过长不处理(目标本身不同)
-                continue
-            qa, qb = q_mj[i0], q_mj[i1]
-            n = i1 - i0
-            for k, i in enumerate(range(i0 + 1, i1)):
-                a = smoothstep((k + 1) / n)
-                cand = qa * (1 - a) + qb * a
-                p_c, ax_c = mj_pose(np.clip(cand, alo, ahi))
-                p_t2 = np.array([D_ROBOT - D_WRIST, y_r[i], z_r[i] - pz_ref[i]])
-                if (np.linalg.norm(p_c - p_t2) < 0.03
-                        and np.dot(ax_c, axis_t[i]) > 0.95):
-                    q_mj[i] = np.clip(cand, alo, ahi)
-                    used.add(i)
-                else:
-                    used.add(i)             # 无法修复也标记, 避免重复处理
-        print(f"[连续性] 分支跳变窗口 {len(_hops)} 处, 已线性插值修复", flush=True)
-
     # ---------- 5. 平滑 + 贴地校正 ----------
     np.savez(os.path.join(OUT, "debug_knots.npz"), q_mj=q_mj, conv=conv,
              y_r=y_r, z_r=z_r, axis_t=axis_t, pz_ref=pz_ref,
@@ -489,10 +528,15 @@ def main():
     qpos_s = np.vstack([np.convolve(qs[:, j], ker7, "valid") for j in range(36)]).T
     qpos_s[:n_hold0] = q_init_vec
     qpos_s[k1 + n_ret:] = q_init_vec
-    for i in range(T):
-        data.qpos[:] = qpos_s[i]
-        mujoco.mj_forward(model, data)
-        qpos_s[i, 2] -= min(data.geom_xpos[g][2] for g in foot_geom)
+
+    def ground_correct(idxs):
+        """贴地校正: root_tz 上移最低足底几何的 z(输入=帧号可迭代, 就地改 qpos_s[:,2])"""
+        for i in idxs:
+            data.qpos[:] = qpos_s[i]
+            mujoco.mj_forward(model, data)
+            qpos_s[i, 2] -= min(data.geom_xpos[g][2] for g in foot_geom)
+
+    ground_correct(range(T))
 
     # 尖峰局部重平滑: 对关节速度>6rad/s 的帧簇, 在±20帧窗口内对该关节做重度平滑
     for _pass in range(3):
@@ -514,6 +558,8 @@ def main():
                 seg = qpos_s[w0:w1, j]
                 qpos_s[w0:w1, j] = np.convolve(
                     np.pad(seg, 12, mode="edge"), np.ones(25) / 25, "valid")
+            # 重平滑改了腿/骨盆关节 -> 足底高度变化, 对该窗口重跑贴地校正(ik_polish 前)
+            ground_correct(range(w0, w1))
     dq = np.abs(np.diff(qpos_s[:, 7:], axis=0)) / DT   # 含腰三自由度与左臂(常数)
     jnames = []
     for s in ("left", "right"):
@@ -950,7 +996,9 @@ def main():
         ii_r, ang_r, dot_r, cls_r = measured_track_stats()
         vmax = float(np.abs(np.diff(qpos_s[:, 7:], axis=0)).max() / DT)
         spr_m = np.array([c in ("green", "red") for c in cls_r], bool)
-        if ang_r[spr_m].min() >= 60.0 and dot_r[spr_m].min() > 0.965 and vmax <= 9.0:
+        spray_ok_r = (not spr_m.any()) or (ang_r[spr_m].min() >= 60.0
+                                           and dot_r[spr_m].min() > 0.965)
+        if spray_ok_r and vmax <= 9.0:
             break
         # 违规只看喷涂帧(green/red): 角度<60.8°或dot<0.968(门限60°/0.965留裕度);
         # 不再用62°——60°名义行永远到不了62°, 只会整行反复重解制造分支翻转; yellow仅报告
@@ -966,10 +1014,11 @@ def main():
             n_sp = 1 if spread_flip() else 0
             sp_txt = "成功" if n_sp else "失败"
         n_rect = rectify_pass()
+        _spr_txt = (f"环前喷涂最小角 {ang_r[spr_m].min():.1f}°, 喷涂最小dot "
+                    f"{dot_r[spr_m].min():.4f}" if spr_m.any() else "无喷涂帧")
         print(f"[审计修复环·{_round + 1}] 喷涂违规帧(<60.8°或dot<0.968) {len(viol)}, "
               f"修复 {n_ok}, 连接段摊宽 {n_yel} 段, 摊宽 {sp_txt}, 整流 {n_rect}; "
-              f"环前喷涂最小角 {ang_r[spr_m].min():.1f}°, 喷涂最小dot "
-              f"{dot_r[spr_m].min():.4f}, 帧速峰 {vmax:.1f} rad/s", flush=True)
+              f"{_spr_txt}, 帧速峰 {vmax:.1f} rad/s", flush=True)
         if n_ok == 0 and n_rect == 0 and n_sp == 0 and n_yel == 0:
             break
     # 回位块重锚定: 平滑/审计修复只改跟踪段, 回位块仍从修复前的 q_last 出发,
@@ -1001,12 +1050,17 @@ def main():
         pos_err[r] = np.linalg.norm(data.xpos[WRIST_BODY] - trk_wrist_world[i - k0])
     m_spr = np.array([c in ("green", "red") for c in cls_trk], bool)
     m_yel = ~m_spr
-    ang_spr, dot_spr = ang_wall[m_spr], dot_nom[m_spr]
-    spray_ok = bool(ang_spr.min() >= 60.0 and dot_spr.min() > 0.965)
-    print(f"[末端指向审计] 喷涂帧(green/red) {int(m_spr.sum())} 实测墙面夹角 "
-          f"[{ang_spr.min():.1f}, {ang_spr.max():.1f}]°, 名义指向dot "
-          f"[{dot_spr.min():.4f}, {dot_spr.max():.4f}] (要求≥60°且dot>0.965, "
-          f"{'全部满足' if spray_ok else '存在违规!'})", flush=True)
+    if m_spr.any():
+        ang_spr, dot_spr = ang_wall[m_spr], dot_nom[m_spr]
+        spray_ok = bool(ang_spr.min() >= 60.0 and dot_spr.min() > 0.965)
+        print(f"[末端指向审计] 喷涂帧(green/red) {int(m_spr.sum())} 实测墙面夹角 "
+              f"[{ang_spr.min():.1f}, {ang_spr.max():.1f}]°, 名义指向dot "
+              f"[{dot_spr.min():.4f}, {dot_spr.max():.4f}] (要求≥60°且dot>0.965, "
+              f"{'全部满足' if spray_ok else '存在违规!'})", flush=True)
+    else:
+        ang_spr = dot_spr = np.zeros(0)      # 无喷涂帧: 跳过该段统计(与yellow防护同法)
+        spray_ok = True
+        print("[末端指向审计] 无喷涂帧(green/red), 跳过喷涂段统计", flush=True)
     if m_yel.any():
         n_y25 = int((pos_err[m_yel] <= 0.025).sum())
         print(f"[连接段统计·不喷涂] yellow {int(m_yel.sum())} 帧夹角 "
@@ -1035,9 +1089,11 @@ def main():
                                 round(float(trk_wrist_world[:, 2].max()), 3)],
         mjcf_ik=(f"{int(conv.sum())}/{N} 收敛(位置<4mm, 轴<0.05), 容差档(≤10mm) {n_loose} 点, "
                  f"边缘微松 {n_relax} 点, 跳变 {len(hops)}"),
-        spray_angle_deg=[round(float(ang_spr.min()), 1), round(float(ang_spr.max()), 1)],
+        spray_angle_deg=([round(float(ang_spr.min()), 1), round(float(ang_spr.max()), 1)]
+                         if m_spr.any() else None),
         spray_angle_ok=spray_ok,
-        spray_dot_nominal=[round(float(dot_spr.min()), 4), round(float(dot_spr.max()), 4)],
+        spray_dot_nominal=([round(float(dot_spr.min()), 4), round(float(dot_spr.max()), 4)]
+                           if m_spr.any() else None),
         spray_frames=int(m_spr.sum()),
         yellow_connect_stats=dict(
             frames=int(m_yel.sum()),
@@ -1055,7 +1111,8 @@ def main():
         init_pelvis_m=round(float(INIT_PELVIS), 4),
         wall_placement=GUN_NOTE,
         root="xy=0, quat=identity(面向+x), z=骨盆参考+逐帧贴地校正",
-        csv_note="wrist_x/y/z 为骨盆系(根相对)坐标, 米; 腕心离地高 = root_tz + wrist_z",
+        csv_note=("wrist_x/y/z 为骨盆系(根相对)坐标, 米; 腕心离地高 = root_tz + wrist_z; "
+                  "axis_dx/dy/dz 为该帧枪轴单位向量(非跟踪帧为 NaN)"),
         usage="npz 放入 mimiclite/motions/any4hdmi-g1-lafan/, 项目 cfg 指定该动作",
     )
     json.dump(meta, open(os.path.join(OUT, "motion_meta.json"), "w", encoding="utf8"),
@@ -1066,12 +1123,16 @@ def main():
         w = csv.writer(f)
         w.writerow(["t_s", "phase", "root_tx", "root_ty", "root_tz", "root_qw",
                     "root_qx", "root_qy", "root_qz"] + jnames +
-                   ["wrist_x", "wrist_y", "wrist_z", "seg_class"])
+                   ["wrist_x", "wrist_y", "wrist_z", "axis_dx", "axis_dy", "axis_dz",
+                    "seg_class"])
         for i in range(T):
             wrist = trk_wrist_out[i - k0] if k0 <= i < k1 else (np.nan, np.nan, np.nan)
+            # 枪轴方向(目标指向, root quat=identity 故基座系=世界系); 非跟踪帧写 NaN
+            ax_out = trk_ax[i - k0] if k0 <= i < k1 else (np.nan, np.nan, np.nan)
             w.writerow([round(i * DT, 4), phase[i]] +
                        [f"{x:.5f}" for x in qpos_s[i]] +
                        [f"{x:.4f}" for x in wrist] +
+                       [f"{x:.4f}" for x in ax_out] +
                        [phase[i][6:] if phase[i].startswith("track_")
                         else ("home" if phase[i] == "home" else "-")])
     print(f"[写出] wall_spray_motion_qpos.csv ({T} 行)", flush=True)

@@ -19,7 +19,13 @@ for f in scripts/*.py; do
 done
 cp scripts/run_pipeline.sh "$REL/scripts/"
 cp scripts/exec/base_lock_node.py scripts/exec/groot_spray_runner.py \
-   scripts/exec/zmq_motion_publisher.py scripts/exec/estop.py "$REL/scripts/exec/"
+   scripts/exec/estop.py "$REL/scripts/exec/"
+# 下列文件存在才拷(部分为可选组件, 缺失不应让 set -e 中断打包)
+cp scripts/exec/groot_daemon.py scripts/exec/groot_bridge.py \
+   scripts/exec/compare_q.py "$REL/scripts/exec/" 2>/dev/null \
+  || echo "  (提示: groot_daemon/groot_bridge/compare_q 未全部打包)"   # 常驻守护进程/桥/关节对照(实机执行链)
+cp scripts/exec/zmq_motion_publisher.py "$REL/scripts/exec/" 2>/dev/null \
+  || true   # 该发布器已由 groot_daemon.py 取代, 不存在时跳过
 
 echo "==> 静态资源与模型档位"
 cp station/static/* "$REL/station/static/"
@@ -57,9 +63,10 @@ json.dump({"_说明": "解释器与机器人执行路径, 按目标机器修改;
            "groot_python": "/home/yang/桌面/轨迹规划/GR00T-WholeBodyControl/.venv_sim_cpu/bin/python",
            "display": ":0",
            "robot_mode": "sim",
-           "robot_iface": "enp8s0",
+           "robot_iface": "enp131s0",
            "zmq_port": 5556,
-           "zmq_host": "*"},
+           "zmq_host": "127.0.0.1",
+           "daemon_port": 5558},
           open(os.path.join(rel, "station/env.json"), "w", encoding="utf8"),
           ensure_ascii=False, indent=1)
 PY
@@ -75,7 +82,8 @@ for f in glob.glob("release/g1_wall_spray_station/station/nn_ik/*_stats.json"):
 PY2
 
 echo "==> README(随包详细文档)"
-cp README_RELEASE.md "$REL/README.md"
+cp README_RELEASE.md "$REL/README.md" 2>/dev/null \
+  || echo "  (提示: README_RELEASE.md 不存在, 跳过随包 README)"
 
 echo "==> 启动脚本"
 cat > "$REL/启动工作站.sh" <<'EOS'

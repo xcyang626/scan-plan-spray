@@ -8,12 +8,16 @@
   腕部与枪在世界系的位置/方向即不随基座漂移。
 
 话题:
-  订阅: /odom            nav_msgs/Odometry   基座位姿(世界系)
-        /<robot>_spray/wall_path  (离线轨迹文件兜底, 二选一)
+  订阅: /odom    nav_msgs/Odometry   基座位姿(世界系)
+  (轨迹目标由 --wall-csv 指定的 wall_path.csv 离线读入; wall_path 话题订阅暂未实现)
   发布: /<robot>_spray/wrist_target_base  geometry_msgs/PoseStamped
         (位置=反投影目标, 四元数=枪轴指向: x 轴对准 d, z 朝上构造最小旋转)
         /<robot>_spray/comp_status        std_msgs/String  (补偿诊断/超限告警)
-超限策略: 反投影目标超出上身可达带(>6cm 或指向偏差>3°) -> status=HOLD, 由上层停喷。
+超限策略: 反投影目标超出上身可达带(>6cm 或指向偏差>3°) -> status=HOLD, 由上层停喷;
+          HOLD 期间目标索引暂停推进(回到可达带后从原目标继续)。
+轨迹结束: 走到序列末尾停在末点保持, status=DONE (不回卷重跑)。
+/odom 看门狗: 时间戳超 0.5s 视为状态估计丢失 -> status=WAIT_BASE_POSE,
+              不再基于陈旧位姿反投影发布目标。
 
 无 rospy 环境自测: python exec/base_lock_node.py --selftest
 """
@@ -108,12 +112,15 @@ def main():
         print("rospy 不可用; 先跑核心自测:")
         return selftest()
 
-    state = {"R": np.eye(3), "t": np.zeros(3), "ok": False}
+    state = {"R": np.eye(3), "t": np.zeros(3), "ok": False, "stamp": None}
 
     def on_odom(msg):
         p = msg.pose.pose.position; q = msg.pose.pose.orientation
         state["R"] = quat_to_R(q.x, q.y, q.z, q.w)
         state["t"] = np.array([p.x, p.y, p.z])
+        # 时间戳优先用消息自带; 缺失(为 0)时退回接收时刻
+        state["stamp"] = (msg.header.stamp if not msg.header.stamp.is_zero()
+                          else rospy.Time.now())
         state["ok"] = True
 
     rospy.init_node(f"{a.robot}_spray_base_lock", anonymous=True)
@@ -123,13 +130,18 @@ def main():
     pub_s = rospy.Publisher(f"/{a.robot}_spray/comp_status", String, queue_size=1)
     P_W, D_W, _rows = load_wall_targets(a.wall_csv)
     rate = rospy.Rate(a.rate)
-    i, hold = 0, False
+    i = 0
+    odom_timeout = rospy.Duration(0.5)     # /odom 新鲜度阈值
     while not rospy.is_shutdown():
-        if not state["ok"]:
+        # /odom 看门狗: 无数据或时间戳超时 -> 不基于陈旧位姿发布目标
+        fresh = (state["ok"] and state["stamp"] is not None
+                 and (rospy.Time.now() - state["stamp"]) < odom_timeout)
+        if not fresh:
             pub_s.publish(json.dumps({"status": "WAIT_BASE_POSE"}))
             rate.sleep(); continue
-        p_b, d_b = reproject(P_W[i % len(P_W)], D_W[i % len(P_W)],
-                             state["R"], state["t"])
+        i = min(i, len(P_W) - 1)            # 序列末尾停在末点(不回卷重跑)
+        done = i >= len(P_W) - 1
+        p_b, d_b = reproject(P_W[i], D_W[i], state["R"], state["t"])
         m = PoseStamped(); m.header.stamp = rospy.Time.now()
         m.header.frame_id = "base"
         m.pose.position.x, m.pose.position.y, m.pose.position.z = p_b
@@ -139,9 +151,11 @@ def main():
         pub_t.publish(m)
         hold = abs(p_b[0] - 0.34) > 0.06            # 粗可达带检查(执行端按型号细化)
         pub_s.publish(json.dumps(
-            {"status": "HOLD" if hold else "LOCKED", "i": i,
+            {"status": "DONE" if done else ("HOLD" if hold else "LOCKED"),
+             "i": i,
              "p_base": [round(v, 4) for v in p_b]}, ensure_ascii=False))
-        i += 1
+        if not hold:                        # HOLD 期间暂停索引推进, 恢复后原目标继续
+            i += 1
         rate.sleep()
 
 

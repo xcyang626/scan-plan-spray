@@ -66,43 +66,83 @@ def daemon_call(req, timeout=4.0):
 
 
 def _send_command_subprocess(kind="stop"):
-    """兜底: GR00T venv 子进程直发官方 command(msgpack 只在 venv 里有)."""
+    """兜底: GR00T venv 子进程直发官方 command(msgpack 只在 venv 里有).
+    急停是时间敏感操作 —— 超时 3s(旧值 30s, 通道卡死会拖住整个急停流程)."""
     try:
         r = subprocess.run(
             [_groot_py(), BRIDGE, "--send-command", kind,
-             "--host", "*", "--port", str(int(_cfg("zmq_port", 5556)))],
-            cwd=GROOT_ROOT, capture_output=True, text=True, timeout=30)
+             "--host", _cfg("zmq_host", "127.0.0.1"),
+             "--port", str(int(_cfg("zmq_port", 5556)))],
+            cwd=GROOT_ROOT, capture_output=True, text=True, timeout=3)
         return r.returncode == 0
     except Exception:
         return False
 
 
+def _deploy_pid():
+    """部署/仿真 runner 的 PID(robot.pid; 无 pid 文件时 None)."""
+    try:
+        return int(open(os.path.join(BASE, "station", "robot.pid")).read().strip())
+    except Exception:
+        return None
+
+
+def _pid_alive(pid):
+    """进程是否存活(排除僵尸)."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            st = f.read().decode(errors="ignore").rsplit(")", 1)[1].split()[0]
+        return st != "Z"
+    except Exception:
+        return False
+
+
+def _confirm_estop(timeout=3.0):
+    """确认急停送达: 官方 stop 语义 = 阻尼指令后部署进程优雅退出 ——
+    以"部署进程已退出"为准(ZMQ PUB 无订阅者时'发送成功'实为丢弃, 不可信)."""
+    pid = _deploy_pid()
+    if pid is None or not _pid_alive(pid):
+        return True                      # 本无运行中的部署, 无需确认
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        if not _pid_alive(pid):
+            return True
+        time.sleep(0.1)
+    return False
+
+
 def estop(verbose=True):
-    """GR00T 原生急停: 经官方 command 话题下发 stop=True."""
+    """GR00T 原生急停: 经官方 command 话题下发 stop=True.
+    送达与否以"部署进程确认退出"判定, 而非通道的发送返回值."""
     # 通道1: 常驻守护进程(独占 ZMQ 端口, 站点在运行时它就在)
     r = daemon_call({"cmd": "command", "kind": "stop"})
     if r and r.get("ok"):
-        _mark_estopped()
+        if _confirm_estop():
+            _mark_estopped()
+            if verbose:
+                print("[estop] 已经守护进程下发 GR00T 官方急停 command(stop=True), "
+                      "部署进程已确认退出: 机器人收到零力矩阻尼指令(全身变软)后优雅停止")
+            return True
         if verbose:
-            print("[estop] 已经守护进程下发 GR00T 官方急停 command(stop=True): "
-                  "机器人将收到零力矩阻尼指令(全身变软)后优雅停止")
-        return True
+            print("[estop] 守护进程已发送但部署进程未退出(未确认送达), 尝试备用通道…")
     # 通道2: GR00T venv 子进程直发
     if _send_command_subprocess("stop"):
-        _mark_estopped()
-        if verbose:
-            print("[estop] 已经子进程下发 GR00T 官方急停 command(stop=True): "
-                  "机器人将收到零力矩阻尼指令(全身变软)后优雅停止")
-        return True
+        if _confirm_estop():
+            _mark_estopped()
+            if verbose:
+                print("[estop] 已经子进程下发 GR00T 官方急停 command(stop=True), "
+                      "部署进程已确认退出: 机器人收到零力矩阻尼指令(全身变软)后优雅停止")
+            return True
     # 通道3: 部署 stdin FIFO 注入官方 'O' 键
     if send_key("O", verbose=False):
-        _mark_estopped()
-        if verbose:
-            print("[estop] 已注入官方按键 'O' (GR00T 原生急停)")
-        return True
+        if _confirm_estop(5.0):          # 末通道给足优雅退出时间
+            _mark_estopped()
+            if verbose:
+                print("[estop] 已注入官方按键 'O' (GR00T 原生急停), 部署进程已确认退出")
+            return True
     if verbose:
-        print("[estop] ✗ 三条通道均失败: 守护进程不在运行、ZMQ 直发失败、"
-              "FIFO 不可写 —— 请直接按手柄急停键")
+        print("[estop] ✗ 急停未确认送达(部署进程仍在运行): 守护进程/ZMQ 直发/FIFO "
+              "三通道均已尝试 —— 请直接按手柄急停键")
     return False
 
 

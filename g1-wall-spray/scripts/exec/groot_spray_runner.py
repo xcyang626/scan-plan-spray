@@ -87,6 +87,7 @@ class SprayController:
         self.waist_kd_scale = float(waist_kd_scale)
         self.playing = False
         self.t_play0 = None
+        self.trig_speed = 1.0      # 触发文件携带的速度倍率(安全限幅 [0.05,1.5])
         self.done = False
         self.runs = 0
         self._trig_fp = None
@@ -153,7 +154,7 @@ class SprayController:
     def t_play(self):
         if self.t_play0 is None:
             return 0.0
-        return time.time() - self.t_play0
+        return (time.time() - self.t_play0) * self.trig_speed
 
     # ---- 触发/计时 ----
     def maybe_start(self):
@@ -168,11 +169,20 @@ class SprayController:
                     info = json.loads(raw)
                     mp = info.get("motion")
                     if mp and os.path.exists(mp):
+                        sp = info.get("speed", 1.0)
+                        try:
+                            sp = float(sp)
+                        except (TypeError, ValueError):
+                            sp = 1.0
+                        # 与站点/daemon 同口径的安全限幅; NaN/inf 归一为实时
+                        self.trig_speed = (min(max(sp, 0.05), 1.5)
+                                           if np.isfinite(sp) else 1.0)
                         self.motion = load_motion(mp)
                         self._trig_fp = raw          # 消费指纹
                         self.playing = True
                         self.t_play0 = time.time()
-                        print(f"[spray] 收到触发, 播放 {mp} ({len(self.motion)} 帧)", flush=True)
+                        print(f"[spray] 收到触发, 播放 {mp} ({len(self.motion)} 帧, "
+                              f"速度×{self.trig_speed})", flush=True)
                         write_status(phase="playing", motion=mp,
                                      frames=int(len(self.motion)))
                 except Exception as e:

@@ -10,8 +10,8 @@
   /<robot>_spray/wall_path        Float32MultiArray  (N,6): seq,u,h,x,y,z (世界系, m)
   /<robot>_spray/robot_path       Float32MultiArray  (N,9): 腕心xyz, 枪轴dxyz, tilt_deg
   /<robot>_spray/trajectory_info  String             (JSON: trajectory_meta 摘要)
-  /<robot>_spray/motion/qpos      Float32MultiArray  (T,36): 全身关节@30Hz 扁平
-  /<robot>_spray/motion/meta      String             (JSON: motion_meta)
+  /<robot>_spray/motion_qpos      Float32MultiArray  (T,36): 全身关节@30Hz 扁平
+  /<robot>_spray/motion_meta      String             (JSON: motion_meta)
   预留(执行模块接入后启用, 本期不发):
   /<robot>_spray/motion/stream    Float32MultiArray  (36,) @30Hz 逐帧流
   /<robot>_spray/exec/cmd         String             执行指令(暂不实现)
@@ -77,10 +77,9 @@ def emit_run(robot, traj_dir=None, motion_dir=None, out_base=None, publish_live=
         pubs = {}
         for name, (typ, _) in TOPICS.items():
             if name in msgs:
-                pubs[name] = rospy.Publisher(
-                    f"/{robot}_spray/{name.replace('_qpos', '/qpos').replace('_meta', '/meta')}"
-                    if False else f"/{robot}_spray/{name}",
-                    FMA if "Float32" in typ else STR, queue_size=1, latch=True)
+                pubs[name] = rospy.Publisher(f"/{robot}_spray/{name}",
+                                             FMA if "Float32" in typ else STR,
+                                             queue_size=1, latch=True)
         for name, body in msgs.items():
             if "Float32" in TOPICS[name][0]:
                 m = FMA(); m.layout.dim = [

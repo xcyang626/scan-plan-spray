@@ -21,7 +21,7 @@ BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # ---------------- 点云读取 ----------------
 def _ply_points(path):
     with open(path, 'rb') as f:
-        head, got = [], False
+        head, got, n = [], False, None
         while not got:
             line = f.readline()
             if not line:
@@ -32,6 +32,8 @@ def _ply_points(path):
                 n = int(s.split()[-1])
             if s == 'end_header':
                 got = True
+        if n is None:
+            raise ValueError('PLY 头缺少 element vertex 行, 无法确定点数')
         fmt = next((l for l in head if l.startswith('format')), 'ascii')
         props, bin_types = [], {'float': 'f4', 'double': 'f8', 'uchar': 'u1',
                                 'int': 'i4', 'uint': 'u4', 'short': 'i2', 'ushort': 'u2',
@@ -48,7 +50,9 @@ def _ply_points(path):
         if 'ascii' in fmt:
             data = np.loadtxt(open(path, 'rb'), skiprows=len(head), max_rows=n, ndmin=2)
         else:
-            dtype = np.dtype([(name, '<' + bin_types[t]) for t, name in props])
+            # 按 fmt 声明选端序: binary_big_endian 必须按大端解, 不能一律当小端
+            endian = '>' if 'binary_big_endian' in fmt else '<'
+            dtype = np.dtype([(name, endian + bin_types[t]) for t, name in props])
             raw = np.frombuffer(f.read(dtype.itemsize * n), dtype=dtype)
             data = np.column_stack([raw[name] for _, name in props]).astype(np.float64)
     return data[:, :3]
@@ -64,18 +68,24 @@ def _pcd_points(path):
                 n = int(line.split()[-1])
             if line.startswith('DATA'):
                 fmt = line.split()[-1]; got = True
-        cols = next((l.split()[2:] for l in head if l.startswith('FIELDS')), ['x', 'y', 'z'])
-        types = next((l.split()[2:] for l in head if l.startswith('TYPE')), None)
-        sizes = next((l.split()[2:] for l in head if l.startswith('SIZE')), None)
+        # 注意 [1:]: FIELDS/TYPE/SIZE 行首是关键字本身, 旧写法 [2:] 会丢掉第一个字段名
+        cols = next((l.split()[1:] for l in head if l.startswith('FIELDS')), ['x', 'y', 'z'])
+        types = next((l.split()[1:] for l in head if l.startswith('TYPE')), None)
+        sizes = next((l.split()[1:] for l in head if l.startswith('SIZE')), None)
         xi, yi, zi = cols.index('x'), cols.index('y'), cols.index('z')
         if fmt == 'ascii':
             data = np.loadtxt(open(path, 'rb'), skiprows=len(head), max_rows=n, ndmin=2)
         else:
-            tmap = {'F': 'f4', 'D': 'f8', 'U': 'u', 'I': 'i'}
-            szmap = {'4': '4', '8': '8', '2': '2', '1': '1'}
+            # PCD 按 TYPE×SIZE 组合映射 dtype(F浮点/I有符号/U无符号);
+            # 旧写法 'F'+'8' 会拼出非法 <f48 导致 numpy 拒绝解析
+            _pcd_dt = {('F', '2'): 'f2', ('F', '4'): 'f4', ('F', '8'): 'f8',
+                       ('I', '1'): 'i1', ('I', '2'): 'i2', ('I', '4'): 'i4', ('I', '8'): 'i8',
+                       ('U', '1'): 'u1', ('U', '2'): 'u2', ('U', '4'): 'u4', ('U', '8'): 'u8'}
             dt = []
-            for t, s in zip(types, sizes):
-                dt.append(('<' + tmap[t] + szmap[s]))
+            for name, t, s in zip(cols, types, sizes):
+                if (t, s) not in _pcd_dt:
+                    raise ValueError(f'暂不支持的 PCD 字段类型 TYPE {t} SIZE {s}')
+                dt.append((name, '<' + _pcd_dt[(t, s)]))
             raw = np.frombuffer(f.read(np.dtype(dt).itemsize * n), dtype=np.dtype(dt))
             data = np.column_stack([raw[cols[xi]], raw[cols[yi]], raw[cols[zi]]]).astype(np.float64)
     return data[:, :3]

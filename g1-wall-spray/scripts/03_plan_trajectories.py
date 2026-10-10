@@ -54,8 +54,12 @@ ARM = "right"; YAW = 60
 _cfgp = os.environ.get("G1W_CFG", "")
 if _cfgp and os.path.exists(_cfgp):
     _c = json.load(open(_cfgp, encoding="utf8"))
+    if "wall_x" not in _c:
+        # cfg 存在却缺 wall_x: 墙面x会被静默替换成站位距离(世界坐标全错), 直接报错退出
+        raise SystemExit(f"[配置] 错误: G1W_CFG({_cfgp}) 缺 wall_x 键(点云机器人系墙距), "
+                         f"拒绝回退默认值; 请检查工作站/云扫描产出的 cfg")
     D_ROBOT = float(_c.get("d_robot", D_ROBOT))
-    X_FACE = float(_c.get("wall_x", D_ROBOT))       # 点云机器人系: 墙距=wall_x
+    X_FACE = float(_c["wall_x"])                    # 点云机器人系: 墙距=wall_x
     FLOOR_Z = float(_c.get("floor_z", 0.0))
     U0 = float(_c.get("u0", 0.0))
     if _c.get("stroke_u"):
@@ -66,6 +70,13 @@ if _cfgp and os.path.exists(_cfgp):
         PITCH = float(_c["pitch"])
     print(f"[配置] 工作站配置已加载 {_cfgp}: d_robot={D_ROBOT}, wall_x={X_FACE}, "
           f"stroke_u=({STROKE_U[0]:.3f},{STROKE_U[1]:.3f}), h_top={H_TOP}, pitch={PITCH}")
+
+# 腕平面 x 越界检查(启动时): 02 工作区网格只覆盖三腕平面(0.30/0.34/0.38)保证带,
+# x=D_ROBOT-D_WRIST 超出 [0.30,0.38]±0.03 时网格可能不覆盖该平面, 打警告(不退出)
+_wx_chk = D_ROBOT - D_WRIST
+if not (0.30 - 0.03 <= _wx_chk <= 0.38 + 0.03):
+    print(f"[警告] 腕平面 x=D_ROBOT-D_WRIST={_wx_chk:.3f}m 超出保证带 [0.30,0.38]±0.03 "
+          f"(d_robot={D_ROBOT}); 工作区网格可能不覆盖该平面, 可行区判定或失真")
 
 # ---------------- G1 FK (与步骤2一致, 官方 URDF g1_29dof_nohand) ----------------
 # 腰部三自由度: yaw放开(±150°), roll/pitch 收紧至 ±5°=±0.0873(与步骤2一致)
@@ -224,8 +235,12 @@ def main():
     H_MIN_SPRAY = Z_BOT - D_WRIST * np.tan(np.deg2rad(TILT_MAX))
     # 行高序列: 最低行向上取到 k*PITCH + PITCH/2 网格, 最高行 H_TOP, 从低到高
     k_min = int(np.ceil((H_MIN_SPRAY - PITCH / 2) / PITCH - 1e-9))
+    k_min = max(k_min, 1)          # 下限钳位: 可喷下限过低时防负行高(轨迹入地)
     H_MIN_ROW = k_min * PITCH + PITCH / 2
     hs_seq = list(np.arange(H_MIN_ROW, H_TOP + 1e-9, PITCH))
+    if not hs_seq:
+        raise RuntimeError(f"行高序列为空: 最低行 {H_MIN_ROW:.2f}m > 最高行 {H_TOP:.2f}m "
+                           f"(H_MIN_SPRAY={H_MIN_SPRAY:.3f}, 请检查 Z_BOT/H_TOP 配置)")
     print(f"[保证区] 站姿 y[{Y_LO:+.2f},{Y_HI:+.2f}], 下倾(<=30°)最低腕心z={z_bot_grid:.3f} "
           f"-> Z_BOT={Z_BOT:.3f}")
     print(f"[喷涂质量] 末端指向与墙面夹角须>=60°(倾角<=30°): 可喷下限 h>={H_MIN_SPRAY:.3f}m "
@@ -255,9 +270,10 @@ def main():
         return h + dirn * D_WRIST * np.tan(np.deg2rad(90.0 - theta))
 
     def iy_arr(y_vals):
+        # 返回未夹紧的网格索引; 越界由 seg_feasible 判不可行(夹到边缘格会把网格外
+        # 坐标误判成可行)
         y_vals = np.asarray(y_vals, float)
-        iy = np.round((y_vals - ys_g[0]) / (ys_g[1] - ys_g[0])).astype(int)
-        return np.clip(iy, 0, len(ys_g) - 1)
+        return np.round((y_vals - ys_g[0]) / (ys_g[1] - ys_g[0])).astype(int)
 
     def iz_of(z_val):
         iz = int(np.round((z_val - zs_g[0]) / (zs_g[1] - zs_g[0])))
@@ -267,7 +283,10 @@ def main():
         """水平线段 y_r=u-u_robot (u∈[a,b] 步0.01) 的每个 (y_r,z_w) 都落在对应网格内?"""
         us = np.arange(a, b + 1e-9, 0.01)
         g = grid_for(theta, dirn)
-        return bool(g[iy_arr(us - u_robot), iz_of(zw_of(h, theta, dirn))].all())
+        iy = iy_arr(us - u_robot)
+        if (iy < 0).any() or (iy >= len(ys_g)).any():
+            return False                       # 网格外直接不可行(不夹边缘格)
+        return bool(g[iy, iz_of(zw_of(h, theta, dirn))].all())
 
     U_C = 0.5 * (STROKE_U[0] + STROKE_U[1])             # 统一区间中心(默认(0.005,0.715)->0.36)
     W = 0.70
@@ -525,9 +544,20 @@ def main():
     # 3) 全序列三次样条插值(锚点含行端与连接段端点 => 跨行/连接段自然过渡)
     from scipy.interpolate import CubicSpline
     ok_a = anchor_idx[np.abs(q_ik[anchor_idx]).sum(1) > 0]
+    if len(ok_a) < 2:
+        raise RuntimeError(f"锚点IK成功数不足: {len(ok_a)}/{n_anchor} "
+                           f"(失败锚点无法构成样条, 请检查工作区网格/站位配置)")
+    _i0a, _i1a = int(ok_a[0]), int(ok_a[-1])
+    _xa = np.arange(N)
+    if _i0a > 0:        # 首锚点失败: 前段用线性插值+端点夹紧(样条外推会振荡)
+        for k in range(10):
+            q_ik[:_i0a, k] = np.interp(_xa[:_i0a], ok_a, q_ik[ok_a, k])
+    if _i1a < N - 1:    # 末锚点失败: 尾段同样线性+夹紧
+        for k in range(10):
+            q_ik[_i1a + 1:, k] = np.interp(_xa[_i1a + 1:], ok_a, q_ik[ok_a, k])
     cs_q = CubicSpline(ok_a, q_ik[ok_a], axis=0)
-    q_ik[:] = cs_q(np.arange(N))
-    pz_ik[:] = np.interp(np.arange(N), ok_a, pz_ik[ok_a])
+    q_ik[_i0a:_i1a + 1] = cs_q(_xa[_i0a:_i1a + 1])    # 中段(锚点覆盖区)用样条
+    pz_ik[:] = np.interp(_xa, ok_a, pz_ik[ok_a])
     qd_pre = np.abs(np.diff(q_ik, axis=0)).max(1)          # 修正前(样条)相邻差
 
     # 4) 全点FK校验 + 增量修正(小步DLS): 位置>4mm / 轴差>0.03 / 走线点角度下限保护

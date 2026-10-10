@@ -4,7 +4,10 @@
 cd "$(dirname "$0")"
 mkdir -p output
 PY="${MUJOCO_PY:-$(command -v python3)}"
-[ -x "$HOME/miniconda3/envs/mujoco/bin/python" ] && PY="$HOME/miniconda3/envs/mujoco/bin/python"
+# 本机 mujoco conda 兜底: 仅在未显式指定 MUJOCO_PY 时启用(否则无条件覆盖会吃掉上面的优先级)
+if [ -z "${MUJOCO_PY:-}" ] && [ -x "$HOME/miniconda3/envs/mujoco/bin/python" ]; then
+  PY="$HOME/miniconda3/envs/mujoco/bin/python"
+fi
 if curl -s -m 1 http://127.0.0.1:8090/api/status >/dev/null 2>&1; then
   echo "工作站已在运行"
 else

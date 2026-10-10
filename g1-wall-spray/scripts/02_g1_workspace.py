@@ -4,9 +4,9 @@
 方法(与方案文件 ws_calc.py / ws_squat.py 一致, 换 G1 运动学):
   - 关节链: 腰(yaw/roll/pitch) + 单臂7关节, 末端 = 腕yaw关节中心(末端前一关节),
     喷枪轴 = 腕yaw系 x 轴(前臂延长线)
-  - 约束1: 腕心位于距墙 0.40m 的平面 -> 机器人离墙 d∈[0.70,0.90] (定位误差),
-    故基座系下腕平面 x_w ∈ [0.30, 0.50]; 对 x_w={0.30,0.40,0.50} 分别建占据网格后取交集
-    = 定位误差下"保证垂直"工作区域
+  - 约束1: 腕心位于距墙 0.40m 的平面 -> 机器人离墙 d∈[0.70,0.78] (腰锁定后定位保证带,
+    标称0.74m), 故基座系下腕平面 x_w ∈ [0.30, 0.38];
+    对 x_w={0.30,0.34,0.38} 分别建占据网格后取交集 = 定位误差下"保证垂直"工作区域
   - 约束2(喷涂质量, 用户定稿): 喷枪轴与墙面夹角须在 60°~90°(越接近90°越好)
     -> 垂直模式 ≤15°(与法向), 倾斜模式 ≤30°(与法向), 用于上下/左右边缘指向
   - 站姿: 骨盆 0.77~0.79m; 蹲姿: 骨盆 0.42~0.70m (腿部FK求可行下限)
@@ -122,9 +122,11 @@ def sample_crouch_pelvis(n=400000, seed=11):
     knee = rng.uniform(-0.0873, 2.8798, n)
     ankle = -(hip + knee)
     ok = (ankle >= -0.8727) & (ankle <= 0.5236)
-    hip, knee = hip[ok][:200000], knee[ok][:200000]
+    # hip/knee/ankle 三列同口径过滤(ok 掩膜+同截断), 否则踝角取的是未过滤前
+    # len(hip) 个样本, 与过滤后的 hip/knee 错位配对
+    hip, knee, ankle = hip[ok][:200000], knee[ok][:200000], ankle[ok][:200000]
     q = np.stack([hip, np.zeros_like(hip), np.zeros_like(hip),
-                  knee, ankle[:len(hip)], np.zeros_like(hip)], 1)
+                  knee, ankle, np.zeros_like(hip)], 1)
     p, _ = fk_chain(LEG_L, q, 0.0)
     pelvis = -p[:, 2] + SOLE_TO_ANKLE
     pelvis = pelvis[pelvis > 0.2]
@@ -222,8 +224,13 @@ def main():
         YAW = (-np.deg2rad(yaw_deg), np.deg2rad(yaw_deg))
         for arm_name, arm in [("right", ARM_R), ("left", ARM_L)]:
             for mode, pr in [("stand", PELVIS_STAND), ("crouch", PELVIS_CROUCH)]:
+                # 确定性种子: 逐字符 ord 累积哈希(内置 hash 受 PYTHONHASHSEED 影响,
+                # 同参数不同进程结果不同, 不可复现)
+                _sd = 0
+                for ch in arm_name:
+                    _sd = (_sd * 31 + ord(ch)) % 1000003
                 r = sample_workspace(arm, YAW, pr, n=4_000_000,
-                                     seed=7 + hash((arm_name, yaw_deg)) % 97)
+                                     seed=7 + (_sd + 31 * yaw_deg) % 97)
                 key = f"{arm_name}_{mode}_y{yaw_deg}"
                 from scipy import ndimage
                 ST = np.ones((3, 3), bool)

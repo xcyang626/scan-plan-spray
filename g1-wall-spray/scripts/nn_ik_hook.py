@@ -23,14 +23,19 @@ def nn_ik(p_rel, d, robot="g1"):
     deg = os.environ.get("G1W_WAIST_DEG", "").strip()
     p = os.path.join(BASE, "station", "nn_ik",
                      f"{robot}_rp{deg}_nn_ik.npz" if deg else f"{robot}_nn_ik.npz")
-    if not os.path.exists(p):
+    try:
+        # 缓存键含 (mtime, size): 12 重训并原子替换文件后, 长驻进程自动重载新权重
+        st = os.stat(p)
+        key = (p, st.st_mtime, st.st_size)
+    except OSError:
         return None
     try:
-        m = _cache[p]
+        m = _cache[key]
     except KeyError:
         try:
             m = dict(np.load(p))          # 训练器可能在重写模型文件, 失败则本点跳过
-            _cache[p] = m
+            _cache.clear()                # 旧文件键失效, 清掉防堆积
+            _cache[key] = m
         except Exception:
             return None
     x = np.concatenate([np.asarray(p_rel, np.float32).ravel(),

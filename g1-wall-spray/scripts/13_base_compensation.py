@@ -45,8 +45,11 @@ def rot_y(a):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--traj", default=os.path.join(BASE, "output", "trajectory.npz"))
-    ap.add_argument("--out", default=os.path.join(BASE, "output", "base_comp_report"))
+    # 默认目录口径与 05_export_ufo_motion.py 的 OUT_BASE 一致:
+    # 工作站流传 G1W_OUT=run_dir 时默认读该 run 的轨迹(否则会错读主 output 的旧轨迹)
+    _outbase = os.environ.get("G1W_OUT", os.path.join(BASE, "output"))
+    ap.add_argument("--traj", default=os.path.join(_outbase, "trajectory.npz"))
+    ap.add_argument("--out", default=os.path.join(_outbase, "base_comp_report"))
     ap.add_argument("--dx", type=float, default=0.03)     # 平移扰动幅值 (m)
     ap.add_argument("--dyaw", type=float, default=np.deg2rad(1.5))
     ap.add_argument("--drp", type=float, default=np.deg2rad(0.6))
@@ -58,7 +61,12 @@ def main():
     p_cmd = np.column_stack([np.full(len(q0), P03.D_ROBOT - P03.D_WRIST),
                              t["rob_y_r"].astype(float),
                              t["rob_z"].astype(float)])      # 基座系(标称)腕心目标
-    N, T = len(q0), np.arange(len(q0)) / 30.0               # 30Hz 执行节拍
+    N = len(q0)
+    # 扰动时间轴: 轨迹点是路径采样(约0.4s/点 @0.05m/s), 不是30Hz帧; 按相邻点欧氏
+    # 距离/统一速度累积得到真实时间(旧版按30Hz算, 扰动周期与附加速度虚高约12倍)
+    SPEED = 0.05                                             # 与 05 导出一致的统一速度
+    T = np.concatenate([[0.0], np.cumsum(
+        np.linalg.norm(np.diff(p_cmd, axis=0), axis=1) / SPEED)])
 
     # ---- 基座扰动 T_WB(t): 机器人位姿漂移(世界系) ----
     dx = a.dx * np.sin(2 * np.pi * 0.11 * T)                # 前后 ±3cm
@@ -115,6 +123,8 @@ def main():
     low = np.where(stroke & (ang_t < 60.0))[0]
     if len(low):
         tb = np.deg2rad(0.8)
+        # 适用前提: 03 构造的名义指向为纯俯仰(y 分量恒=0), 重构轴才能取
+        # (cosθ, 0, ±sinθ) 形式(带横向分量的指向不适用该重构)
         th = np.arccos(np.clip(d_W[low, 0], -1, 1)) - tb
         dW2 = np.column_stack([np.cos(th), np.zeros(len(low)),
                                np.sign(d_W[low, 2]) * np.sqrt(np.maximum(0, 1 - np.cos(th)**2))])
@@ -147,7 +157,9 @@ def main():
 
     # ---- 指标 ----
     dq = np.abs(q1 - q0).max()                              # 补偿引起的关节改动量
-    vel_add = np.abs(np.diff(q1 - q0, axis=0)).max() * 30   # 附加关节速度
+    # 附加关节速度: 按真实逐点耗时(弧长/0.05m/s)折算, 不再按30Hz帧(会虚高约12倍)
+    _dt_pts = np.maximum(np.diff(T), 1e-6)
+    vel_add = float((np.abs(np.diff(q1 - q0, axis=0)) / _dt_pts[:, None]).max())
     _wlim = float(os.environ.get("G1W_WAIST_RP", "0")) or 0.0872665
     waist_ok = bool((np.abs(q1[:, 1]) <= _wlim + 1e-6).all()
                     and (np.abs(q1[:, 2]) <= _wlim + 1e-6).all())

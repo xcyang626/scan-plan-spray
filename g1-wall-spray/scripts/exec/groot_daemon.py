@@ -28,6 +28,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import socket
 import sys
@@ -59,8 +60,15 @@ def _env_json():
 
 ZMQ_PORT = int(os.environ.get("G1W_ZMQ_PORT",
                               _env_json().get("zmq_port", 5556)))
+# ZMQ 发布端绑定地址: 优先环境变量显式覆盖, 其次 env.json 的 zmq_host
+# (约定必须 localhost), 无配置时默认仅本机 —— 不再默认绑 '*'(全网卡可达)
+ZMQ_HOST = (os.environ.get("G1W_ZMQ_HOST")
+            or _env_json().get("zmq_host") or "127.0.0.1")
 DAEMON_PORT = int(os.environ.get("G1W_DAEMON_PORT",
                                  _env_json().get("daemon_port", 5558)))
+
+# 实机安全限幅: 速度倍率上下限(越界一律 clamp 到此区间并 emit 日志, 不静默)
+SPEED_MIN, SPEED_MAX = 0.05, 1.5
 
 # 官方安全保持站姿 = v7_arm_sdk_safe.csv 首帧(SONIC 交错序):
 # 腰 0,0,0; 左肩pitch 0.2, 左肩roll 0.2, 左肘 0.6; 其余 0
@@ -134,7 +142,7 @@ def emit(obj):
 class Daemon:
     """独占 ZMQ PUB 的常驻发布端。所有 socket 发送经 send_lock 串行(zmq 线程不安全)。"""
 
-    def __init__(self, host="*", port=5556):
+    def __init__(self, host="127.0.0.1", port=5556):
         self.host, self.port = host, port
         self.pub = None
         self.send_lock = threading.Lock()
@@ -272,7 +280,7 @@ class Daemon:
             n = len(pos)
             times = np.arange(n) / 30.0                 # 动作 30Hz 导出(官方: index/30)
             vel = np.gradient(pos, times, axis=0)
-            duration = float(times[-1] / speed)
+            duration = float(times[-1] / max(speed, SPEED_MIN))   # 实机安全限幅: 防 speed<=0 除零
             emit({"event": "stream_meta", "frames": n,
                   "duration_s": round(duration, 2), "rate": rate, "speed": speed})
             # 官方启用序列: command(start=True, planner=True)×3。
@@ -347,6 +355,15 @@ class Daemon:
 
     def start_stream(self, motion, rate=50.0, speed=1.0, blend_s=1.0, mjcf=None):
         """rate=50Hz/speed/blend 均为官方默认语义; speed=1.0 实时(动作本身 30Hz 导出)。"""
+        speed = float(speed)
+        if not math.isfinite(speed):      # NaN/inf 会穿透 min/max 夹取, 归一为实时
+            emit({"event": "speed_clamped", "requested": speed, "applied": 1.0})
+            speed = 1.0
+        if not (SPEED_MIN <= speed <= SPEED_MAX):      # 实机安全限幅
+            clamped = min(max(speed, SPEED_MIN), SPEED_MAX)
+            emit({"event": "speed_clamped", "requested": speed,
+                  "applied": clamped})                 # 记日志, 不静默
+            speed = clamped
         if self.streaming and not self.holding:
             return {"ok": False, "err": "busy",
                     "note": "轨迹执行中, 请等本轮完成/进入保持, 或先停止"}
@@ -522,10 +539,10 @@ def _tcp_serve(conn, dmn):
 
 
 def main():
-    dmn = Daemon(host="*", port=ZMQ_PORT)
+    dmn = Daemon(host=ZMQ_HOST, port=ZMQ_PORT)
     if not dmn.bind_pub():
         sys.exit(2)
-    emit({"event": "ready", "zmq": f"*:{ZMQ_PORT}",
+    emit({"event": "ready", "zmq": f"{ZMQ_HOST}:{ZMQ_PORT}",
           "control": f"127.0.0.1:{DAEMON_PORT}"})
     threading.Thread(target=_tcp_server, args=(dmn,), daemon=True).start()
     # stdin 请求循环: 站点退出(EOF)即结束, 释放 ZMQ 端口
