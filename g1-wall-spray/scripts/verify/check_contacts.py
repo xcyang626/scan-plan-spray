@@ -37,6 +37,7 @@ def main():
     _reg = json.load(open(os.path.join(BASE, "station", "robot_registry.json"),
                           encoding="utf8"))
     mjcf = _reg["g1"]["mjcf"]
+    mjcf = os.path.expanduser(mjcf)    # registry 允许 ~/.cache/... 写法
     mjcf = mjcf if os.path.isabs(mjcf) else os.path.join(BASE, mjcf)
     model = mujoco.MjModel.from_xml_path(mjcf)
     data = mujoco.MjData(model)

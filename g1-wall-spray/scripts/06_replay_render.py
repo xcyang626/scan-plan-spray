@@ -13,6 +13,7 @@ try:
     import json as _json
     _m = _json.load(open(os.path.join(BASE06, "station", "robot_registry.json"),
                          encoding="utf8"))["g1"]["mjcf"]
+    _m = os.path.expanduser(_m)        # registry 允许 ~/.cache/... 写法
     MJCF = _m if os.path.isabs(_m) else os.path.join(BASE06, _m)
 except Exception:
     MJCF = os.path.join(BASE06, "models", "g1_mjcf", "g1-mode_13_15.xml")

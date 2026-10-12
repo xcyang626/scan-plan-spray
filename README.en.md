@@ -23,7 +23,7 @@
 Two complete technical tracks for the same task — **automatic line-tracing / spraying on walls**:
 
 - **Humanoid track (Unitree G1)**: cabin point-cloud registration → spray station & stance planning → **dual-posture (stand + crouch)** constant-width zigzag trajectories with per-point IK → a web workstation → whole-body control execution, with the control policy based on NVIDIA **GEAR-SONIC** and one-switch sim/real modes (full-band spray verified on the physical G1).
-- **Robot-arm track (OpenArm v1, 7-DOF)**: zero calibration → simulation → real robot, pushed through three layers (MPC / reinforcement learning / ILC), cutting one 36-waypoint run from ~300 s down to **143.6 s** with zero e-stops.
+- **Robot-arm track (OpenArm v1, 7-DOF)**: zero calibration → simulation → real robot, pushed through three layers (MPC / reinforcement learning / ILC), cutting one 36-waypoint run from ≈300 s down to **143.6 s** with zero e-stops.
 
 The four modules are independent and each runs on its own. `g1-wall-spray` consumes exactly the output of `pointcloud-registration`, and its workspace computation inherits the method from `station-planning`.
 
@@ -51,7 +51,7 @@ This repository is an archival record of that work: every module keeps its runna
 | | Full-band spray on the physical G1 (2026-10-12, ×1.0, 155.6 s) | stand+crouch 0.35–1.45 m; zero mode-flapping while standing, gentle 0.13 m/s squat descent |
 | | Base-disturbance compensation (wrist error, world frame) | 32 mm → **4 mm** |
 | | Full planning pipeline (03 → packaging → final audit) | ≈ 33 s |
-| openarm-zigzag | Full-run duration (MPC baseline → RL+ILC) | ~300 s → **143.6 s**, zero e-stops |
+| openarm-zigzag | Full-run duration (MPC baseline → RL+ILC) | ≈300 s → **143.6 s**, zero e-stops |
 | | Tracking / run-to-run repeatability | mean 1.19° / RMS **0.04°** |
 | | Low-frequency sway suppression (0.5–2 Hz) | 3.8° → 0.7°; integrator peak down 2–5× |
 
@@ -149,7 +149,7 @@ A single-file Python web workstation (stdlib HTTP + embedded three.js 3D preview
 <img src="g1-wall-spray/media/fig_replay_contactsheet.png" width="49%"/>
 </p>
 
-MuJoCo replay (standing-only v5, 307 points; the current dual-posture stand+crouch flow is in the module README):
+MuJoCo replay (current V3 dual-posture motion — stand band, five-segment squat transition, crouch band; the same motion executed on the physical G1):
 
 <video src="g1-wall-spray/media/replay_motion.mp4" controls muted width="60%"></video>
 

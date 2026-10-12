@@ -1,7 +1,7 @@
 # 喷涂轨迹工作站 · 界面设计规范 (参考 Linear / Vercel / Stripe Dashboard / Grafana)
 
 所有值可直接落 CSS。核心原则: **少即多**——3 层表面灰阶建立纵深, 一个品牌色统领,
-动效只用于"状态变化"与"入场", 150~250ms, 统一缓动。
+动效只用于"状态变化"与"入场", 150–250ms, 统一缓动。
 
 ## 1. 色彩 Token
 
@@ -55,7 +55,7 @@ button{transition:transform .15s cubic-bezier(.2,.8,.2,1),box-shadow .15s,filter
 button:disabled{background:#1a2230;color:#5b6b7e;box-shadow:none;transform:none;cursor:not-allowed}
 ```
 
-## 5. 动画 (全部 150~250ms, 缓动 var(--ease))
+## 5. 动画 (全部 150–250ms, 缓动 var(--ease))
 
 ```css
 :root{--ease:cubic-bezier(.2,.8,.2,1)}
