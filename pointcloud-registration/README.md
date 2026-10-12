@@ -88,3 +88,4 @@ python make_sample_data.py --src /path/to/cabin_solution/点云.py
 本模块的输出（带语义标签的机器人视角点云）是 `../station-planning/`
 工位规划的输入抽象，也是 `../g1-wall-spray/` 中 `11_cloud_scan.py`
 墙面段提取所消费的地图格式——同一条数据链：扫描 → 配准 → 规划 → 执行。
+
