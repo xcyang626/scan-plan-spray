@@ -58,7 +58,8 @@ LEG_L = [
 ]
 
 PELVIS_STAND = (0.77, 0.79)   # 站姿骨盆
-PELVIS_CROUCH = (0.60, 0.70)  # 蹲姿骨盆(策略友好, 避免深蹲分布外)
+_CROUCH_LO = float(os.environ.get("G1W_CROUCH_LO", "0")) or 0.60
+PELVIS_CROUCH = (_CROUCH_LO, 0.70)  # 蹲姿骨盆地板(实测 height_sweep: 策略可稳到0.29, 缺省0.60保守)
 SOLE_TO_ANKLE = 0.038
 X_PLANES = (0.30, 0.34, 0.38)  # 腕平面: 离墙0.70/0.74/0.78m (腰锁定后0.90m物理不可达)
 PLANE_TOL = 0.03
@@ -212,7 +213,7 @@ def main():
     import matplotlib.pyplot as plt
 
     p2 = sample_crouch_pelvis()
-    crouch_lo = max(p2, 0.60)   # 策略友好下限, 避免深蹲
+    crouch_lo = max(p2, _CROUCH_LO)   # 实测地板(G1W_CROUCH_LO)与腿FK下限取大
     PELVIS_CROUCH = (crouch_lo, 0.70)
     print(f"[蹲姿采样范围] 骨盆 {PELVIS_CROUCH}; 站姿 {PELVIS_STAND}")
     print("[站位保证带] 腰锁定后 x_w∈[0.30,0.38] -> 离墙 d∈[0.70,0.78]m (标称0.74m)")

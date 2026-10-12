@@ -35,8 +35,15 @@ BRIDGE = os.path.join(BASE, "scripts", "exec", "groot_bridge.py")
 
 def _cfg(key, default):
     try:
-        return json.load(open(os.path.join(BASE, "station", "env.json"),
-                              encoding="utf8")).get(key, default)
+        _d = json.load(open(os.path.join(BASE, "station", "env.json"),
+                            encoding="utf8"))
+        try:      # 本机覆盖层(不入库), 与 10_station_app 同机制
+            _d.update(json.load(open(
+                os.path.join(BASE, "station", "env.local.json"),
+                encoding="utf8")))
+        except Exception:
+            pass
+        return _d.get(key, default)
     except Exception:
         return default
 

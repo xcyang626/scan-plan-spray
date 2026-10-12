@@ -3,13 +3,14 @@
 本工程（`g1_wall_spray`）同一套代码支持两种执行后端，通过一个配置项切换：
 
 ```jsonc
-// station/env.json
-"robot_mode": "real"   // 实机 G1（当前默认）
-"robot_mode": "sim"    // MuJoCo 仿真（备份见 backup/仿真版_20261008/）
+// station/env.local.json(本机覆盖层, 不入库; 复制自通用占位 station/env.json)
+"robot_mode": "real"   // 实机 G1（加载时覆盖 env.json 同名字段）
+"robot_mode": "sim"    // MuJoCo 仿真
 ```
 
-**仿真版备份位置**：`backup/仿真版_20261008/`
-（含完整工程包 `g1_wall_spray_station_仿真版.zip`、仿真执行端 `exec_仿真版/`、仿真配置 `env.json.仿真版`、备份说明）
+> `env.json` 只放通用占位（公开仓库脱敏）；本机解释器路径、`robot_iface`、
+> real 模式等机器相关配置全部放 `env.local.json`（.gitignore 已忽略），
+> 四处加载点（10_station_app / groot_bridge / groot_daemon / estop）同机制。
 
 ---
 
@@ -73,29 +74,46 @@ cd g1_wall_spray && ./启动工作站.sh     # 打开 http://127.0.0.1:8090
    --input-type zmq --output-type zmq --zmq-host <本机IP> --zmq-port 5556`
 - ZMQ 推流端（等待执行触发）
 
-### 3. 机器人侧终端操作（重要，需人工）
-部署进程的终端里：
-| 按键 | 作用 |
-|---|---|
-| `]` | 启动控制系统 |
-| `ENTER` | 切换到 ZMQ 流模式（开始跟踪我们发的动作） |
-| `O` | **急停**（随时准备按） |
-| `I` | 重置朝向 |
+### 3. 部署进程自动化（2026-10-12 起无需人工按键）
+网页「启动机器人」后自动完成（`AUTO_START_ROBOT`）：
+- 拉起 `g1_deploy_onnx_ref <iface> ... --input-type zmq --output-type zmq --zmq-host localhost --zmq-port 5556`
+- 经守护进程发 GR00T `command(start=True, planner=True)` —— 启动控制（机器人回
+  初始站姿）+ 进入 planner 模式，随后自动挂**保持流**（50Hz 保持实测姿态，防
+  planner 静默时 C++ 回退参考舞蹈动作）。
+- 手柄/键盘仍可随时介入（按键表见下），自动化失败时兜底手动：
+  `]` 启动控制、`ENTER` 切 ZMQ 流、`O` 急停、`X` 退出。
 
 ### 4. 走网页流程
 选点云 → 生成轨迹 → 检查无误 → 生成动作 → 「自动执行」→ 机器人按轨迹喷涂。
 
+## 四b、V2 双姿态（站+蹲）实机执行 —— 蹲姿通道（V2.1h 分段门控）
+
+站姿段沿用 v5 验证过的纯上肢 17 关节 planner 流（**height=-1、无模式字段**，
+与纯站姿动作完全同通道）；蹲姿段经守护进程自动切换：
+
+- **数据驱动识别**：动作 root_z 最低 <0.72 → 该动作启用高度通道；其后**逐帧
+  分段门控**——参考 z<0.70 的帧（蹲姿段/下蹲过渡）才在 planner 消息携带
+  `height`=期望骨盆高，模式按参考高度滞回切 IDEL_SQUAT(4)（<0.66 进 / ≥0.70 出）。
+  > 2026-10-12 首跑实测教训：早期实现高度通道全程开 + 外环负纠偏，与模式滞回
+  > 锁成极限环（IDLE↔SQUAT 横跳，机器人上下摇晃）——分段门控后站立段零翻转。
+- **骨盆闭环**（与仿真 runner --height 同口径，仅蹲姿段）：5557/g1_debug 实测
+  q29 → 腿部平面几何反解骨盆高（与 05.leg_ik_planar 同一套常数，互逆 1e-16）→
+  外环比例纠偏 K=1.8、±0.10、指令限幅 [0.28,0.85]；反馈丢失时纠偏缓慢归零
+- **站→蹲过渡（V2.2 五段时序）**：收臂(自适应限峰速) → 零位停顿 1.2s →
+  纯下蹲 5.9s（臂贴身 0.07 m/s）→ 蹲底停顿 1.5s → 蹲姿下伸出；结尾回位同律
+  ~6s。蹲姿段进/出场有 `height_seg` 事件可查。
+- **执行统计进页面日志**：骨盆最低 / |骨盆-参考|最大 / 上肢跟踪 err / 腕心高度
+  偏差 / 枪偏离法向（stream_done 事件自动打印）
+- 高度 blend：从实测高度平滑过渡到动作首帧参考（重跑时零瞬态）
+- 页面流程与仿真版完全一致，`robot_mode` 一个配置项切换后端
+
 ## 五、切回仿真版
 
 ```bash
-# 方式一：改配置（推荐）
-vim g1_wall_spray/station/env.json     # "robot_mode": "sim"
+vim g1_wall_spray/station/env.local.json     # "robot_mode": "sim"
 ./启动工作站.sh
-
-# 方式二：直接用备份包
-unzip backup/仿真版_20261008/g1_wall_spray_station_仿真版.zip -d /tmp/sim版
-cd /tmp/sim版/g1_wall_spray_station && ./启动工作站.sh
 ```
+（规划链与执行链其余部分两版完全共享，无需其他改动）
 
 
 ## 六、急停与安全操作（两级设计）

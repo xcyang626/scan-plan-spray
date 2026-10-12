@@ -50,8 +50,10 @@ GUN_LEN = 0.12            # 喷枪长度(腕心->喷嘴)
 ARM = "right"; YAW = 60
 
 # ---- 工作站配置注入 (10_station_app.py / 11_cloud_scan.py 产出; 缺省=舱室默认) ----
-# G1W_CFG json 可覆盖: d_robot, wall_x, floor_z, u0, stroke_u, h_top, pitch
+# G1W_CFG json 可覆盖: d_robot, wall_x, floor_z, u0, stroke_u, h_top, pitch, posture
 _cfgp = os.environ.get("G1W_CFG", "")
+_POSTURE = "stand"
+_CROUCH_TOP = None
 if _cfgp and os.path.exists(_cfgp):
     _c = json.load(open(_cfgp, encoding="utf8"))
     if "wall_x" not in _c:
@@ -68,8 +70,27 @@ if _cfgp and os.path.exists(_cfgp):
         H_TOP = float(_c["h_top"])
     if _c.get("pitch") is not None:
         PITCH = float(_c["pitch"])
+    _POSTURE = str(_c.get("posture", "stand"))
+    if _c.get("crouch_top"):
+        _CROUCH_TOP = float(_c["crouch_top"])
     print(f"[配置] 工作站配置已加载 {_cfgp}: d_robot={D_ROBOT}, wall_x={X_FACE}, "
-          f"stroke_u=({STROKE_U[0]:.3f},{STROKE_U[1]:.3f}), h_top={H_TOP}, pitch={PITCH}")
+          f"stroke_u=({STROKE_U[0]:.3f},{STROKE_U[1]:.3f}), h_top={H_TOP}, pitch={PITCH}, "
+          f"posture={_POSTURE}")
+
+# V2 双姿态(2026-10): 缺省 stand = v5 站姿单一模式, 行为零改动;
+# dual = 站姿先喷上半(0.55~H_TOP) -> 回零位过渡 -> 蹲姿喷下半(物理下限~0.45), 用户定稿顺序.
+# 环境变量 G1W_POSTURE 优先于 G1W_CFG 的 posture 键.
+POSTURE = os.environ.get("G1W_POSTURE", "") or _POSTURE
+if POSTURE not in ("stand", "dual"):
+    raise SystemExit(f"[配置] posture 只支持 stand/dual, 收到 {POSTURE!r}")
+# V2 蹲姿带上边界(用户定稿 2026-10-10: 0.55/0.65 两行归蹲姿, 站姿带只喷 0.75~H_TOP,
+# 减少姿态切换且站姿带底缘不再依赖极限俯仰档); None=自动(站姿最低可行行以下归蹲姿, 首版行为)
+CROUCH_TOP = float(os.environ.get("G1W_CROUCH_TOP", "0") or 0) or _CROUCH_TOP or None
+# V3 走线方向(用户定稿 2026-10-12): vertical=竖直列 —— 喷涂线平行于"机器人-墙面法向"
+# 的垂面(枪臂恒在该垂面内, 俯仰±30°, 60/70/80/90 离散角被认可, 横向分量恒0);
+# 横向只在列间跳转(kind=hop 非喷涂)。horizontal=旧水平行(回退用)。
+STROKE_DIR = (os.environ.get("G1W_STROKE_DIR", "horizontal") or "horizontal").strip().lower()
+COL_PITCH_MAX = 0.15        # 列距上限(喷幅横向覆盖)
 
 # 腕平面 x 越界检查(启动时): 02 工作区网格只覆盖三腕平面(0.30/0.34/0.38)保证带,
 # x=D_ROBOT-D_WRIST 超出 [0.30,0.38]±0.03 时网格可能不覆盖该平面, 打警告(不退出)
@@ -98,7 +119,15 @@ ARM_R = [
 ]
 CHAIN = WAIST + ARM_R
 JLO = np.array([j[3] for j in CHAIN]); JHI = np.array([j[4] for j in CHAIN])
-PELVIS_RANGE = {"stand": (0.77, 0.79)}          # 只保留站姿
+# V3 稳定性(2026-10-12 实测教训): 腰yaw URDF 全限位 ±150° 会让 IK 冗余解持续拧腰
+# (实测爬到 +150°, 躯干拧转把底座拖转 +130°, 落点/覆盖全毁). 工作区网格本按
+# ±30/60° 腰yaw档建立, 冗余该由手臂消化 —— 腰yaw硬限 ±35°(档位+裕量).
+_WYAW_MAX = np.deg2rad(float(os.environ.get("G1W_WAIST_YAW_MAX", "45")))
+JLO[0] = -_WYAW_MAX; JHI[0] = _WYAW_MAX
+PELVIS_RANGE = {"stand": (0.77, 0.79)}          # 站姿(默认, v5 口径)
+PELVIS_RANGE.update({                            # V2 双姿态增补:
+    "crouch": (float(os.environ.get("G1W_CROUCH_LO", "0")) or 0.60, 0.70),  # 蹲姿地板=02 同源(实测可稳到0.29)
+    "trans": (float(os.environ.get("G1W_CROUCH_LO", "0")) or 0.60, 0.79)})  # 站<->蹲过渡段(骨盆自由穿越)
 
 
 def rotx(a):
@@ -164,14 +193,20 @@ def fk_jac(q, pz):
 
 
 # ---------------- 批量 DLS IK ----------------
-def batch_ik(q0, pz0, p_star, d_star, mode, iters=500, pos_tol=0.004, ax_tol=0.03):
+def batch_ik(q0, pz0, p_star, d_star, mode, iters=500, pos_tol=0.004, ax_tol=0.03, pb=None):
     """阻尼最小二乘: 腕心->p_star, 枪轴->d_star. 变量 = q(10)+骨盆高(1).
     纯DLS(无零空间种子拉力: 拉力会在误差大时把解拖离目标并冻结).
+    pb=(N,2) 每点骨盆界限(V2 双姿态按点分 stand/crouch/trans); None=按 mode 标量界限(legacy).
     返回 (q, pz, pos_err, axis_err, converged)"""
     N = len(q0)
     X = np.column_stack([q0, pz0]).astype(float)
-    plo, phi = PELVIS_RANGE[mode]
-    lo = np.append(JLO, plo); hi = np.append(JHI, phi)
+    if pb is not None:
+        pba = np.asarray(pb, float)                     # (N,2) 每点骨盆下/上限
+        lo2 = np.column_stack([np.tile(JLO, (N, 1)), pba[:, 0:1]])   # (N,11)
+        hi2 = np.column_stack([np.tile(JHI, (N, 1)), pba[:, 1:2]])
+    else:
+        plo, phi = PELVIS_RANGE[mode]
+        lo1 = np.append(JLO, plo); hi1 = np.append(JHI, phi)
     lam = 0.08
     done = np.zeros(N, bool)
     for it in range(iters):
@@ -190,7 +225,10 @@ def batch_ik(q0, pz0, p_star, d_star, mode, iters=500, pos_tol=0.004, ax_tol=0.0
         A = JJt + (lam ** 2) * np.eye(6)[None]
         y = np.linalg.solve(A, e[..., None])[..., 0]        # (na,6)
         dq = np.einsum('nij,ni->nj', J, y)                  # J^T y = DLS 步
-        X[act] = np.clip(Xa + dq, lo[None, :], hi[None, :])
+        if pb is not None:
+            X[act] = np.clip(Xa + dq, lo2[act], hi2[act])
+        else:
+            X[act] = np.clip(Xa + dq, lo1[None, :], hi1[None, :])
         p_cur, ax_cur = fk_wrist(X[act, :10], X[act, 10])
         pe = np.linalg.norm(p_star[act] - p_cur, axis=1)
         ae = np.linalg.norm(d_star[act] - ax_cur, axis=1)
@@ -217,6 +255,7 @@ def main():
     ys_g, zs_g = ws["ys"], ws["zs"]
 
     # ---------------- 站姿单一模式: 网格与IK种子 ----------------
+    DUAL = POSTURE == "dual"
     g_perp = ws[f"{ARM}_stand_y{YAW}_perp"]          # 垂直指向(<=15°)保证区 (θ=90档)
     g_td = ws[f"{ARM}_stand_y{YAW}_tiltd"]           # 下倾(<=30°)可达 (dir=+1档)
     g_tu = ws[f"{ARM}_stand_y{YAW}_tiltu"]           # 上倾(<=30°)可达 (dir=-1档)
@@ -224,6 +263,17 @@ def main():
     esub = ws[f"{ARM}_stand_y{YAW}_endsub"].astype(float)
     tree_stand = cKDTree(esub[:, :3])
     tree_all = tree_stand                            # 兜底树(仅站姿, 与stand一致)
+    qsub_all = qsub
+    if DUAL:                                         # V2: 蹲姿网格与种子(02 已算好 *_crouch_* 键)
+        g_perp_c = ws[f"{ARM}_crouch_y{YAW}_perp"]
+        g_td_c = ws[f"{ARM}_crouch_y{YAW}_tiltd"]
+        g_tu_c = ws[f"{ARM}_crouch_y{YAW}_tiltu"]
+        qsub_c = ws[f"{ARM}_crouch_y{YAW}_qsub"].astype(float)
+        esub_c = ws[f"{ARM}_crouch_y{YAW}_endsub"].astype(float)
+        tree_all = cKDTree(np.vstack([esub[:, :3], esub_c[:, :3]]))
+        qsub_all = np.vstack([qsub, qsub_c])
+        print("[V2双姿态] 蹲姿网格/IK种子已加载(骨盆 0.60~0.70), 执行序: "
+              "站姿喷上半 -> 回零位过渡 -> 蹲姿喷下半")
 
     # 保证区(垂直) y 范围(站姿)
     yrows = np.where(g_perp.any(1))[0]
@@ -241,12 +291,37 @@ def main():
     if not hs_seq:
         raise RuntimeError(f"行高序列为空: 最低行 {H_MIN_ROW:.2f}m > 最高行 {H_TOP:.2f}m "
                            f"(H_MIN_SPRAY={H_MIN_SPRAY:.3f}, 请检查 Z_BOT/H_TOP 配置)")
+    _stand_all = list(hs_seq)                        # 未切分前的完整站姿行表
+    if DUAL and CROUCH_TOP:
+        hs_seq = [h for h in hs_seq if h > CROUCH_TOP + 1e-9]
+        if not hs_seq:
+            raise RuntimeError(f"crouch_top={CROUCH_TOP} 过高: 站姿带无剩余行")
+        moved = [f"{h:.2f}" for h in _stand_all if h <= CROUCH_TOP + 1e-9]
+        print(f"[V2双姿态] 蹲姿上边界 {CROUCH_TOP:.2f}m(用户定稿): 站姿带底缘 {moved} "
+              f"归入蹲姿带 -> 站姿 {min(hs_seq):.2f}~{H_TOP:.2f}m 共{len(hs_seq)}行")
+    zone_rows = ["stand"] * len(hs_seq)             # 执行序=高度升序(v5 口径)
+    H_MIN_SPRAY_MIN = H_MIN_SPRAY
+    Z_BOT_C = H_MIN_SPRAY_C = None
+    crouch_cands = []
+    if DUAL:
+        # V2: 蹲姿带下倾最低腕心 -> 理论可喷下限; 行候选=站姿最低行以下全部网格行,
+        # 真正保留哪些行由求解段的网格探测决定(理论下限只作参考口径)
+        td_cols_c = np.where(g_td_c.any(0))[0]
+        z_bot_c = float(zs_g[td_cols_c.min()]) if len(td_cols_c) else np.nan
+        Z_BOT_C = max(Z_MIN_ROBOT, z_bot_c)
+        H_MIN_SPRAY_C = Z_BOT_C - D_WRIST * np.tan(np.deg2rad(TILT_MAX))
+        crouch_cands = sorted(set(
+            [round(k * PITCH + PITCH / 2, 2) for k in range(1, k_min)]
+            + ([round(h, 2) for h in _stand_all if h <= CROUCH_TOP + 1e-9]
+               if CROUCH_TOP else [])))
+        print(f"[V2双姿态] 蹲姿下倾最低腕心z={z_bot_c:.3f} -> 理论可喷下限 {H_MIN_SPRAY_C:.3f}m "
+              f"(=Z_BOT_C {Z_BOT_C:.3f} - 0.40*tan30°); 行候选 {crouch_cands}(以网格探测为准)")
     print(f"[保证区] 站姿 y[{Y_LO:+.2f},{Y_HI:+.2f}], 下倾(<=30°)最低腕心z={z_bot_grid:.3f} "
           f"-> Z_BOT={Z_BOT:.3f}")
-    print(f"[喷涂质量] 末端指向与墙面夹角须>=60°(倾角<=30°): 可喷下限 h>={H_MIN_SPRAY:.3f}m "
+    print(f"[喷涂质量] 末端指向与墙面夹角须>=60°(倾角<=30°): 站姿可喷下限 h>={H_MIN_SPRAY:.3f}m "
           f"(= Z_BOT {Z_BOT:.3f} - 0.40*tan30°)")
-    print(f"[行高] 最低行 H_MIN_ROW={H_MIN_ROW:.2f}m (=可喷下限向上取到 k*{PITCH}+{PITCH/2} 网格), "
-          f"最高行 {H_TOP:.2f}m, 行距 {PITCH}m, 共 {len(hs_seq)} 行: "
+    print(f"[行高] 站姿最低行 H_MIN_ROW={H_MIN_ROW:.2f}m (=可喷下限向上取到 k*{PITCH}+{PITCH/2} 网格), "
+          f"最高行 {H_TOP:.2f}m, 行距 {PITCH}m, 站姿带 {len(hs_seq)} 行: "
           + " ".join(f"{h:.2f}" for h in hs_seq))
 
     # 机器人横向站位: 工作区中心对准喷涂带中心
@@ -261,7 +336,11 @@ def main():
     #   dir=-1 腕在下方(枪上倾,tiltu网格); θ=90 时 z_w=h(perp网格); 指向纯俯仰。
     ANG_OPTS = [(90, +1), (80, +1), (80, -1), (70, +1), (70, -1), (60, +1), (60, -1)]
 
-    def grid_for(theta, dirn):
+    def grid_for(theta, dirn, zmode="stand"):
+        if zmode == "crouch":                       # V2: 蹲姿网格
+            if theta == 90:
+                return g_perp_c
+            return g_td_c if dirn > 0 else g_tu_c
         if theta == 90:
             return g_perp
         return g_td if dirn > 0 else g_tu
@@ -279,72 +358,198 @@ def main():
         iz = int(np.round((z_val - zs_g[0]) / (zs_g[1] - zs_g[0])))
         return int(np.clip(iz, 0, len(zs_g) - 1))
 
-    def seg_feasible(h, theta, dirn, a, b):
+    def seg_feasible(h, theta, dirn, a, b, zmode="stand"):
         """水平线段 y_r=u-u_robot (u∈[a,b] 步0.01) 的每个 (y_r,z_w) 都落在对应网格内?"""
         us = np.arange(a, b + 1e-9, 0.01)
-        g = grid_for(theta, dirn)
+        g = grid_for(theta, dirn, zmode)
         iy = iy_arr(us - u_robot)
         if (iy < 0).any() or (iy >= len(ys_g)).any():
             return False                       # 网格外直接不可行(不夹边缘格)
         return bool(g[iy, iz_of(zw_of(h, theta, dirn))].all())
 
     U_C = 0.5 * (STROKE_U[0] + STROKE_U[1])             # 统一区间中心(默认(0.005,0.715)->0.36)
-    W = 0.70
-    while True:
-        raw_lo = max(STROKE_U[0], U_C - W / 2)          # 区间clip到[0.005,0.715]
-        raw_hi = min(STROKE_U[1], U_C + W / 2)
-        u_lo, u_hi = raw_lo + 0.02, raw_hi - 0.02       # 两端各内收0.02m
-        feas = []                                       # 每行可行(θ,dir)列表(ANG_OPTS已θ降序)
-        ok = True
-        for h in hs_seq:
-            opts = [(t, d) for t, d in ANG_OPTS if seg_feasible(h, t, d, u_lo, u_hi)]
-            if not opts:
-                ok = False
-                break
-            feas.append(opts)
-        assign = None
-        if ok:
-            # 叠层单调(用户定稿): z_w 随行高严格递增(数值保护间隔0.005m), θ尽量大 -> 回溯分配
-            n_r = len(feas)
-            assign = [None] * n_r
 
-            def bt(i, z_prev):
-                if i == n_r:
-                    return True
-                for theta, dirn in feas[i]:
-                    z = zw_of(hs_seq[i], theta, dirn)
-                    if z > z_prev + 0.005 - 1e-9:
-                        assign[i] = (theta, dirn)
-                        if bt(i + 1, z):
-                            return True
-                        assign[i] = None
-                return False
-
-            if bt(0, -9.9):
-                break
+    def solve_band(rows_h, zmode, tag, fixed=None):
+        """单姿态带等宽求解: 带内统一u区间(中心U_C, clip到STROKE_U, 两端内收0.02m),
+        z_w 随行高严格递增(数值保护间隔0.005m), 行角θ取可行最大档(回溯).
+        V2: 蹲姿带以站姿带区间为准(fixed) —— 两带带宽不一致墙面覆盖对不齐(用户定稿),
+        站姿带是窄的一方, 对齐只收窄蹲姿带. 返回 (W, u_lo, u_hi, assign)."""
+        W = 0.70
+        while True:
+            if fixed is not None:
+                ulo, uhi = fixed[0], fixed[1]
+            else:
+                raw_lo = max(STROKE_U[0], U_C - W / 2)  # 区间clip到[0.005,0.715]
+                raw_hi = min(STROKE_U[1], U_C + W / 2)
+                ulo, uhi = raw_lo + 0.04, raw_hi - 0.04  # 两端各内收0.04m(腰yaw限位后极缘点需更多余量)
+            feas = []                                   # 每行可行(θ,dir)列表(ANG_OPTS已θ降序)
+            ok = True
+            for h in rows_h:
+                opts = [(t, d) for t, d in ANG_OPTS if seg_feasible(h, t, d, ulo, uhi, zmode)]
+                if not opts:
+                    ok = False
+                    break
+                feas.append(opts)
             assign = None
-        W -= 0.01
-        if W < 0.05:
-            for i, h in enumerate(hs_seq):
-                opts = [(t, d, round(zw_of(h, t, d), 3)) for t, d in ANG_OPTS
-                        if seg_feasible(h, t, d, max(STROKE_U[0], U_C - 0.1),
-                                        min(STROKE_U[1], U_C + 0.1))]
-                print(f"[诊断] h={h:.2f} 可行档(W~0.2): {opts}")
-            raise RuntimeError("等宽联合求解失败: 无W使每行存在可行(θ,dir)且z_w严格递增!")
-    W = round(W, 2)                                     # 消除递减累加的浮点噪声
-    u_lo, u_hi = round(u_lo, 3), round(u_hi, 3)
+            if ok:
+                # 叠层单调(用户定稿): 带内 z_w 随行高严格递增, θ尽量大 -> 回溯分配
+                n_r = len(feas)
+                assign = [None] * n_r
+
+                def bt(i, z_prev):
+                    if i == n_r:
+                        return True
+                    for theta, dirn in feas[i]:
+                        z = zw_of(rows_h[i], theta, dirn)
+                        # 竖直列模式不要求 z_w 递增: 那是水平行叠层防碰的约束; 列内
+                        # 沿高度连续扫过整段, 顶段上仰时腕心自然回落(wrist上限), 无害
+                        if i == 0 or STROKE_DIR == "vertical" \
+                                or z > z_prev + 0.005 - 1e-9:
+                            assign[i] = (theta, dirn)
+                            if bt(i + 1, z):
+                                return True
+                            assign[i] = None
+                    return False
+
+                if bt(0, -9.9):
+                    break
+                assign = None
+            if fixed is not None:
+                for h in rows_h:
+                    opts = [(t, d, round(zw_of(h, t, d), 3)) for t, d in ANG_OPTS
+                            if seg_feasible(h, t, d, max(STROKE_U[0], U_C - 0.1),
+                                            min(STROKE_U[1], U_C + 0.1), zmode)]
+                    print(f"[诊断] h={h:.2f}({zmode}) 可行档(W~0.2): {opts}")
+                raise RuntimeError(f"等宽求解失败({tag}): 固定区间[{fixed[0]:.3f},{fixed[1]:.3f}]"
+                                   f"下存在无可行(θ,dir)或z_w不递增的行!")
+            W -= 0.01
+            if W < 0.05:
+                for h in rows_h:
+                    opts = [(t, d, round(zw_of(h, t, d), 3)) for t, d in ANG_OPTS
+                            if seg_feasible(h, t, d, max(STROKE_U[0], U_C - 0.1),
+                                            min(STROKE_U[1], U_C + 0.1), zmode)]
+                    print(f"[诊断] h={h:.2f}({zmode}) 可行档(W~0.2): {opts}")
+                raise RuntimeError(f"等宽联合求解失败({tag}): "
+                                   f"无W使每行存在可行(θ,dir)且z_w严格递增!")
+        return round(uhi - ulo + 0.04, 2), round(ulo, 3), round(uhi, 3), list(assign)
+
+    if STROKE_DIR == "vertical":
+        # V3 竖直列: 阶梯加密 0.05m; 站姿底从 0.70 起探(低端不可行逐档抬高),
+        # 蹲姿顶=站姿底+2cm(两带重叠防水平漏带: 列内连续, 带间是水平缝必须重叠)
+        PV = 0.05
+        _a = max(STROKE_U[0], U_C - 0.1); _b = min(STROKE_U[1], U_C + 0.1)
+        def _probe(h, zm):
+            return any(seg_feasible(h, t, d, _a, _b, zm) for t, d in ANG_OPTS)
+        _vs = [round(float(h), 2) for h in np.arange(0.70, H_TOP + 1e-9, PV)]
+        while _vs and not _probe(_vs[0], "stand"):
+            _vs.pop(0)
+        hs_seq = _vs
+        zone_rows = ["stand"] * len(hs_seq)
+        if DUAL:
+            _ct = round(hs_seq[0] + 0.06, 2)
+            _vc = [round(float(h), 2) for h in np.arange(0.25, _ct + 1e-9, PV)]
+            while _vc and not _probe(_vc[-1], "crouch"):
+                _vc.pop()
+            crouch_cands = _vc
+        print(f"[V3竖直列] 阶梯pitch {PV}m: 站姿 {hs_seq[0]:.2f}~{hs_seq[-1]:.2f}"
+              + (f" / 蹲姿 {crouch_cands[0]:.2f}~{crouch_cands[-1]:.2f}"
+                 f"(带重叠 {crouch_cands[-1] - hs_seq[0]:.2f}m 防漏带)" if DUAL else ""))
+    W, u_lo, u_hi, assign_s = solve_band(hs_seq, "stand", "站姿带")
     row_params = []
-    for h, (theta, dirn) in zip(hs_seq, assign):
+    for h, (theta, dirn) in zip(hs_seq, assign_s):
         row_params.append(dict(h=float(h), z_w=float(zw_of(h, theta, dirn)),
-                               angle_deg=int(theta), dir=int(dirn)))
-    assert all(b["z_w"] - a["z_w"] >= 0.005 - 1e-6
-               for a, b in zip(row_params, row_params[1:])), "z_w 未严格递增!"
-    print(f"[联合求解] 统一宽度 W={W:.2f}m (中心u_c={U_C}, clip{STROKE_U}, 两端内收0.02m) "
-          f"-> 统一区间 [{u_lo:.3f},{u_hi:.3f}] (宽 {u_hi - u_lo:.3f}m, 所有行相同; z_w叠层严格递增)")
+                               angle_deg=int(theta), dir=int(dirn), zone="stand",
+                               u_lo=u_lo, u_hi=u_hi))
+    u_lo_c = u_hi_c = None
+    if DUAL:
+        # V2(用户定稿): 蹲姿带行候选按站姿区间探测, 直接取站姿区间对齐求解
+        # (带宽不一致墙面覆盖对不齐; 蹲姿网格更宽, 对齐只收窄蹲姿带, 站姿带不变)
+        hs_crouch = [h for h in crouch_cands
+                     if any(seg_feasible(h, t, d, u_lo, u_hi, "crouch") for t, d in ANG_OPTS)]
+        if not hs_crouch:
+            raise RuntimeError(f"V2双姿态: 蹲姿网格在站姿区间[{u_lo:.3f},{u_hi:.3f}]下无可行行, "
+                               "请检查 02 蹲姿工作区/站位配置")
+        Wc, u_lo_c, u_hi_c, assign_c = solve_band(hs_crouch, "crouch", "蹲姿带", fixed=(u_lo, u_hi))
+        for h, (theta, dirn) in zip(hs_crouch, assign_c):
+            row_params.append(dict(h=float(h), z_w=float(zw_of(h, theta, dirn)),
+                                   angle_deg=int(theta), dir=int(dirn), zone="crouch",
+                                   u_lo=u_lo_c, u_hi=u_hi_c))
+        # ---- 底部延伸带(2026-10-12 用户: "骨盆都到0.35了怎么还喷不到下面") ----
+        # 直接 IK 探测表明 60°下倾 + 骨盆0.30 时落点可到 ~0.10m; 旧蹲姿网格的
+        # 下倾腕心下限(Z_BOT_C~0.58)把行地板保守卡在0.35. 延伸行绕开网格、
+        # 逐行 IK 探宽(底部两侧不可达 -> 延伸行比主带窄, 主带结构不动).
+        _EXT_FLOOR = float(os.environ.get("G1W_EXT_FLOOR", "0.35"))  # 默认关(=蹲姿地板): 弯腰延伸行有分支翻转, 用户定稿先不喷最下面
+        if _EXT_FLOOR < min(hs_crouch) - 1e-9:
+            _pz_ext = 0.30                       # 延伸行骨盆(策略 height_cmd 下限带内)
+            from scipy.spatial import cKDTree as _cKDTree
+            _ws_npz = np.load(os.environ.get("G1W_WS", os.path.join(IN, "g1_workspace.npz")),
+                              allow_pickle=True)
+            _qsub_ext = np.vstack([_ws_npz[f"right_{_m}_y60_qsub"].astype(float)
+                                   for _m in ("stand", "crouch")])
+            _tree_ext = _cKDTree(np.vstack([
+                _ws_npz[f"right_{_m}_y60_endsub"].astype(float)[:, :3]
+                for _m in ("stand", "crouch")]))
+            # 延伸行骨盆 0.30 < G1W_CROUCH_LO: 放宽蹲姿带下界(点级 pb 用)
+            PELVIS_RANGE["crouch"] = (min(0.30, PELVIS_RANGE["crouch"][0]),
+                                      PELVIS_RANGE["crouch"][1])
+            _ext_rows = []
+            for _h in np.arange(_EXT_FLOOR, min(hs_crouch) - 1e-9, PITCH):
+                _h = round(float(_h), 2)
+                _zw = _h + D_WRIST * np.tan(np.deg2rad(TILT_MAX))   # 60°下倾
+                _got = None
+                for _W in (0.40, 0.35, 0.30, 0.25, 0.20, 0.15):     # 先宽后窄
+                    if _got is not None:
+                        break
+                    _a = max(STROKE_U[0], U_C - _W / 2) + 0.02   # 与主带同款两端内收
+                    _b = min(STROKE_U[1], U_C + _W / 2) - 0.02
+                    if _b - _a < _W - 0.05:
+                        continue
+                    _us = np.arange(_a, _b + 1e-9, 0.02)
+                    _ps = np.column_stack([np.full(len(_us), D_ROBOT - D_WRIST),
+                                           _us - u_robot, np.full(len(_us), _zw)])
+                    _d = np.tile(np.array([np.cos(np.deg2rad(-TILT_MAX)), 0.0,
+                                           np.sin(np.deg2rad(-TILT_MAX))]),
+                                 (len(_us), 1))
+                    _j = _tree_ext.query(_ps)[1]
+                    _sq = np.vstack([_qsub_ext[_k][:10] for _k in _j])
+                    for _pz in (0.30, 0.35, 0.40, 0.45, 0.50, 0.55,
+                                0.60):                        # 逐行试骨盆档(弯腰档:骨盆可高)
+                        _pb = np.column_stack([np.full(len(_us), _pz - 0.012),
+                                               np.full(len(_us), _pz + 0.012)])
+                        _, _, _, _, _cv = batch_ik(_sq.copy(), np.full(len(_us), _pz),
+                                                   _ps, _d, "stand", iters=600, pb=_pb)
+                        if _cv.all():
+                            _got = dict(h=_h, z_w=float(_zw), angle_deg=60, dir=1,
+                                        zone="crouch", u_lo=round(_a, 3),
+                                        u_hi=round(_b, 3), pz=_pz)
+                            break
+                if _got is not None:
+                    _got["pz_band"] = (_got["pz"] - 0.05, _got["pz"] + 0.05)
+                    _ext_rows.append(_got)
+            if _ext_rows:
+                print(f"[底部延伸] {len(_ext_rows)} 行 " +
+                      " ".join(f"{r['h']:.2f}(宽{r['u_hi']-r['u_lo']:.2f})"
+                               for r in _ext_rows))
+                # 插到蹲姿行之前(z_w 升序执行: 深蹲先喷最底, 沿伸行上行接主带)
+                _n_st = sum(1 for r in row_params if r["zone"] == "stand")
+                row_params[_n_st:_n_st] = _ext_rows
+                hs_crouch = [r["h"] for r in _ext_rows] + hs_crouch
+        hs_seq = hs_seq + hs_crouch
+        zone_rows = zone_rows + ["crouch"] * len(hs_crouch)
+        H_MIN_SPRAY_MIN = min(H_MIN_SPRAY, H_MIN_SPRAY_C)
+        print(f"[联合求解·蹲姿带] 与站姿带同区间[{u_lo_c:.3f},{u_hi_c:.3f}](两带对齐, 用户定稿); "
+              f"蹲姿行 " + " ".join(f"{h:.2f}" for h in hs_crouch))
+    if STROKE_DIR != "vertical":
+        assert all(b["z_w"] - a["z_w"] >= 0.005 - 1e-6
+                   for a, b in zip(row_params, row_params[1:])
+                   if b["zone"] == a["zone"]), \
+            "同姿态带内 z_w 未严格递增!"
+    print(f"[联合求解·站姿带] 统一宽度 W={W:.2f}m (中心u_c={U_C}, clip{STROKE_U}, 两端内收0.02m) "
+          f"-> 统一区间 [{u_lo:.3f},{u_hi:.3f}] (宽 {u_hi - u_lo:.3f}m; z_w叠层严格递增)")
     for rp in row_params:
         tag = "垂直" if rp["angle_deg"] == 90 else ("枪下倾" if rp["dir"] > 0 else "枪上倾")
-        print(f"[行参数] h={rp['h']:.2f}m z_w={rp['z_w']:.3f}m θ={rp['angle_deg']:2d}° "
-              f"dir={rp['dir']:+d} ({tag})")
+        print(f"[行参数] h={rp['h']:.2f}m({rp['zone'][0]}) z_w={rp['z_w']:.3f}m "
+              f"θ={rp['angle_deg']:2d}° dir={rp['dir']:+d} ({tag}) u[{rp['u_lo']:.3f},{rp['u_hi']:.3f}]")
 
     # ---------------- 障碍物(红色穿越区) ----------------
     # 点云模式: cfg 提供障碍(window 开口 + 凸出物箱) -> 覆盖舱内硬编码几何
@@ -425,31 +630,114 @@ def main():
     def n_samples(a, b):
         return max(2, int(np.ceil(abs(b - a) / POINT_SPACING)) + 1)
 
-    rows = []      # (u, h, kind, cls, y_r, z_r, phi)  phi=带符号俯仰角(rad), 纯俯仰指向
-    for r, rp in enumerate(row_params):
-        h, zw, theta, dirn = rp["h"], rp["z_w"], rp["angle_deg"], rp["dir"]
-        phi = -dirn * np.deg2rad(90.0 - theta)          # 行常数: 指向与墙面法向的带符号俯仰角
-        u_a, u_b = (u_lo, u_hi) if r % 2 == 0 else (u_hi, u_lo)   # 行方向交替
-        us = np.linspace(u_a, u_b, n_samples(u_a, u_b))
-        if r > 0:                                       # 行端竖直U型连接段
-            rp0 = row_params[r - 1]
-            phi0 = -rp0["dir"] * np.deg2rad(90.0 - rp0["angle_deg"])
-            uc = us[0]                                  # = 上一行u_b: 行端常数
-            y_rc = uc - u_robot
-            hh = np.linspace(rp0["h"], h, n_samples(rp0["h"], h))[1:]
-            for k, hq in enumerate(hh):
-                t = (k + 1) / len(hh)
-                rows.append((float(uc), float(hq), "connector",
-                             "yellow",                 # 连接段强制标黄: 不做障碍红判定,
-                             y_rc,                     # 下游按非喷涂段处理(角度规范豁免)
-                             rp0["z_w"] + (zw - rp0["z_w"]) * t,     # z_w 线性
-                             phi0 + (phi - phi0) * t))               # 俯仰角线性插值
-        for u in us:                                    # 行内水平走线点
-            rows.append((float(u), h, "stroke",
-                         "red" if in_obstacle(u, h) else "green",
-                         u - u_robot, zw, phi))
-    print(f"[之字形] {len(hs_seq)} 行 统一u区间[{u_lo:.3f},{u_hi:.3f}], "
-          f"行方向交替(低→高), 行端竖直U型连接, 腕心行内水平(z_w行常数)")
+    rows = []      # (u, h, kind, cls, y_r, z_r, phi, zone)  phi=带符号俯仰角(rad), 纯俯仰指向
+    u_prev_end = None                                 # 上一行末端u(V2接缝过渡的u线性起点)
+    if STROKE_DIR == "vertical":
+        # V3 竖直列(用户定稿 2026-10-12): 喷涂线=竖直线, 平行于"机器人-墙面法向"垂面;
+        # 枪臂恒在该垂面内(纯俯仰φ, 横向分量=0), 60/70/80/90 档沿高度阶梯取角并插值;
+        # 横向只在列间跳转(kind=hop, 非喷涂黄段); 列距<=0.15m(喷幅横向覆盖)。
+        _lad = {(rp["zone"], round(rp["h"], 2)): rp for rp in row_params}
+
+        def lad_at(zn_, h_):
+            """阶梯插值: 返回该高度处的 (phi, z_w) —— 相邻档线性, 横向分量恒0."""
+            _hs = sorted(k[1] for k in _lad if k[0] == zn_)
+            h_ = float(np.clip(h_, _hs[0], _hs[-1]))
+            i = int(np.clip(np.searchsorted(_hs, h_), 1, len(_hs) - 1))
+            h0, h1 = _hs[i - 1], _hs[i]
+            t = 0.0 if h1 == h0 else (h_ - h0) / (h1 - h0)
+            a0, a1 = _lad[(zn_, h0)], _lad[(zn_, h1)]
+            f0 = -a0["dir"] * np.deg2rad(90.0 - a0["angle_deg"])
+            f1 = -a1["dir"] * np.deg2rad(90.0 - a1["angle_deg"])
+            return f0 + (f1 - f0) * t, a0["z_w"] + (a1["z_w"] - a0["z_w"]) * t
+
+        _full_lo, _full_hi = u_lo - 0.02, u_hi + 0.02
+        _K = max(2, int(np.ceil((_full_hi - _full_lo) / COL_PITCH_MAX)))
+        _pc = (_full_hi - _full_lo) / _K
+        cols_u = [round(_full_lo + _pc * (k + 0.5), 3) for k in range(_K)]
+        zones_seq = ["stand"] + (["crouch"] if DUAL else [])
+        for _zi, _zn in enumerate(zones_seq):
+            _band = [rp for rp in row_params if rp["zone"] == _zn]
+            _h_lo = min(rp["h"] for rp in _band)
+            _h_hi = max(rp["h"] for rp in _band)
+            for _k, _cu in enumerate(cols_u):
+                _up = (_k % 2 == 0)
+                _ha, _hb = (_h_lo, _h_hi) if _up else (_h_hi, _h_lo)
+                if rows:                            # 列间跳转(非喷涂): 上一列末端 -> 本列首端
+                    # hop 高度=本列起点高度(_ha): 与上一列末端同高(zigzag 交替保证),
+                    # 修 bug: 旧代码误用终点高度 _hb, hop 与列首之间凭空多出整段竖直瞬移
+                    _pu, _ph = rows[-1][0], rows[-1][1]
+                    _ph_t = _ha
+                    for _uq in np.linspace(_pu, _cu, n_samples(_pu, _cu))[1:-1]:
+                        _fq, _zw = lad_at(_zn, _ph_t)
+                        rows.append((float(_uq), float(_ph_t), "hop", "yellow",
+                                     float(_uq) - u_robot, _zw, _fq, _zn))
+                for _hq in np.linspace(_ha, _hb, n_samples(_ha, _hb)):
+                    _hq = float(_hq)
+                    _fq, _zw = lad_at(_zn, _hq)
+                    rows.append((_cu, _hq, "stroke",
+                                 "red" if in_obstacle(_cu, _hq) else "green",
+                                 _cu - u_robot, _zw, _fq, _zn))
+            if _zi == 0 and DUAL and rows:
+                # 姿态翻转过渡(kind=transition): 05 在 zone 翻转处整段替换为回零位过渡
+                _pu, _ph = rows[-1][0], rows[-1][1]
+                _zn2 = zones_seq[1]
+                _b2 = [rp for rp in row_params if rp["zone"] == _zn2]
+                _h2 = min(rp["h"] for rp in _b2)    # 蹲姿第一列(k=0)自底起
+                for _t, (_uq, _hq) in enumerate(zip(
+                        np.linspace(_pu, cols_u[0], 12), np.linspace(_ph, _h2, 12))):
+                    _zq = "stand" if 2 * (_t + 1) <= 12 else "crouch"
+                    # 站/蹲阶梯值连续混合(w=smoothstep): 避免硬切换造成 zw/φ 阶跃
+                    _w = (_t + 1) / 12.0
+                    _w = _w * _w * (3.0 - 2.0 * _w)
+                    _fs, _zs = lad_at("stand", float(_hq))
+                    _fc, _zc = lad_at("crouch", float(_hq))
+                    _fq = _fs + (_fc - _fs) * _w
+                    _zw = _zs + (_zc - _zs) * _w
+                    rows.append((float(_uq), float(_hq), "transition", "yellow",
+                                 float(_uq) - u_robot, _zw, _fq, _zq))
+        print(f"[V3竖直列] {_K} 列 u={['%.3f' % c for c in cols_u]} 列距{_pc:.3f}m; "
+              f"带序 {'->'.join(zones_seq)}; 列内竖直走线+列间hop(非喷涂)"
+              + ("; 带间回零位过渡(transition)" if DUAL else ""))
+    else:
+        for r, rp in enumerate(row_params):
+            h, zw, theta, dirn = rp["h"], rp["z_w"], rp["angle_deg"], rp["dir"]
+            phi = -dirn * np.deg2rad(90.0 - theta)          # 行常数: 指向与墙面法向的带符号俯仰角
+            u_a, u_b = (rp["u_lo"], rp["u_hi"]) if r % 2 == 0 else (rp["u_hi"], rp["u_lo"])
+            us = np.linspace(u_a, u_b, n_samples(u_a, u_b))
+            if r > 0:                                       # 行端竖直U型连接段
+                rp0 = row_params[r - 1]
+                phi0 = -rp0["dir"] * np.deg2rad(90.0 - rp0["angle_deg"])
+                uc = us[0]                                  # = 上一行u_b: 行端常数
+                y_rc = uc - u_robot
+                hh = np.linspace(rp0["h"], h, n_samples(rp0["h"], h))[1:]
+                seam = rp["zone"] != rp0["zone"]            # V2 姿态接缝(stand->crouch)
+                for k, hq in enumerate(hh):
+                    t = (k + 1) / len(hh)
+                    # V2 接缝段 kind="transition": 05 在 zone 翻转处整段替换为"收臂->零位停顿
+                    # ->伸出+下蹲"回零位过渡(用户定稿); 两带u区间不同 -> u也线性过渡;
+                    # zone 上半 stand/下半 crouch 供翻转检测, IK 骨盆界限取 trans(0.60~0.79)
+                    zq = "stand" if 2 * (k + 1) <= len(hh) else "crouch"
+                    uq = (float(u_prev_end + (uc - u_prev_end) * t) if seam else float(uc))
+                    rows.append((uq, float(hq), "transition" if seam else "connector",
+                                 "yellow",                 # 连接/过渡段强制标黄: 不做障碍红判定,
+                                 uq - u_robot,             # 下游按非喷涂段处理(角度规范豁免)
+                                 rp0["z_w"] + (zw - rp0["z_w"]) * t,     # z_w 线性
+                                 phi0 + (phi - phi0) * t,               # 俯仰角线性插值
+                                 (zq if seam else rp["zone"])))
+            for u in us:                                    # 行内水平走线点
+                rows.append((float(u), h, "stroke",
+                             "red" if in_obstacle(u, h) else "green",
+                             u - u_robot, zw, phi, rp["zone"]))
+            u_prev_end = float(us[-1])
+    print(f"[之字形] {len(hs_seq)} 行, 站姿带u区间[{u_lo:.3f},{u_hi:.3f}]"
+          + (f", 蹲姿带u区间[{u_lo_c:.3f},{u_hi_c:.3f}](两带各自等宽, 共用中心)"
+             if DUAL else "(统一u区间)")
+          + ", 行方向交替, 行端竖直U型连接, 腕心行内水平(z_w行常数)"
+          + (f"; V2执行序: 站姿带{row_params[0]['h']:.2f}~"
+             f"{max(rp['h'] for rp in row_params if rp['zone'] == 'stand'):.2f}m -> "
+             f"回零位过渡 -> 蹲姿带"
+             f"{min(rp['h'] for rp in row_params if rp['zone'] == 'crouch'):.2f}~"
+             f"{max(rp['h'] for rp in row_params if rp['zone'] == 'crouch'):.2f}m" if DUAL else ""))
 
     u_w = np.array([r_[0] for r_ in rows])
     h_w = np.array([r_[1] for r_ in rows])
@@ -458,7 +746,14 @@ def main():
     y_r = np.array([r_[4] for r_ in rows])
     z_r = np.array([r_[5] for r_ in rows])
     phi_w = np.array([r_[6] for r_ in rows])
-    zone_w = np.array(["stand"] * len(u_w))        # 所有点站姿
+    zone_w = np.array([r_[7] for r_ in rows])
+    # V2 每点骨盆界限: 过渡段 trans(自由穿越), 其余按 zone; stand 模式 None(走 mode 标量, legacy)
+    _EXT_PZ = {round(r["h"], 2): r["pz_band"] for r in row_params if "pz_band" in r}
+    pt_pb = (np.array([
+        PELVIS_RANGE["trans"] if k == "transition" else
+        (_EXT_PZ.get(round(float(h), 2), PELVIS_RANGE[z])
+         if (z == "crouch" and "pz_band" in {} or True) else PELVIS_RANGE[z])
+        for k, z, h in zip(kind_w, zone_w, h_w)], float) if DUAL else None)
 
     # ---------------- 机器人轨迹映射: 腕心位置 + 纯俯仰指向 ----------------
     # x: 腕平面 x_w = D_ROBOT - D_WRIST; 指向 d = (cosφ, 0, sinφ): 左右分量恒=0
@@ -509,14 +804,17 @@ def main():
     prev_q, prev_pz, n_anchor_ok = None, None, 0
     for r, i in enumerate(anchor_idx):
         # 种子分梯队批量并行: 一梯队(NN+热种子, 小iters快收敛) -> 二梯队(MC+噪声, 大iters)
-        q_nn = nn_ik(p_star_rel[i], d_star[i])          # NN-IK 提速插槽(未部署→None)
+        # NN-IK 条件输入(V2 通用大模型): 骨盆=该点姿态带中点, 腰限=当前档位
+        q_nn = nn_ik(p_star_rel[i], d_star[i],
+                     pelvis=(float(pt_pb[i].mean()) if DUAL else 0.78),
+                     rp=(_WRP if _WRP > 0 else 0.0872665))
         t1, t2 = [], []
         if q_nn is not None:
             t1.append((np.asarray(q_nn, float), 0.78))
         if prev_q is not None:
             t1.append((prev_q.copy(), prev_pz))
-        t2.append((qsub[j_mc[r, 0]][:10].astype(float).copy(),
-                   float(qsub[j_mc[r, 0]][10])))
+        t2.append((qsub_all[j_mc[r, 0]][:10].astype(float).copy(),
+                   float(qsub_all[j_mc[r, 0]][10])))
         if prev_q is not None:
             t2.append((prev_q + rng_a.uniform(-0.15, 0.15, 10), prev_pz))
         best = None
@@ -528,7 +826,9 @@ def main():
             qf, pf, e1, e2, cv = batch_ik(qs.copy(), pzs,
                                           np.repeat(p_star_rel[i:i + 1], len(tier), 0),
                                           np.repeat(d_star[i:i + 1], len(tier), 0),
-                                          "stand", iters=it)
+                                          "stand", iters=it,
+                                          pb=(np.repeat(pt_pb[i][None], len(tier), 0)
+                                              if DUAL else None))
             for k in np.where(cv)[0]:
                 jump = float(np.abs(qf[k] - prev_q).max()) if prev_q is not None else 0.0
                 if best is None or jump < best[0]:
@@ -574,7 +874,8 @@ def main():
         if not len(idx):
             break
         qf, pf, e1, e2, cv = batch_ik(q_ik[idx], pz_ik[idx], p_star_rel[idx], d_star[idx],
-                                      "stand", iters=150, pos_tol=0.004, ax_tol=0.03)
+                                      "stand", iters=150, pos_tol=0.004, ax_tol=0.03,
+                                      pb=(pt_pb[idx] if DUAL else None))
         q_ik[idx], pz_ik[idx] = qf, pf
         n_corr_tot += len(idx)
         print(f"[IK·修正] 第{rd + 1}轮 增量修正 {len(idx)} 点 ({_time.time() - _t0:.1f}s)", flush=True)
@@ -602,10 +903,11 @@ def main():
                 pz0 = pz_ik[still].copy()
             else:           # MC末位种子
                 sel = np.isin(bad, still)
-                q0 = qsub[j2[sel, si - 3]][:, :10].copy()
-                pz0 = qsub[j2[sel, si - 3]][:, 10].copy()
+                q0 = qsub_all[j2[sel, si - 3]][:, :10].copy()
+                pz0 = qsub_all[j2[sel, si - 3]][:, 10].copy()
             qf, pf, e1, e2, cv = batch_ik(q0, pz0, p_star_rel[still], d_star[still],
-                                          "stand", iters=1200)
+                                          "stand", iters=1200,
+                                          pb=(pt_pb[still] if DUAL else None))
             _, ax_r = fk_wrist(qf, pf)
             ang_r = 90.0 - np.degrees(np.arccos(np.clip(ax_r[:, 0], -1, 1)))
             for r, i in enumerate(still):
@@ -625,19 +927,20 @@ def main():
         # 4.5) 60°行实现偏置兜底(函数化: 支延续后可再跑一轮): 实测<60.05°走线点, 目标轴朝垂直偏+0.6°小步重解;
         # 逐点连续性守卫(与当前相邻解差<0.6rad才接受), 多轮迭代逐步接纳
         n_bias = 0
-        for _b in range(4):
+        for _b in range(6):
             p_c, ax_c = fk_wrist(q_ik, pz_ik)
             ang_c = 90.0 - np.degrees(np.arccos(np.clip(ax_c[:, 0], -1, 1)))
             low60 = np.where(stroke_m & (ang_c < 60.05))[0]
             if not len(low60):
                 break
             d_b = d_star[low60].copy()
-            tb = np.deg2rad(0.6)
+            tb = np.deg2rad(1.0)
             d_b[:, 0] = np.cos(np.arccos(np.clip(d_star[low60, 0], -1, 1)) - tb)
             d_b[:, 2] = np.sign(d_star[low60, 2]) * np.sqrt(np.maximum(
                 0.0, 1.0 - d_b[:, 0] ** 2))
             qf, pf, e1, e2, cv = batch_ik(q_ik[low60], pz_ik[low60], p_star_rel[low60],
-                                          d_b, "stand", iters=90, pos_tol=0.004, ax_tol=0.02)
+                                          d_b, "stand", iters=90, pos_tol=0.004, ax_tol=0.02,
+                                          pb=(pt_pb[low60] if DUAL else None))
             _, ax_b = fk_wrist(qf, pf)
             ang_b = 90.0 - np.degrees(np.arccos(np.clip(ax_b[:, 0], -1, 1)))
             acc = 0
@@ -663,12 +966,15 @@ def main():
         for pp in range(N - 1):
             if np.abs(q_ik[pp + 1] - q_ik[pp]).max() <= 0.6:
                 continue
+            if DUAL and zone_w[pp] != zone_w[pp + 1]:
+                continue            # V2 姿态接缝: 时间轴由05回零位过渡覆盖, 不修
             qm = 0.5 * (q_ik[pp] + q_ik[pp + 1]); pzm = 0.5 * (pz_ik[pp] + pz_ik[pp + 1])
             for tgt in (pp + 1, pp):
                 q_pre = q_ik[tgt - 1] if tgt > 0 else qm
                 qf, pf, e1, e2, cv = batch_ik(qm[None].copy(), np.array([pzm]),
                                               p_star_rel[tgt:tgt + 1], d_star[tgt:tgt + 1],
-                                              "stand", iters=800)
+                                              "stand", iters=800,
+                                              pb=(pt_pb[tgt:tgt + 1] if DUAL else None))
                 if cv[0] and np.abs(qf[0] - q_pre).max() < 0.6:
                     q_ik[tgt], pz_ik[tgt] = qf[0], float(pf[0])
                     n += 1
@@ -683,6 +989,8 @@ def main():
         for _ in range(3):
             qd = np.abs(np.diff(q_ik, axis=0)).max(1)
             bad = np.where(qd > 0.6)[0]
+            if DUAL:      # V2: 姿态接缝跳变合法(骨盆/构型切换, 05回零位过渡覆盖), 排除
+                bad = np.array([b for b in bad if zone_w[b] == zone_w[b + 1]], int)
             if not len(bad):
                 break
             p = int(bad[0])
@@ -691,7 +999,8 @@ def main():
             for k in range(p + 1, len(q_ik)):          # 正向: 低侧支延续到链尾
                 qf, pf, e1, e2, cv = batch_ik(
                     q_ik[k - 1][None].copy(), np.array([pz_ik[k - 1]]),
-                    p_star_rel[k:k + 1], d_star[k:k + 1], "stand", iters=400)
+                    p_star_rel[k:k + 1], d_star[k:k + 1], "stand", iters=400,
+                    pb=(pt_pb[k:k + 1] if DUAL else None))
                 if cv[0] and np.abs(qf[0] - q_ik[k - 1]).max() < 0.35:
                     q_ik[k], pz_ik[k] = qf[0], pf[0]; n += 1
                 else:
@@ -703,7 +1012,8 @@ def main():
                 for k in range(p, -1, -1):
                     qf, pf, e1, e2, cv = batch_ik(
                         q_ik[k + 1][None].copy(), np.array([pz_ik[k + 1]]),
-                        p_star_rel[k:k + 1], d_star[k:k + 1], "stand", iters=400)
+                        p_star_rel[k:k + 1], d_star[k:k + 1], "stand", iters=400,
+                        pb=(pt_pb[k:k + 1] if DUAL else None))
                     if cv[0] and np.abs(qf[0] - q_ik[k + 1]).max() < 0.35:
                         q_ik[k], pz_ik[k] = qf[0], pf[0]; n += 1
                     else:
@@ -744,25 +1054,49 @@ def main():
           f"(要求>=60°, {'全部满足' if angle_rule_ok else '存在违规!'}), "
           f"与目标指向偏差 max {np.degrees(np.arccos(ax_dot.min())):.2f}°")
 
-    # ---------------- F: 自检 (a)行内腕心水平 (b)行角一致 (c)指向无横向分量 ----------------
-    zstd_rows, zptp_rows, angvar_rows = [], [], []
-    for rp in row_params:
-        mrow = (kind_w == "stroke") & (np.abs(h_w - rp["h"]) < 1e-9)
-        zptp_rows.append(float(np.ptp(z_r[mrow])))          # (a) 走线点腕心z极差(max-min)
-        zstd_rows.append(float(np.std(z_r[mrow])))          #     标准差(float均值舍入~1e-16)
-        angvar_rows.append(float(np.var(ang_wall[mrow])))   # (b) 走线点实测夹角方差
-    zptp_max = max(zptp_rows)
-    zstd_max, angvar_max = max(zstd_rows), max(angvar_rows)
-    lat_cmd = float(np.abs(d_star[:, 1]).max())             # (c) 指令指向横向分量
-    lat_fk = float(np.abs(ax_ach[:, 1]).max())              #     FK实测横向分量(轴向容差内)
-    wrist_horiz_ok = bool(zptp_max == 0.0 and angvar_max < 4.0 and lat_cmd == 0.0)
-    print(f"[自检a] 各行走线点腕心z极差(max-min) max={zptp_max:.1e} m (要求=0: 严格水平线), "
-          f"标准差 max={zstd_max:.1e} m (np.mean浮点舍入量级)")
-    print(f"[自检b] 各行实测墙面夹角方差 max={angvar_max:.2e} deg² (要求≈0: 行角一致, <4.0)")
-    print(f"[自检c] 指向横向分量: 指令 max={lat_cmd:.1e} (要求=0: 纯俯仰), "
-          f"FK实测 max={lat_fk:.4f} (轴向容差0.03内)")
-    if not wrist_horiz_ok:
-        print("[自检] 腕心水平线/行角一致性自检未通过!")
+    # ---------------- F: 自检 ----------------
+    # (c)两模式共用: 指向无横向分量(枪臂恒在"机器人-墙面"法向垂面内, 用户定稿)
+    lat_cmd = float(np.abs(d_star[:, 1]).max())
+    lat_fk = float(np.abs(ax_ach[:, 1]).max())
+    if STROKE_DIR == "vertical":
+        # V3 竖直列自检: (a)列内走线点u极差=0(严格竖直线) (b)列覆盖(高度极差与点数)
+        uptp_cols, angvar_cols = [], []
+        for cu in (cols_u if STROKE_DIR == "vertical" else []):
+            mcol = (kind_w == "stroke") & (np.abs(u_w - cu) < 1e-6)
+            if not mcol.any():
+                continue
+            uptp_cols.append(float(np.ptp(u_w[mcol])))
+            angvar_cols.append(float(np.var(ang_wall[mcol])))
+        uptp_max = max(uptp_cols) if uptp_cols else 9.9
+        angvar_max_col = max(angvar_cols) if angvar_cols else 9.9
+        wrist_horiz_ok = bool(uptp_max == 0.0 and lat_cmd == 0.0)
+        print(f"[自检a·V3] 各列走线点u极差 max={uptp_max:.1e} m (要求=0: 严格竖直线), "
+              f"共 {len(uptp_cols)} 列")
+        print(f"[自检b·V3] 各列实测墙面夹角方差 max={angvar_max_col:.2e} deg² "
+              f"(列内沿高度阶梯变角, 仅作参考)")
+        print(f"[自检c] 指向横向分量: 指令 max={lat_cmd:.1e} (要求=0: 枪臂在法向垂面内), "
+              f"FK实测 max={lat_fk:.4f} (轴向容差0.03内)")
+        if not wrist_horiz_ok:
+            print("[自检] 竖直列/垂面内指向自检未通过!")
+        zptp_max, zstd_max, angvar_max = uptp_max, 0.0, angvar_max_col
+    else:
+        # 水平行自检: (a)行内腕心水平 (b)行角一致
+        zstd_rows, zptp_rows, angvar_rows = [], [], []
+        for rp in row_params:
+            mrow = (kind_w == "stroke") & (np.abs(h_w - rp["h"]) < 1e-9)
+            zptp_rows.append(float(np.ptp(z_r[mrow])))          # (a) 走线点腕心z极差(max-min)
+            zstd_rows.append(float(np.std(z_r[mrow])))          #     标准差(float均值舍入~1e-16)
+            angvar_rows.append(float(np.var(ang_wall[mrow])))   # (b) 走线点实测夹角方差
+        zptp_max = max(zptp_rows)
+        zstd_max, angvar_max = max(zstd_rows), max(angvar_rows)
+        wrist_horiz_ok = bool(zptp_max == 0.0 and angvar_max < 4.0 and lat_cmd == 0.0)
+        print(f"[自检a] 各行走线点腕心z极差(max-min) max={zptp_max:.1e} m (要求=0: 严格水平线), "
+              f"标准差 max={zstd_max:.1e} m (np.mean浮点舍入量级)")
+        print(f"[自检b] 各行实测墙面夹角方差 max={angvar_max:.2e} deg² (要求≈0: 行角一致, <4.0)")
+        print(f"[自检c] 指向横向分量: 指令 max={lat_cmd:.1e} (要求=0: 纯俯仰), "
+              f"FK实测 max={lat_fk:.4f} (轴向容差0.03内)")
+        if not wrist_horiz_ok:
+            print("[自检] 腕心水平线/行角一致性自检未通过!")
 
     # ---------------- 保存 ----------------
     with open(os.path.join(OUT, "wall_path.csv"), "w", newline="", encoding="utf8") as f:
@@ -778,7 +1112,7 @@ def main():
                     "wrist_x_m", "wrist_y_m", "wrist_z_m", "axis_dx", "axis_dy", "axis_dz",
                     "tilt_deg", "ik_ok", "pelvis_z_m"] + [f"q{i+1}" for i in range(10)])
         for i in range(len(u_w)):
-            w.writerow([i, zone_w[i], kind_w[i], cls_w[i], "stand", int(perp_ok[i]),
+            w.writerow([i, zone_w[i], kind_w[i], cls_w[i], zone_w[i], int(perp_ok[i]),
                         f"{u_w[i]:.4f}", f"{h_w[i]:.4f}",
                         f"{wri_xyz[i,0]:.4f}", f"{wri_xyz[i,1]:.4f}", f"{wri_xyz[i,2]:.4f}",
                         f"{d_star[i,0]:.4f}", f"{d_star[i,1]:.4f}", f"{d_star[i,2]:.4f}",
@@ -807,7 +1141,7 @@ def main():
     np.savez_compressed(os.path.join(OUT, "trajectory.npz"),
                         wall_u=u_w, wall_h=h_w, wall_xyz=wall_xyz, kind=kind_w, cls=cls_w,
                         zone=zone_w, rob_xyz=wri_xyz, rob_y_r=y_r, rob_z=z_r, perp=perp_ok,
-                        mode=np.array(["stand"] * len(u_w)), axis=d_star, tilt=tilt_deg,
+                        mode=zone_w, axis=d_star, tilt=tilt_deg,
                         ik_ok=conv, ik_strict=conv_strict, q=q_ik,
                         pelvis=pz_ik, tilt_ach=90.0 - ang_wall, angle_wall=ang_wall,
                         wall_pts_sec=sec["points"], wall_lab=sec["label"],
@@ -815,26 +1149,37 @@ def main():
                         uniform_stroke_u=np.array([u_lo, u_hi]),
                         row_heights=np.array(hs_seq),
                         row_params=np.array(
-                            [(rp["h"], rp["z_w"], rp["angle_deg"], rp["dir"])
+                            [(rp["h"], rp["z_w"], rp["angle_deg"], rp["dir"],
+                              rp["zone"], rp["u_lo"], rp["u_hi"])
                              for rp in row_params],
                             dtype=[("h", "f8"), ("z_w", "f8"),
-                                   ("angle_deg", "i4"), ("dir", "i4")]))
+                                   ("angle_deg", "i4"), ("dir", "i4"),
+                                   ("zone", "U8"), ("u_lo", "f8"), ("u_hi", "f8")]))
     traj_meta = dict(
         arm=ARM, waist_yaw_range_deg=YAW, d_robot_nominal=D_ROBOT, d_wrist=D_WRIST,
         gun_len=GUN_LEN, u_robot=u_robot, pitch=PITCH, point_spacing=POINT_SPACING,
         stroke_u=list(STROKE_U),
         uniform_stroke_u=[float(u_lo), float(u_hi)],
+        crouch_stroke_u=([float(u_lo_c), float(u_hi_c)] if DUAL else None),
         row_heights=[round(float(h), 2) for h in hs_seq],
         row_params=[dict(h=round(rp["h"], 2), z_w=round(rp["z_w"], 4),
-                         angle_deg=rp["angle_deg"], dir=rp["dir"]) for rp in row_params],
-        h_min_row=float(H_MIN_ROW), h_top=float(H_TOP),
-        z_bot=float(Z_BOT), h_min_sprayed=float(H_MIN_SPRAY),
+                         angle_deg=rp["angle_deg"], dir=rp["dir"], zone=rp["zone"])
+                    for rp in row_params],
+        posture=POSTURE,
+        stroke_dir=STROKE_DIR,
+        **({"columns": [round(c, 3) for c in cols_u],
+            "col_pitch": round(float(_pc), 4)} if STROKE_DIR == "vertical" else {}),
+        **({"crouch_top": float(CROUCH_TOP)} if CROUCH_TOP else {}),
+        h_min_row=float(min(hs_seq)), h_top=float(H_TOP),
+        z_bot=float(Z_BOT_C if DUAL else Z_BOT),
+        h_min_sprayed=float(H_MIN_SPRAY_MIN),
         Y_LO=Y_LO, Y_HI=Y_HI,
         tilt_max_deg=TILT_MAX, tilt_max_actual=float(tilt_deg.max()),
         row_angle_hist=ang_rows,
         angle_rule_deg=[60.0, 90.0],
         angle_achieved_deg=[float(ang_wall.min()), float(ang_wall.max())],
         angle_rule_ok=angle_rule_ok,
+        stroke_geom_ok=bool(wrist_horiz_ok),          # 竖直:列u极差=0&横向分量0 / 水平:行z极差0
         n_perp_cmd=n_perp_cmd,
         z_min_robot_traj=float(z_r.min()), z_max_robot_traj=float(z_r.max()),
         obstacles=obstacles,
@@ -855,7 +1200,12 @@ def main():
         n_yellow=int((cls_w == "yellow").sum()),
         stations=dict(
             base=dict(x=X_FACE - D_ROBOT, y=U0 + u_robot),
-            stand_pelvis=list(PELVIS_RANGE["stand"])),
+            stand_pelvis=list(PELVIS_RANGE["stand"]),
+            **(dict(crouch_pelvis=list(PELVIS_RANGE["crouch"]),
+                    zone_split_h=float(H_MIN_ROW),
+                    crouch_rows=int(sum(1 for z in zone_rows if z == "crouch")),
+                    h_min_sprayed_stand=float(H_MIN_SPRAY))
+               if DUAL else {})),
         notes=dict(
             保证区="站姿单一模式(骨盆0.77~0.79m), 腰roll/pitch±0.0873(±5°)与步骤2一致; "
                   "站位0.70~0.78m三腕平面(0.30/0.34/0.38)保证区(perp/tiltd/tiltu)求交",
@@ -891,10 +1241,26 @@ def main():
             ax.scatter(pts[m, 0], pts[m, 1], s=1.2,
                        c="#9fb8c8" if CLOUD_PLOT else lab_c[k],
                        label=lab_n.get(k, "点云"), zorder=1)
-    ax.plot(u_w, h_w, "-", color=colors["green"], lw=2.2, zorder=3,
-            solid_capstyle="round", label="之字形喷涂走线(行距0.1m, 匀速)")
-    ax.plot(u_w[kind_w == "stroke"], h_w[kind_w == "stroke"], "o", ms=2.5,
-            color=colors["green"], zorder=3)
+    if DUAL:
+        # V2(用户定稿): 站/蹲走线分色 —— 蓝=站姿(上半), 绿=蹲姿(下半), 灰虚线=回零位过渡段
+        C_ST, C_CR, C_TR = "#1f7ac2", "#1e9e6a", "#8a8a8a"
+        m_st = (kind_w != "transition") & (zone_w == "stand")
+        m_cr = (kind_w != "transition") & (zone_w == "crouch")
+        m_tr = kind_w == "transition"
+        ax.plot(u_w[m_st], h_w[m_st], "-", color=C_ST, lw=2.2, zorder=3,
+                solid_capstyle="round", label="站姿喷涂走线(上半 0.55~1.45m)")
+        ax.plot(u_w[m_cr], h_w[m_cr], "-", color=C_CR, lw=2.2, zorder=3,
+                solid_capstyle="round", label="蹲姿喷涂走线(下半 0.45m)")
+        ax.plot(u_w[m_tr], h_w[m_tr], "--", color=C_TR, lw=1.6, zorder=3,
+                label="回零位过渡段(05替换为收臂/停顿/下蹲)")
+        for m, c in (((kind_w == "stroke") & (zone_w == "stand"), C_ST),
+                     ((kind_w == "stroke") & (zone_w == "crouch"), C_CR)):
+            ax.plot(u_w[m], h_w[m], "o", ms=2.5, color=c, zorder=3)
+    else:
+        ax.plot(u_w, h_w, "-", color=colors["green"], lw=2.2, zorder=3,
+                solid_capstyle="round", label="之字形喷涂走线(行距0.1m, 匀速)")
+        ax.plot(u_w[kind_w == "stroke"], h_w[kind_w == "stroke"], "o", ms=2.5,
+                color=colors["green"], zorder=3)
     for oi, o in enumerate(plot_boxes):
         ax.add_patch(plt.Rectangle((o["u"][0], o["h"][0]), o["u"][1] - o["u"][0],
                                    o["h"][1] - o["h"][0], fill=False,
@@ -903,9 +1269,10 @@ def main():
                                    label=("点云检出障碍" if CLOUD_PLOT else "障碍范围(信息标注)")
                                    if oi == 0 else None))
     ax.axvspan(u_lo, u_hi, color="#1f7ac2", alpha=0.07,
-               label=f"统一u区间 [{u_lo:.2f},{u_hi:.2f}]m (等宽完整之字形)")
-    ax.axhline(H_MIN_SPRAY, color="darkred", ls=":", lw=1.6)
-    ax.text(0.40, H_MIN_SPRAY - 0.035, f"可喷下限 {H_MIN_SPRAY:.2f}m (与墙面夹角>=60°约束)",
+               label=(f"两带统一u区间 [{u_lo:.2f},{u_hi:.2f}]m (站/蹲对齐)" if DUAL
+                      else f"统一u区间 [{u_lo:.2f},{u_hi:.2f}]m (等宽完整之字形)"))
+    ax.axhline(H_MIN_SPRAY_MIN, color="darkred", ls=":", lw=1.6)
+    ax.text(0.40, H_MIN_SPRAY_MIN - 0.035, f"可喷下限 {H_MIN_SPRAY_MIN:.2f}m (与墙面夹角>=60°约束)",
             color="darkred", fontsize=10, ha="center")
     if CLOUD_PLOT:
         ax.set_xlim(pts[:, 0].min() - 0.06, pts[:, 0].max() + 0.06)
@@ -917,7 +1284,8 @@ def main():
         ax.set_xlim(-0.07, 0.90); ax.set_ylim(-0.07, 1.60)
     ax.set_aspect("equal")
     ax.set_xlabel("u 沿墙向右 (m)"); ax.set_ylabel("h 距地高度 (m)")
-    ax.set_title(f"G1 墙面之字形喷涂轨迹 (站姿, 行距{PITCH}m, {H_MIN_ROW:.2f}→{H_TOP:.2f}m, "
+    ax.set_title(f"G1 墙面之字形喷涂轨迹 ({'站+蹲双姿态' if DUAL else '站姿'}, 行距{PITCH}m, "
+                 f"{min(hs_seq):.2f}→{H_TOP:.2f}m, "
                  f"统一u区间[{u_lo:.2f},{u_hi:.2f}], 夹角60°~90°)")
     ax.legend(loc="lower right", markerscale=4, fontsize=9); ax.grid(alpha=0.25)
     plt.tight_layout(); plt.savefig(os.path.join(OUT, "fig_wall_path_2d.png"), dpi=130); plt.close()
@@ -931,8 +1299,21 @@ def main():
         m = lab == 1
         ax.scatter(pts[m, 0], pts[m, 1], s=1.0, c="#e8f2e8", zorder=0)
     ax.scatter(u_w[::4], h_w[::4], s=2.5, c="#aaaaaa", zorder=1, label="墙面轨迹点(对应参考)")
-    ax.plot(u_rob, z_r, "-", color=colors["green"], lw=2.0, zorder=3,
-            solid_capstyle="round", label="机器人腕心走线(距墙0.40m)")
+    if DUAL:
+        # V2: 腕心走线同口径站/蹲分色
+        C_ST, C_CR, C_TR = "#1f7ac2", "#1e9e6a", "#8a8a8a"
+        m_st = (kind_w != "transition") & (zone_w == "stand")
+        m_cr = (kind_w != "transition") & (zone_w == "crouch")
+        m_tr = kind_w == "transition"
+        ax.plot(u_rob[m_st], z_r[m_st], "-", color=C_ST, lw=2.0, zorder=3,
+                solid_capstyle="round", label="站姿腕心走线(距墙0.40m)")
+        ax.plot(u_rob[m_cr], z_r[m_cr], "-", color=C_CR, lw=2.0, zorder=3,
+                solid_capstyle="round", label="蹲姿腕心走线(骨盆参考0.63m)")
+        ax.plot(u_rob[m_tr], z_r[m_tr], "--", color=C_TR, lw=1.5, zorder=3,
+                label="回零位过渡段")
+    else:
+        ax.plot(u_rob, z_r, "-", color=colors["green"], lw=2.0, zorder=3,
+                solid_capstyle="round", label="机器人腕心走线(距墙0.40m)")
     idx = np.linspace(0, len(u_w) - 1, 150).astype(int)
     for i in idx:
         if not conv[i]:
@@ -941,11 +1322,14 @@ def main():
                 color=SINGLE, lw=0.6, alpha=0.45, zorder=2)
     ax.axhline(Z_MIN_ROBOT, color="r", ls=":", lw=1.6)
     ax.text(0.60, Z_MIN_ROBOT + 0.008, "机器人轨迹安全下限 0.15m", color="r", fontsize=9)
-    ax.axhline(H_MIN_SPRAY, color="darkred", ls=":", lw=1.6)
-    ax.text(0.62, H_MIN_SPRAY - 0.035, f"可喷下限 {H_MIN_SPRAY:.2f}m (夹角>=60°)",
+    ax.axhline(H_MIN_SPRAY_MIN, color="darkred", ls=":", lw=1.6)
+    ax.text(0.62, H_MIN_SPRAY_MIN - 0.035, f"可喷下限 {H_MIN_SPRAY_MIN:.2f}m (夹角>=60°)",
             color="darkred", fontsize=9, ha="center")
     ax.axhspan(0.755, 0.775, color="orchid", alpha=0.25)
     ax.text(0.60, 0.785, "站姿骨盆 0.77m", fontsize=8, color="purple")
+    if DUAL:
+        ax.axhspan(0.60, 0.70, color="orchid", alpha=0.18)
+        ax.text(0.60, 0.585, "蹲姿骨盆带 0.60~0.70m (导出参考0.63)", fontsize=8, color="purple")
     ax.axvline(u_lo, color="#1f7ac2", ls="--", lw=1.2)
     ax.axvline(u_hi, color="#1f7ac2", ls="--", lw=1.2)
     ax.annotate("等宽完整之字形(腕心水平线,行角离散{90,80,70,60}°)",
@@ -961,7 +1345,8 @@ def main():
     ax.set_xlabel("u 沿墙向右 (m)  (腕心每行走水平线, 行角离散{90,80,70,60}°, 指向纯俯仰)")
     ax.set_ylabel("z 高度 (m)")
     ax.set_title(f"G1 机器人(腕心,距墙0.40m)等宽完整之字形(统一u区间"
-                 f"[{u_lo:.2f},{u_hi:.2f}]) — 站姿, 站位离墙0.70~0.78m")
+                 f"[{u_lo:.2f},{u_hi:.2f}]) — {'站+蹲双姿态(先站后蹲)' if DUAL else '站姿'}, "
+                 f"站位离墙0.70~0.78m")
     ax.legend(loc="lower left", markerscale=4, fontsize=9); ax.grid(alpha=0.25)
     plt.tight_layout(); plt.savefig(os.path.join(OUT, "fig_robot_path_2d.png"), dpi=130)
     plt.close()

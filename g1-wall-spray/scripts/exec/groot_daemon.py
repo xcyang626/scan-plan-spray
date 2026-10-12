@@ -52,8 +52,15 @@ import groot_bridge as gb  # noqa: E402
 
 def _env_json():
     try:
-        return json.load(open(os.path.join(BASE, "station", "env.json"),
-                              encoding="utf8"))
+        _d = json.load(open(os.path.join(BASE, "station", "env.json"),
+                            encoding="utf8"))
+        try:      # 本机覆盖层(不入库), 与 10_station_app 同机制
+            _d.update(json.load(open(
+                os.path.join(BASE, "station", "env.local.json"),
+                encoding="utf8")))
+        except Exception:
+            pass
+        return _d
     except Exception:
         return {}
 
@@ -79,6 +86,57 @@ DEFAULT_HOLD_POSE = [0.0, 0.0, 0.0, 0.2, 0.0, 0.2, 0.0, 0.0, 0.0,
 # —— 官方 pico_manager_thread_server.FeedbackReader._get_upper_body_joint_indices() 原样
 UPPER17_FROM_BODY29 = [12, 13, 14, 15, 22, 16, 23, 17, 24, 18, 25,
                        19, 26, 20, 27, 21, 28]
+
+# ---------------- V2 蹲姿通道: 腿关节反解骨盆高度 ----------------
+# 与 05_export_ufo_motion.leg_ik_planar 同一套平面几何的正向反解:
+#   knee -> r = sqrt(L1²+L2²-2·L1·L2·cos(π-knee)); pelvis_h = r + 0.1027 + ANKLE_Z
+# (hip 的 b 角不影响 r, 无需知道髋角; 忽略 roll/yaw/脚背俯仰, 作高度估计足够)
+_L1, _L2, _ANKLE_Z, _HIP_OFF = 0.34051, 0.31757, 0.038, 0.1027
+
+
+def pelvis_h_from_q29(q29):
+    """q29(mujoco序) -> 骨盆高度估计(m). 双腿取均值; 无效角度返回 None."""
+    try:
+        kn = [float(q29[3]), float(q29[9])]          # 左/右 knee(腿序: pitch,roll,yaw,knee,...)
+        if not all(np.isfinite(kn)):
+            return None
+        hs = []
+        for k in kn:
+            g = np.pi - k                             # leg_ik_planar 的 g
+            if not (0.02 < g < np.pi - 0.02):
+                return None
+            r2 = _L1 ** 2 + _L2 ** 2 - 2 * _L1 * _L2 * np.cos(g)
+            hs.append(np.sqrt(max(r2, 1e-4)) + _HIP_OFF + _ANKLE_Z)
+        return float(np.mean(hs))
+    except Exception:
+        return None
+
+
+# ---------------- V2.1g 真机任务空间慢环: 走线水平度(腕心高度)修正 ----------------
+# 仿真 v6 伺服的慢环移植: 真机反馈(q29)只有关节角无底座位姿 —— 站/蹲时底座近似
+# 竖直朝墙(SONIC 平衡), 以 腿IK反解骨盆高 + 实测上肢关节FK 合成腕心世界位姿,
+# 对 [腕心位置; 枪轴] 残差做 10Hz 低增益积分修正(叠加进发送的上肢17目标).
+# 关节权限与仿真 v6 教训一致: 腰 yaw 禁用(会与底座偏航正反馈), 腰 roll/pitch 0.3,
+# 主力右臂; 修正只加进最终注入命令, 不进快环(此处本就只有慢环).
+try:
+    from arm_task_servo import (fk_jac1 as _fk_jac1, JLO as _C_JLO,
+                                JHI as _C_JHI)
+    _SRV_OK = True
+except Exception:                                    # 模块缺失时优雅降级
+    _SRV_OK = False
+
+# q10(mujoco序: 腰3+右臂7) -> SONIC17 序的索引: 腰 0..2; 右臂 body29 22..28
+# (SONIC 交错序 = [腰3, Lsh_p, Rsh_p, Lsh_r, Rsh_r, ...], 见 UPPER17_FROM_BODY29)
+_Q10_TO_SONIC17 = [0, 1, 2, 4, 6, 8, 10, 12, 14, 16]
+_TRIM_COL = np.array([0.0, 0.3, 0.3, 1, 1, 1, 1, 1, 1, 1])   # 腰yaw禁用
+
+
+def wrist_world_from_q29(q29, h_pelvis):
+    """实测 q29 + 骨盆高 -> (腕心世界估计(3,), 枪轴世界估计(3,)).
+    底座假设: 竖直、朝 +x(墙面法向), 位置 [0,0,h_pelvis]."""
+    q10 = np.concatenate([q29[12:15], q29[22:29]]).astype(float)
+    p_rel, a_rel, _, _ = _fk_jac1(q10)
+    return p_rel + np.array([0.0, 0.0, h_pelvis]), a_rel
 
 
 class FeedbackReader:
@@ -215,9 +273,10 @@ class Daemon:
         alpha = (t - times[lo]) / (times[hi] - times[lo])
         return (1.0 - alpha) * values[lo] + alpha * values[hi]
 
-    def _send_upper(self, pos17, vel17):
+    def _send_upper(self, pos17, vel17, height=-1.0, mode=None):
         with self.send_lock:
-            self.pub.planner_upper_body(pos17, upper_vel=vel17)
+            self.pub.planner_upper_body(pos17, upper_vel=vel17,
+                                         height=float(height), mode=mode)
         with self._rec_lock:                       # 记录器: 记下每一条指令帧
             if self._rec is not None:
                 self._rec["sent_t"].append(time.time())
@@ -273,7 +332,16 @@ class Daemon:
     def _do_stream(self, motion, rate, speed, blend_s, mjcf, gen):
         """官方算法: 50Hz 时间采样 + 梯度速度 + 结束保持末姿 + 取消时 5×hold。
         全程只发 planner 话题(上肢 17 关节, SONIC 交错序) —— 下肢归 SONIC 平衡策略,
-        绝不发 planner=False(会切模式触发 TriggerSafetyReset)。"""
+        绝不发 planner=False(会切模式触发 TriggerSafetyReset)。
+        V2 蹲姿通道(数据驱动): 动作 root_z 最低 <0.72 时逐帧携带 planner height
+        (期望骨盆高, 与上肢目标同一条消息, C++ 端进策略观测); 骨盆高用 5557 实测
+        q29 经腿部平面几何反解, 外环比例纠偏(与仿真 runner --height 同口径:
+        K=1.8, 纠偏±0.10, 指令限幅[0.28,0.85]) —— 带臂负载蹲不深时自动加深指令。
+        V2.1h 分段门控: 高度/模式/外环只在蹲姿段(参考 z<0.70)发送, 站姿段
+        height=-1+mode=None —— IDLE 不消费 target_height, 站姿段闭环的负纠偏
+        会把 h_cmd 压过蹲阈值再弹回, IDLE<->SQUAT 模式极限环即实机"上下摇晃"
+        (2026-10-12 首跑实测, 24 次翻转/400 条重规划)。模式滞回改挂参考高度:
+        <0.66 进蹲 / >=0.70 回站, 纠偏只调蹲深不再影响模式切换。"""
         try:
             u_hw = gb.qpos_upper17_hw(motion, mjcf)     # (T,17) 硬件序(官方§8方法解析)
             pos = gb.to_sonic_order(u_hw)               # (T,17) SONIC 交错序
@@ -281,8 +349,39 @@ class Daemon:
             times = np.arange(n) / 30.0                 # 动作 30Hz 导出(官方: index/30)
             vel = np.gradient(pos, times, axis=0)
             duration = float(times[-1] / max(speed, SPEED_MIN))   # 实机安全限幅: 防 speed<=0 除零
+            # V2: 蹲姿通道(数据驱动, 与 05 的 DUAL 判据同源)
+            try:
+                _mq = np.asarray(np.load(motion)["qpos"], float)
+                z_root = _mq[:, 2]
+                height_on = bool(z_root.min() < 0.72)
+            except Exception:
+                _mq, z_root, height_on = None, None, False
+            # V2.1g: 任务空间慢环目标(腕心世界 P*/枪轴 A*, 规划=底座竖直@z_root)
+            tgtP = tgtA = None
+            if _SRV_OK and _mq is not None:
+                try:
+                    from arm_task_servo import precompute_motion_targets
+                    tgtP, tgtA, _ = precompute_motion_targets(_mq)
+                except Exception:
+                    tgtP = tgtA = None
+            trim10 = np.zeros(10)
+            off17_last = np.zeros(17)
+            h_ref = float(np.clip(z_root[0], 0.30, 0.85)) if height_on else -1.0
+            h_cmd = h_ref
+            h_corr = 0.0
+            # 蹲姿模式(带滞回): SONIC planner 只在蹲姿系模式消费 target_height,
+            # IDLE 下发高度机器人不会蹲(2026-10-12 实机实测) —— 下蹲段切 IDEL_SQUAT。
+            # V2.1h: 滞回挂参考高度而非纠偏后的指令(见 _do_stream docstring)
+            squat_mode = False
+            seg_squat = False           # 蹲姿段门控(参考 z<0.70), 每帧更新
+            fb = self._ensure_feedback() if height_on else None
+            st = {"h_meas_min": 9.9, "h_err_max": 0.0, "up_err_sum": 0.0,
+                  "up_err_max": 0.0, "n_up": 0,
+                  "wz_err_sum": 0.0, "wz_err_max": 0.0, "n_wz": 0,
+                  "ang_min": 90.0, "ang_sum": 0.0, "n_ang": 0}
             emit({"event": "stream_meta", "frames": n,
-                  "duration_s": round(duration, 2), "rate": rate, "speed": speed})
+                  "duration_s": round(duration, 2), "rate": rate, "speed": speed,
+                  "height_channel": height_on})
             # 官方启用序列: command(start=True, planner=True)×3。
             # 已启动时 start 为空操作(C++ 只在 !operator_state.start 时处理),
             # planner=True 保持 PLANNER 模式不切换 → 无安全重置、无二次斜坡。
@@ -294,11 +393,15 @@ class Daemon:
             next_tick = time.perf_counter()
             # 首次执行直接跑(官方); 从保持态重跑则 1s smoothstep blend(官方 B 语义)
             blend_from = self.hold_position if self.hold_position is not None else pos[0]
+            h_blend_from = (float(np.clip(pelvis_h_from_q29(fb.q29), 0.30, 0.85))
+                            if (height_on and fb is not None and fb.q29 is not None
+                                and pelvis_h_from_q29(fb.q29)) else h_ref)
             phase = "blend" if self.hold_position is not None else "run"
             blend_start = time.perf_counter()
             run_start = time.perf_counter()
             hold_position = pos[-1].copy()
             last_prog = time.perf_counter()
+            tick = 0
             while True:
                 if self.cancel_evt.is_set() or self._gen != gen:
                     break
@@ -308,18 +411,39 @@ class Daemon:
                     t_traj = min(times[-1], elapsed * speed)
                     p = self._sample(times, pos, t_traj)
                     v = self._sample(times, vel, t_traj) * speed
+                    if height_on:
+                        h_ref = float(np.clip(
+                            self._sample(times, z_root, t_traj), 0.30, 0.85))
                     if elapsed >= duration:
                         hold_position = p.copy()
                         self.hold_position = hold_position   # 立即公布(重跑 blend 要用)
                         phase = "hold"
                         self.holding = True
                         emit({"event": "stream_done", "frames": n,
-                              "note": "保持末姿中(SONIC 平衡站立)"})
+                              "note": "保持末姿中(SONIC 平衡站立)",
+                              "height_channel": height_on,
+                              "pelvis_min": (round(st["h_meas_min"], 3)
+                                             if st["h_meas_min"] < 9 else None),
+                              "pelvis_err_max": round(st["h_err_max"], 3),
+                              "upper_err_mean": (round(st["up_err_sum"] /
+                                                        max(st["n_up"], 1), 4)),
+                              "upper_err_max": round(st["up_err_max"], 4),
+                              "wrist_z_err_mean": round(st["wz_err_sum"] /
+                                                        max(st["n_wz"], 1), 4),
+                              "wrist_z_err_max": round(st["wz_err_max"], 4),
+                              "gun_angle_off_mean": round(
+                                  st["ang_sum"] / max(st["n_ang"], 1), 1),
+                              "gun_angle_off_max": round(
+                                  90.0 - st["ang_min"]
+                                  if st["n_ang"] else 0.0, 1)})
                 elif phase == "blend":
                     alpha = min(1.0, (now - blend_start) / blend_s)
                     alpha = alpha * alpha * (3.0 - 2.0 * alpha)
                     p = (1.0 - alpha) * blend_from + alpha * pos[0]
                     v = np.zeros(17)
+                    if height_on:                      # 高度同步 blend: 实测 -> 首帧参考
+                        h_ref = float(np.clip(
+                            (1.0 - alpha) * h_blend_from + alpha * z_root[0], 0.30, 0.85))
                     if alpha >= 1.0:
                         phase = "run"
                         run_start = now
@@ -327,11 +451,79 @@ class Daemon:
                 else:
                     p = hold_position.copy()
                     v = np.zeros(17)
-                self._send_upper(p, v)
+                # 蹲姿外环(10Hz): 实测骨盆高反馈纠偏(实测-参考差放大加深指令)
+                # 任务空间慢环(10Hz, V2.1g): 腕心/枪轴残差 -> 上肢17 修正(走线水平度)
+                if tick % 5 == 0:
+                    _fresh = (fb is not None and fb.q29 is not None
+                              and time.time() - fb.ts < 0.5)
+                    q29m = np.asarray(fb.q29, float) if _fresh else None
+                    h_m = pelvis_h_from_q29(q29m) if q29m is not None else None
+                    u_m = q29m[UPPER17_FROM_BODY29] if q29m is not None else None
+                    if u_m is not None:                # 上肢关节空间跟踪(SONIC序)
+                        e_j = float(np.linalg.norm(u_m - (p + off17_last)))
+                        st["up_err_sum"] += e_j; st["n_up"] += 1
+                        st["up_err_max"] = max(st["up_err_max"], e_j)
+                    if height_on:
+                        if h_m is not None:      # 统计全程留痕(站姿段偏差也有诊断价值)
+                            st["h_meas_min"] = min(st["h_meas_min"], h_m)
+                            st["h_err_max"] = max(st["h_err_max"], abs(h_m - h_ref))
+                        if seg_squat:            # 外环只在蹲姿段闭环加深指令;
+                            if h_m is not None:  # 站姿段策略不消费高度, 闭环只会
+                                h_corr = min(max(1.8 * (h_ref - h_m), -0.10), 0.10)
+                            else:
+                                h_corr *= 0.9    # 反馈丢失: 纠偏缓慢归零
+                            h_cmd = float(np.clip(h_ref + h_corr, 0.28, 0.85))
+                    # —— 任务空间慢环: 残差在实测构型上线性化, 积分修正(权限同仿真 v6)
+                    if q29m is not None and h_m is not None and tgtP is not None:
+                        t_now = (min(times[-1], (now - run_start) * speed)
+                                 if phase == "run"
+                                 else (0.0 if phase == "blend" else times[-1]))
+                        p_star = self._sample(times, tgtP, t_now)
+                        a_star = self._sample(times, tgtA, t_now)
+                        _n = np.linalg.norm(a_star)
+                        if _n > 1e-6:
+                            p_w, a_w = wrist_world_from_q29(q29m, h_m)
+                            st["wz_err_sum"] += abs(p_w[2] - p_star[2])
+                            st["wz_err_max"] = max(st["wz_err_max"],
+                                                   abs(p_w[2] - p_star[2]))
+                            st["n_wz"] += 1
+                            _an = np.degrees(np.arccos(np.clip(
+                                a_w[0] / max(np.linalg.norm(a_w), 1e-9), -1, 1)))
+                            st["ang_min"] = min(st["ang_min"], _an)
+                            st["ang_sum"] += _an; st["n_ang"] += 1
+                            q10m = np.concatenate([q29m[12:15], q29m[22:29]])
+                            _, _, Jp, Ja = _fk_jac1(q10m)
+                            J = np.vstack([Jp, Ja]) * _TRIM_COL
+                            e = np.concatenate([p_star - p_w,
+                                                0.5 * (a_star / _n - a_w)]) * 0.15
+                            dq = J.T @ np.linalg.solve(
+                                J @ J.T + 0.01 * np.eye(6), e)
+                            np.clip(dq, -0.02, 0.02, out=dq)
+                            trim10 = np.clip(trim10 + dq, -0.15, 0.15)
+                off17 = np.zeros(17)
+                off17[_Q10_TO_SONIC17] = trim10
+                off17_last = off17
+                # V2.1h 分段门控: 蹲姿段(参考 z<0.70)才发 height/mode, 站姿段
+                # height=-1 + mode=None(与纯站姿动作同通道); 模式滞回挂参考
+                # (0.66 进 / 0.70 出), 纠偏只调蹲深 —— 消灭站姿段模式极限环
+                _seg = bool(height_on and h_ref < 0.70)
+                if _seg != seg_squat:
+                    seg_squat = _seg
+                    emit({"event": "height_seg",
+                          "seg": ("squat" if _seg else "stand"),
+                          "h_ref": round(float(h_ref), 3)})
+                if _seg:
+                    squat_mode = squat_mode or h_ref < 0.66
+                else:
+                    squat_mode = False
+                    h_corr = 0.0
+                self._send_upper(p + off17, v, height=(h_cmd if _seg else -1.0),
+                                 mode=(4 if (_seg and squat_mode) else None))
                 if phase == "run" and now - last_prog >= 2.0:
                     emit({"event": "stream_progress", "k": int(t_traj * 30),
                           "n": n, "frac": round(t_traj / max(times[-1], 1e-9), 3)})
                     last_prog = now
+                tick += 1
                 next_tick += period
                 sleep_s = next_tick - time.perf_counter()
                 if sleep_s > 0.0:
@@ -343,7 +535,8 @@ class Daemon:
             self.hold_position = hold_position
             if self.cancel_evt.is_set():
                 for _ in range(5):
-                    self._send_upper(hold_position, np.zeros(17))
+                    self._send_upper(hold_position + off17_last, np.zeros(17),
+                                     height=(h_cmd if seg_squat else -1.0))
                     time.sleep(0.02)
                 emit({"event": "stream_cancelled", "note": "已按官方退出序列保持末姿"})
         except Exception as ex:

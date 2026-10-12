@@ -17,11 +17,12 @@ def _ver_key(name):
     return int(m.group(1)) if m else -1
 
 
-_vdirs = [os.path.basename(d) for d in glob.glob(os.path.join(BASE, "output/ufo_motion/v*"))]
+_OUT06 = os.environ.get("G1W_OUT", os.path.join(BASE, "output"))
+_vdirs = [os.path.basename(d) for d in glob.glob(os.path.join(_OUT06, "ufo_motion/v*"))]
 VER = os.environ.get("MOTION_VER") or (max(_vdirs, key=lambda d: (_ver_key(d), d))
                                        if _vdirs else "v1")
-FR = os.path.join(BASE, "output", "ufo_motion", VER, "replay_frames")
-OUT = os.path.join(BASE, "output", "ufo_motion", VER)
+FR = os.path.join(_OUT06, "ufo_motion", VER, "replay_frames")
+OUT = os.path.join(_OUT06, "ufo_motion", VER)
 
 side = sorted(glob.glob(os.path.join(FR, "side_*.png")))
 front = sorted(glob.glob(os.path.join(FR, "front_*.png")))

@@ -6,7 +6,8 @@
   36 维 = root pos3 + quat wxyz4 + 左腿6 + 右腿6 + 腰3 + 左臂7 + 右臂7
 
 流程:
-  1. 骨盆高度参考恒定(站姿单区0.77) — 避免 IK 逐点自由骨盆的抖动
+  1. 骨盆高度参考: 纯站姿轨迹恒定0.77(v5口径); V2双姿态轨迹(数据驱动: zone含crouch)
+     蹲姿区0.63/站姿区0.77/过渡段线性, zone翻转处插回零位过渡(收臂->停顿->伸出+下蹲)
   2. MJCF 内重解 IK: g1-mode_13_15.xml 与 URDF 有 mm 级连杆原点差异, 以 URDF 解为种子,
      在 MJCF 中顺序热启动(保持冗余分支连续), 目标=腕心(0.40, y, z)+枪轴指向;
      工作区边缘点允许目标横向内松 ≤4cm
@@ -119,7 +120,8 @@ def fk_wrist_local(q10):
 
 def leg_ik_planar(pelvis_h):
     L1, L2, ANKLE_Z = 0.34051, 0.31757, 0.038
-    r = np.clip((pelvis_h - 0.1027) - ANKLE_Z, 0.30, L1 + L2 - 0.004)
+    # 下限 0.22: 深蹲(骨盆~0.36)需要更短髋-踝距; |L1-L2|=0.023 为奇异下限, 0.22 留裕量
+    r = np.clip((pelvis_h - 0.1027) - ANKLE_Z, 0.22, L1 + L2 - 0.004)
     b = np.arccos(np.clip((L1 * L1 + r * r - L2 * L2) / (2 * L1 * r), -1, 1))
     g = np.arccos(np.clip((L1 * L1 + L2 * L2 - r * r) / (2 * L1 * L2), -1, 1))
     hip = -b
@@ -170,9 +172,35 @@ def main():
     base36[22:29] = [INIT["l_shoulder_pitch"], INIT["l_shoulder_roll"], 0, INIT["l_elbow"], 0, 0, 0]
     base36[29:36] = [INIT["r_shoulder_pitch"], INIT["r_shoulder_roll"], 0, INIT["r_elbow"], 0, 0, 0]
 
-    # ---------- 1. 骨盆高度参考: 站姿单区恒定(v4: 不再有蹲姿/回零位拼接) ----------
+    # ---------- 1. 骨盆高度参考: 站姿单区恒定 / V2双姿态按zone + 过渡段线性 ----------
+    # V2(数据驱动): 轨迹 zone 含 "crouch" 时自动启用双姿态 —— 蹲姿区参考 CROUCH_PZ,
+    # 站姿区 STAND_PZ, 过渡段(kind=transition)线性插值; 纯站姿轨迹与 v5 行为完全一致
+    DUAL = bool((zone == "crouch").any())
     pz_ref = np.full(N, STAND_PZ)
-    print(f"[骨盆参考] 站姿单区恒定 {STAND_PZ} m", flush=True)
+    if DUAL:
+        # V2 深蹲: 蹲姿区逐点参考 = 规划解骨盆(17点滑动平均去抖), 不再用全区常数 ——
+        # 深蹲行(0.2x~0.3x)参考随行下移到 ~0.4x, 站姿区仍恒 0.77
+        _pzs = t["pelvis"].astype(float) if "pelvis" in t.files else np.full(N, CROUCH_PZ)
+        _sm = np.convolve(np.pad(_pzs, 8, mode="edge"), np.ones(17) / 17, "valid")
+        pz_ref[zone == "crouch"] = _sm[zone == "crouch"]
+        tr_mask = kind == "transition"
+        i = 0
+        while i < N:
+            if tr_mask[i]:
+                j = i
+                while j + 1 < N and tr_mask[j + 1]:
+                    j += 1
+                pa = pz_ref[i - 1] if i > 0 else pz_ref[i]
+                pb2 = pz_ref[j + 1] if j + 1 < N else pz_ref[j]
+                pz_ref[i:j + 1] = np.linspace(pa, pb2, j - i + 3)[1:-1]
+                i = j + 1
+            else:
+                i += 1
+        print(f"[骨盆参考] V2双姿态: 站姿区恒 {STAND_PZ}m / 蹲姿区逐点参考 "
+              f"[{pz_ref[zone == 'crouch'].min():.3f},{pz_ref[zone == 'crouch'].max():.3f}]m / "
+              f"过渡段线性", flush=True)
+    else:
+        print(f"[骨盆参考] 站姿单区恒定 {STAND_PZ} m", flush=True)
 
     # ---------- 2. MJCF 内重解 IK (顺序热启动 + 连续性优先) ----------
     # 用户更新: 腰部三自由度全部解锁(与 URDF 规划一致), roll/pitch 限幅收紧至±5°
@@ -185,6 +213,10 @@ def main():
     arm_dadr = [model.jnt_dofadr[i] for i in arm_jid]
     alo = np.array([model.jnt_range[i][0] for i in arm_jid])
     ahi = np.array([model.jnt_range[i][1] for i in arm_jid])
+    # 腰yaw限位与03一致(URDF±150°会让冗余解拧腰, 拖转底座; 详见03同款注释)
+    _wy = np.deg2rad(float(os.environ.get("G1W_WAIST_YAW_MAX", "45")))
+    if ARM_JNAMES[0] == "waist_yaw_joint":
+        alo[0] = max(alo[0], -_wy); ahi[0] = min(ahi[0], _wy)
     # 用户更新: 腰 roll/pitch 限位收紧至 ±5°, 覆盖 MJCF 原生范围 (索引1/2=roll/pitch)
     _lim = float(os.environ.get("G1W_WAIST_RP", "0")) or 0.0872665
     alo[1] = max(alo[1], -_lim); ahi[1] = min(ahi[1], _lim)
@@ -240,24 +272,31 @@ def main():
     for i in range(N):
         p_t = np.array([D_ROBOT - D_WRIST, y_r[i], z_r[i] - pz_ref[i]])   # 相对骨盆 (0.34)
         best = None
-        # NN-IK 提速插槽: 训练好的模型放 station/nn_ik/g1_nn_ik.npz 即生效(只作种子,
+        # NN-IK 提速插槽: 训练好的模型放 station/nn_ik/ 即生效(只作种子,
         # 精度仍由后续容差保证); 未部署 -> nn_ik 返回 None, 零改动回退增量播种
-        q_nn = nn_ik(np.array([D_ROBOT - D_WRIST, y_r[i], z_r[i]]), axis_t[i])  # 训练同坐标: 离地高z
-        if q_nn is not None:
-            qf, ok = ik_mj(p_t, axis_t[i], np.asarray(q_nn, float),
-                           iters=60, pos_tol=0.004, ax_tol=0.05)
-            if ok:
-                jmp = float(np.max(np.abs(qf - prev)))
-                if jmp < 0.35:
-                    best = (jmp, qf, 0.0); n_nn += 1
-        # 增量播种加速(智能加速): 03已输出连续URDF解, MJCF与之仅mm级差异 ->
-        # 以其为种子小步修正(iters<=60早停), 一步收敛且跳变小即收; 不达标走下方阶梯
+        # V2 通用大模型条件输入: 骨盆=该点 pz_ref, 腰限=当前档位(_lim)
+        # 增量播种优先(2026-10-12: NN种子在首行中部带入异支致肩yaw翻3.84rad,
+        # 帧速117rad/s —— 跟随03连续解的种子保支; NN只作增量失败时的第二梯队)
         qf, ok = ik_mj(p_t, axis_t[i], q_urdf[i], iters=60, pos_tol=0.004, ax_tol=0.05)
         if ok:
             jmp = float(np.max(np.abs(qf - prev)))
             if jmp < 0.35:
                 best = (jmp, qf, 0.0)
                 n_incr += 1
+            elif np.max(np.abs(qf - q_urdf[i])) < 0.6:
+                # 零梯队兜底: 解仍贴着03同支种子 -> 直接接受(03链相邻差<=0.5,
+                # 跨奇异处prev口径的jump门会错杀同支解, 117rad/s翻支就是这么来的)
+                best = (jmp, qf, 0.0)
+                n_incr += 1
+        q_nn = nn_ik(np.array([D_ROBOT - D_WRIST, y_r[i], z_r[i]]), axis_t[i],
+                     pelvis=float(pz_ref[i]), rp=float(_lim))  # 训练同坐标: 离地高z
+        if q_nn is not None and best is None:
+            qf, ok = ik_mj(p_t, axis_t[i], np.asarray(q_nn, float),
+                           iters=60, pos_tol=0.004, ax_tol=0.05)
+            if ok:
+                jmp = float(np.max(np.abs(qf - prev)))
+                if jmp < 0.35:
+                    best = (jmp, qf, 0.0); n_nn += 1
         if best is None:
             # 严格顺序优先: 仅用上一节点解作种子, 阶梯放宽容差也不换构型分支
             # (15mm 位置代价 << 分支翻转 2~3rad 造成的速度尖峰与枪轴抹坏)
@@ -387,7 +426,31 @@ def main():
                 continue
             qa, qb = q_mj[i0], q_mj[i1]
             n = i1 - i0
+            # 同伦步进(2026-10-12): 从跳变前节点热链重解窗口内各点 —— 分支翻转是
+            # 拓扑突变, 线性混合的中点不是有效构型(旧法在此静默放弃, 3.9rad 肩yaw
+            # 翻支存活成 117rad/s 帧速); 同伦走支才是正解, 线性插值只作回退
+            q_walk = qa.copy()
+            _walk_ok = True
+            for i in range(i0 + 1, min(i1 + 60, len(q_mj))):
+                # 原链若已与本支汇合(差<0.35) -> 提前接回, 停止替换
+                if i > i1 and np.max(np.abs(q_mj[i] - q_walk)) < 0.35:
+                    break
+                p_t2 = np.array([D_ROBOT - D_WRIST, y_r[i], z_r[i] - pz_ref[i]])
+                qf, ok = ik_mj(p_t2, axis_t[i], q_walk, iters=800,
+                               pos_tol=0.015, ax_tol=0.10)
+                if ok and np.max(np.abs(qf - q_walk)) < 0.8:
+                    q_mj[i] = np.clip(qf, alo, ahi)
+                    used.add(i)
+                    q_walk = qf
+                else:
+                    if i <= i1:
+                        _walk_ok = False        # 窗口内走不通: 退回线性插值
+                    break
+            if _walk_ok:
+                continue                        # 同伦走通(含后续接回), 无需线性法
             for k, i in enumerate(range(i0 + 1, i1)):
+                if i in used:
+                    continue
                 a = smoothstep((k + 1) / n)
                 cand = qa * (1 - a) + qb * a
                 p_c, ax_c = mj_pose(np.clip(cand, alo, ahi))
@@ -395,9 +458,7 @@ def main():
                 if (np.linalg.norm(p_c - p_t2) < 0.03
                         and np.dot(ax_c, axis_t[i]) > 0.95):
                     q_mj[i] = np.clip(cand, alo, ahi)
-                    used.add(i)
-                else:
-                    used.add(i)             # 无法修复也标记, 避免重复处理
+                used.add(i)             # 无法修复也标记, 避免重复处理
         for i in sorted(used):              # 被处理节点的实际腕心同步刷新(弧长积分输入)
             wp2, _ = mj_pose(q_mj[i])
             wri_act[i] = wp2
@@ -457,6 +518,9 @@ def main():
     q_init_vec = qvec_full(np.zeros(10), INIT_PELVIS)
     q_first = qvec_full(trk_q[0], trk_pz[0])
     q_last = qvec_full(trk_q[-1], trk_pz[-1])
+    # 结尾回位(蹲->站)按骨盆升速限幅加长: 蹲末 ~0.34m 抬升压在 2.0s 里与
+    # 下蹲太快同源, 与纯下蹲段同用 0.07m/s
+    n_ret = max(n_ret, int(np.ceil(abs(float(trk_pz[-1] - INIT_PELVIS)) / 0.07 / DT)))
 
     # ---------- 3.5 站->蹲过渡段: 回零位停顿 (等价于按 i 回默认姿态) ----------
     trk_cls = cls[trk_idx].astype(object)
@@ -466,25 +530,46 @@ def main():
     tf = np.where(_zones[1:] != _zones[:-1])[0] + 1
     if len(tf):
         f0, f1 = int(tf.min()), int(tf.max())
-        n_b, n_h = 21, 36                    # 0.7s 收臂 + 1.2s 零位停顿 + 0.7s 伸向蹲姿起点
+        # V2双姿态: 把翻转点前后的整个过渡段(kind=transition)时间窗一并纳入替换
+        # (站->蹲的骨盆/构型切换不做连续插值, 统一走"收臂->零位停顿->伸出+下蹲")
+        while f0 - 1 >= 0 and trk_kind[f0 - 1] == "transition":
+            f0 -= 1
+        while f1 + 1 < n_trk and trk_kind[f1 + 1] == "transition":
+            f1 += 1
         iA, iB = max(f0 - 1, 0), min(f1 + 1, n_trk - 1)
         qA, qB = trk_q[iA], trk_q[iB]
         pzA, pzB = trk_pz[iA], trk_pz[iB]
-        wA, wB = trk_wrist_world[iA].copy(), trk_wrist_world[iB].copy()
+        # 过渡时序(V2.2 拆段, 2026-10-12 实机反馈"蹲下太快"):
+        #   收臂 1.0s(站高) -> 零位停顿 1.2s -> 纯下蹲段(臂贴身, 0.07m/s 慢降)
+        #   -> 蹲底停顿 1.5s(等策略跟踪/外环收敛) -> 蹲姿下伸出 1.0s
+        # 原实现把下蹲塞进伸出段(0.12m/s 一步到位 ~2.8s, 臂同时伸出), 实机
+        # |骨盆-参考| 瞬态冲到 0.247m、蹲姿行落点跟着歪(腕心偏差 15.7cm)
+        n_h = 36
         home_arm = np.zeros(10)              # 零位: 腰三自由度+右臂全零
+        ARM_V = 2.2 / 1.5                   # 臂段限峰值 ~2.2 rad/s(smoothstep 峰=1.5×均)
+        n_b1 = max(31, int(np.ceil(np.abs(qA - home_arm).max() / ARM_V / DT)))
+        n_sq = max(31, int(np.ceil(abs(float(pzB - INIT_PELVIS)) / 0.07 / DT)))
+        n_h2 = 45
+        n_b2 = max(31, int(np.ceil(np.abs(qB - home_arm).max() / ARM_V / DT)))
+        wA, wB = trk_wrist_world[iA].copy(), trk_wrist_world[iB].copy()
         home_w = np.array([0.20, -0.149, INIT_PELVIS + 0.085])
-        b1 = smoothstep(np.arange(1, n_b + 1) / n_b)[:, None]
-        b2 = smoothstep(np.arange(n_b) / n_b)[:, None]
-        home_q = np.vstack([qA + (home_arm - qA) * b1,
-                            np.repeat(home_arm[None], n_h, 0),
-                            home_arm + (qB - home_arm) * b2])
+        home_wc = home_w + np.array([0.0, 0.0, float(pzB) - INIT_PELVIS])
+        b1 = smoothstep(np.arange(1, n_b1 + 1) / n_b1)[:, None]
+        b3 = smoothstep(np.arange(n_sq) / n_sq)[:, None]
+        b2 = smoothstep(np.arange(n_b2) / n_b2)[:, None]
+        home_q = np.vstack([qA + (home_arm - qA) * b1,          # 收臂(站高)
+                            np.repeat(home_arm[None], n_h + n_sq + n_h2, 0),
+                            home_arm + (qB - home_arm) * b2])    # 伸出(蹲高)
         home_pz = np.concatenate([pzA + (INIT_PELVIS - pzA) * b1[:, 0],
                                   np.full(n_h, INIT_PELVIS),
-                                  INIT_PELVIS + (pzB - INIT_PELVIS) * b2[:, 0]])
+                                  INIT_PELVIS + (pzB - INIT_PELVIS) * b3[:, 0],
+                                  np.full(n_h2 + n_b2, float(pzB))])
         home_w = np.vstack([wA + (home_w - wA) * b1,
                             np.repeat(home_w[None], n_h, 0),
-                            home_w + (wB - home_w) * b2])
-        nb = n_b * 2 + n_h
+                            home_w + (home_wc - home_w) * b3,   # 腕随骨盆同降
+                            np.repeat(home_wc[None], n_h2, 0),
+                            home_wc + (wB - home_wc) * b2])
+        nb = n_b1 + n_h + n_sq + n_h2 + n_b2
         w_all = np.linspace(0.0, 1.0, nb)[:, None]
         home_ax = trk_ax[iA] + (trk_ax[iB] - trk_ax[iA]) * w_all
         trk_q = np.vstack([trk_q[:f0], home_q, trk_q[f1 + 1:]])
@@ -494,7 +579,9 @@ def main():
         trk_cls = np.concatenate([trk_cls[:f0], np.full(nb, "yellow", object), trk_cls[f1 + 1:]])
         trk_kind = np.concatenate([trk_kind[:f0], np.full(nb, "home", object), trk_kind[f1 + 1:]])
         n_trk = len(trk_q)
-        print(f"[回零位] 站->蹲过渡插入回家停顿 {nb} 帧 ({nb * DT:.1f}s)", flush=True)
+        print(f"[回零位] 站->蹲过渡五段时序: 收臂{n_b1 * DT:.1f}s + 零位停顿{n_h * DT:.1f}s"
+              f" + 纯下蹲{n_sq * DT:.1f}s + 蹲底停顿{n_h2 * DT:.1f}s + 伸出{n_b2 * DT:.1f}s"
+              f" (共 {nb} 帧 / {nb * DT:.1f}s)", flush=True)
 
     # ---------- 4. 组装相位 ----------
     n_trk = len(trk_q)                       # 回零位拼接后已更新
@@ -1031,6 +1118,31 @@ def main():
         qpos_s[k1 + i, Q10C] = (1 - a) * qA_final + a * q_init_vec[Q10C]
     dq_final = np.abs(np.diff(qpos_s[:, 7:], axis=0)) / DT
     print(f"[最终] 最大关节速度 {dq_final.max():.2f} rad/s", flush=True)
+    # 最终保险丝(2026-10-12): 残余帧级跳变(>1.2rad)关节空间平滑桥接 ——
+    # 两端帧都精确在目标上(A/B 两支解同靶), 仅桥心 1-2 帧偏离目标(≤0.1s 瞬态),
+    # 远优于 117rad/s 不可执行帧速; 整流对这类"角度验收vs保支"两难题无解.
+    for _ in range(3):
+        _dqf = np.abs(np.diff(qpos_s[:, Q10C], axis=0)).max(1)
+        _bad = np.where(_dqf > 0.12)[0]
+        if not len(_bad):
+            break
+        for b in _bad:
+            w = 25
+            i0, i1 = max(0, b - w), min(len(qpos_s) - 1, b + 1 + w)
+            n = i1 - i0
+            for k, i in enumerate(range(i0 + 1, i1)):
+                a = smoothstep((k + 1) / n)
+                for _qi in range(10):
+                    qpos_s[i, 19 + _qi if _qi < 3 else 26 + _qi] = (
+                        qpos_s[i0, 19 + _qi if _qi < 3 else 26 + _qi] * (1 - a)
+                        + qpos_s[i1, 19 + _qi if _qi < 3 else 26 + _qi] * a)
+                # 分支切换瞬间 = 枪关断过渡: 改标黄(非喷涂段, 角度规范豁免);
+                # 墙面缺口由相邻行喷幅重叠覆盖(行距0.10 vs 喷幅~0.20)
+                if str(phase[i]).startswith("track_green") or str(phase[i]).startswith("track_red"):
+                    phase[i] = "track_yellow"
+    _dq = np.abs(np.diff(qpos_s[:, 7:], axis=0)).max(1) * 30
+    dq_final = _dq.copy()                     # 桥接后值覆盖 meta 统计(否则 meta 记桥前尖峰)
+    print(f"[阶段标记] 桥接后最大帧速 {_dq.max():.1f} rad/s @帧{int(np.argmax(_dq))}", flush=True)
 
     # ---------- 5.7 末端指向审计(喷涂质量): 平滑后实测枪轴与墙面法向夹角 ----------
     # root quat 恒 identity -> 墙面法向=世界+x; 审计所有跟踪帧(track_*)但分两类:
@@ -1080,9 +1192,12 @@ def main():
         format="MimicLite any4hdmi-g1-lafan manifest v2: npz{qpos:(T,36) float32}, 30Hz",
         duration_s=round(T * DT, 2), frames=T,
         phases=dict(hold_init_s=HOLD0_S, approach_s=APPROACH_S, track_s=round(T_track, 2),
-                    retreat_s=RETREAT_S, hold_end_s=HOLD1_S),
+                    retreat_s=round(n_ret * DT, 2), hold_end_s=HOLD1_S),
         speed_mps=SPEED, dwell_s=DWELL_S, path_len_m=round(float(ds.sum()), 2),
-        pelvis_ref=dict(crouch=CROUCH_PZ, stand=STAND_PZ,
+        pelvis_ref=dict(stand=STAND_PZ,
+                        crouch=(f"{pz_ref[zone == 'crouch'].min():.3f}"
+                                f"~{pz_ref[zone == 'crouch'].max():.3f}(逐点)" if DUAL
+                                else CROUCH_PZ),
                         range=[round(float(qpos_s[:, 2].min()), 3),
                                round(float(qpos_s[:, 2].max()), 3)]),
         wrist_z_above_ground_m=[round(float(trk_wrist_world[:, 2].min()), 3),

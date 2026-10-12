@@ -3,7 +3,7 @@
   "g1": {
     "name": "Unitree G1 (29dof, 右臂喷枪)",
     "urdf": "g1_29dof_nohand.urdf",
-    "mjcf": "/home/yang/.cache/huggingface/hub/models--elijahgalahad--g1_xmls/snapshots/1c1d082f299126b9272e81c04121ff347c97fa8f/g1-mode_13_15.xml",
+    "mjcf": "~/.cache/huggingface/hub/models--elijahgalahad--g1_xmls/snapshots/1c1d082f299126b9272e81c04121ff347c97fa8f/g1-mode_13_15.xml",
     "arm": "right",
     "dof": {
       "waist": 3,
@@ -25,7 +25,7 @@
     "workspace_npz": "output/g1_workspace.npz",
     "motion_ver": "v5_stand_zigzag",
     "nn_ik_file": "station/nn_ik/g1_nn_ik.npz",
-    "model_dir": "/home/yang/桌面/遥操/g1_model",
+    "model_dir": "~/桌面/遥操/g1_model",
     "urdf_file": "g1_29dof_nohand.urdf"
   }
 }

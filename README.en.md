@@ -46,8 +46,9 @@ This repository is an archival record of that work: every module keeps its runna
 | | Dependencies | numpy + matplotlib only — no PCL/Open3D |
 | station-planning | 10 m × 2 m demo wall | 4 BCD cells → **12 stances**, gapless coverage |
 | | Per-stance coverage (±30° waist yaw) | ≈1.1 m wide; reachability 1.12 m² / spray coverage 2.53 m² |
-| g1-wall-spray | Per-point IK on the zigzag | **307/307 converged**, gun-wall angle ≥60° throughout |
-| | NN-IK seed convergence (iters=60) | **98.0%** vs 31.3% with random seeds |
+| g1-wall-spray | Per-point IK, dual-posture trajectory | **433/433 converged**, measured gun-wall angle 61.6–90° |
+| | NN-IK universal model seed convergence (iters=60) | **64%** vs 23.8% random MC (no retrain across waist/crouch configs) |
+| | Full-band spray on the physical G1 (2026-10-12, ×1.0, 155.6 s) | stand+crouch 0.35–1.45 m; zero mode-flapping while standing, gentle 0.13 m/s squat descent |
 | | Base-disturbance compensation (wrist error, world frame) | 32 mm → **4 mm** |
 | | Full planning pipeline (03 → packaging → final audit) | ≈ 33 s |
 | openarm-zigzag | Full-run duration (MPC baseline → RL+ILC) | ~300 s → **143.6 s**, zero e-stops |

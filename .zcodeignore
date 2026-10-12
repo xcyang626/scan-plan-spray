@@ -1,0 +1,58 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv*/
+
+# ---- ROS 2 / colcon 构建产物（可重建） ----
+build/
+install/
+log/
+
+# ---- g1-wall-spray 运行期产物 ----
+g1-wall-spray/output/
+g1-wall-spray/runs/
+g1-wall-spray/release/
+g1-wall-spray/station/run/
+g1-wall-spray/station/robot_status.json
+g1-wall-spray/station/robot.pid
+g1-wall-spray/station/*.fifo
+
+# ---- pointcloud-registration 运行输出（样例输入 ply 已入库，不放输出） ----
+pointcloud-registration/舱室点云/舱室地图机器人扫描版本.*
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+.DS_Store
+*.bak*
+
+# ===== ↑ 以上同步自 .gitignore（「从 .gitignore 同步」只重写以上部分）=====
+.git/
+.hg/
+.svn/
+node_modules/
+bower_components/
+jspm_packages/
+site-packages/
+venv/
+coverage/
+htmlcov/
+lcov-report/
+cmakefiles/
+cmake-build-*/
+bazel-*/
+pods/
+deriveddata/
+storybook-static/
+playwright-report/
+test-results/
+allure-results/
+allure-report/
+cdk.out/
+*.egg-info/
+*.dist-info/
+eggs/
+pip-wheel-metadata/
+wheels/
+# ----- ↑ 以上为 ZCode 默认排除规则（自定义规则请写在本行下方，不会被同步/恢复改动）-----
+# 自定义规则写在下方（本行提示可删除）

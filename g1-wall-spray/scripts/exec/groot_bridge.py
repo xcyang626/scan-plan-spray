@@ -40,12 +40,20 @@ if GROOT_ROOT not in sys.path:
 
 
 def _default_zmq_host():
-    """ZMQ 绑定地址: 优先 env.json 的 zmq_host(约定必须 localhost),
-    无配置时默认 127.0.0.1 —— 不再裸绑 '*'(全网卡可达). CLI --host 可显式覆盖."""
+    """ZMQ 绑定地址: 优先 env.json(+env.local.json 覆盖)的 zmq_host
+    (约定必须 localhost), 无配置时默认 127.0.0.1 —— 不再裸绑 '*'(全网卡可达).
+    CLI --host 可显式覆盖."""
     try:
         _base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        h = json.load(open(os.path.join(_base, "station", "env.json"),
-                           encoding="utf8")).get("zmq_host")
+        _d = json.load(open(os.path.join(_base, "station", "env.json"),
+                            encoding="utf8"))
+        try:      # 本机覆盖层(不入库), 与 10_station_app 同机制
+            _d.update(json.load(open(
+                os.path.join(_base, "station", "env.local.json"),
+                encoding="utf8")))
+        except Exception:
+            pass
+        h = _d.get("zmq_host")
         return h or "127.0.0.1"
     except Exception:
         return "127.0.0.1"
@@ -64,6 +72,7 @@ from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (  # noqa: E402
 UPPER_BODY_IDX = [19, 20, 21] + list(range(22, 29)) + list(range(29, 36))
 # LocomotionMode::IDLE —— planner 模式下"原地站立"（下肢由机器人自身平衡）
 MODE_IDLE = 0
+MODE_IDLE_SQUAT = 4          # LocomotionMode.IDEL_SQUAT: planner 只在蹲姿系模式消费 target_height
 
 # GR00T 原生按键（与官方 keyboard/zmq 接口一致）
 KEY_START = "]"        # 启动控制
@@ -97,9 +106,9 @@ class Publisher:
     # ---- 官方 planner 话题: 上肢 17 关节目标 ----
     def planner_upper_body(self, upper17, movement=(0.0, 0.0, 0.0),
                            facing=(1.0, 0.0, 0.0), speed=-1.0, height=-1.0,
-                           upper_vel=None):
+                           upper_vel=None, mode=None):
         self.pub.send(build_planner_message(
-            mode=MODE_IDLE, movement=movement, facing=facing,
+            mode=(MODE_IDLE if mode is None else int(mode)), movement=movement, facing=facing,
             speed=speed, height=height,
             upper_body_position=list(np.asarray(upper17, float)),
             upper_body_velocity=None if upper_vel is None else list(np.asarray(upper_vel, float)),

@@ -31,6 +31,13 @@ _ENV_JSON = {}
 try:
     _ENV_JSON = json.load(open(os.path.join(BASE, "station", "env.json"),
                                encoding="utf8"))
+    # 本机覆盖层: station/env.local.json 不入库(.gitignore)。跟踪版 env.json
+    # 只放通用占位(无本机路径/内网配置), 换机部署 = 复制为 env.local.json 填值
+    try:
+        _ENV_JSON.update(json.load(open(
+            os.path.join(BASE, "station", "env.local.json"), encoding="utf8")))
+    except Exception:
+        pass
 except Exception:
     pass
 ISA_PY = (os.environ.get("G1W_ISA_PY") or _ENV_JSON.get("isaac_py")
@@ -161,7 +168,8 @@ def _daemon_event(m):
     ev = m.get("event")
     if ev == "stream_meta":
         log(f"▶ 官方上肢流: {m.get('frames')} 帧 / {m.get('duration_s')}s "
-            f"@{m.get('rate')}Hz (speed×{m.get('speed')})")
+            f"@{m.get('rate')}Hz (speed×{m.get('speed')})"
+            + (" [蹲姿通道: planner height + 骨盆闭环]" if m.get("height_channel") else ""))
     elif ev == "stream_run":
         log("blend 过渡完成, 轨迹开始")
     elif ev == "stream_progress":
@@ -169,8 +177,18 @@ def _daemon_event(m):
         write_status_phase("playing", progress=(k / n if n else 0.0))
     elif ev == "stream_done":
         write_status_phase("done", progress=1.0)
-        log(f"★ 轨迹执行完成: {m.get('frames')} 帧已全部下发, "
-            f"{m.get('note') or '保持末姿'}")
+        _hc = " [蹲姿通道]"
+        if m.get("height_channel") or m.get("pelvis_err_max") is not None:
+            log(f"★ 轨迹执行完成: {m.get('frames')} 帧已全部下发, "
+                f"{m.get('note') or '保持末姿'}"
+                f"{_hc} 骨盆最低 {m.get('pelvis_min')}m / |骨盆-参考|最大 "
+                f"{m.get('pelvis_err_max')}m / 腕心高度偏差 max "
+                f"{(m.get('wrist_z_err_max') or 0)*100:.1f}cm"
+                f"(走线水平度) / 枪偏离法向 max "
+                f"{m.get('gun_angle_off_max')}°")
+        else:
+            log(f"★ 轨迹执行完成: {m.get('frames')} 帧已全部下发, "
+                f"{m.get('note') or '保持末姿'}")
     elif ev == "stream_cancelled":
         write_status_phase("soft_stopped")
         log(f"动作流已取消 ({m.get('note') or '官方退出序列'})")
@@ -360,7 +378,8 @@ def _robot_status():
     st = {"running": live, "mode": ROBOT_MODE, "daemon": _DAEMON.alive()}
     try:
         f = json.load(open(ROBOT_STATUS_F, encoding="utf8"))
-        for k in ("phase", "progress", "pelvis", "motion", "frames", "done_runs"):
+        for k in ("phase", "progress", "pelvis", "motion", "frames", "done_runs",
+                  "pelvis_min", "pelvis_err_max", "fallen", "impact_err"):
             if k in f:
                 st[k] = f[k]
     except Exception:
@@ -402,10 +421,13 @@ def kill_deploy(soft_wait=8.0):
     return _robot_pid() is None
 
 
-def start_robot():
-    """启动机器人: 拉起 GR00T-WBC 仿真+策略, 机器人回到初始站姿并等待执行."""
-    global ESTOP
+def start_robot(posture="stand"):
+    """启动机器人: 拉起 GR00T-WBC 仿真+策略, 机器人回到初始站姿并等待执行.
+    posture=dual 时 sim 分支给 runner 追加 --height(蹲姿执行通道: 动作骨盆高
+    写入 height_cmd, 由平衡策略下蹲) —— 执行通道与回放都能看到完整蹲姿."""
+    global ESTOP, _ROBOT_HEIGHT
     ESTOP = False               # 新会话起点: 解除急停对 stage 线程的封锁
+    _ROBOT_HEIGHT = True     # sim 启动永远预挂 --height(见下方 sim 分支说明)
     # 停掉可能在跑的动作流(否则机器人停在喷涂姿态, 看起来"没回初始位姿")
     try:
         subprocess.run(["pkill", "-f", "send_upper_body_trajector[y]"], timeout=5)
@@ -509,8 +531,15 @@ def start_robot():
                 write_status_phase("standing")
             threading.Thread(target=_auto_start, daemon=True).start()
     else:
+        # sim 启动永远预挂蹲姿通道: 对站姿动作无影响(height_cmd 播放期才生效且跟随
+        # 动作骨盆, 站姿动作即恒 ~0.758; 待命期自动回 yaml 默认) —— 从机制上消灭
+        # "启动时刻姿态选择决定能否下蹲"这一整类失败(2026-10-10 两次实测踩中)
+        # --log: 每次执行自动留跟踪日志(落点误差诊断的数据源, 每次运行覆盖)
+        _cmd = [GROOT_PY, ROBOT_RUNNER, "--trigger", TRIGGER_F, "--height",
+                "--log", os.path.join(BASE, "output", "exec_last.npz")]
+        log("▶ 蹲姿执行通道已预挂(--height): 站姿动作不受影响, 双姿态动作可直接下蹲")
         _ROBOT_PROC = subprocess.Popen(
-            [GROOT_PY, ROBOT_RUNNER, "--trigger", TRIGGER_F],
+            _cmd,
             cwd=GROOT_ROOT, env=env, stdout=logf, stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL, start_new_session=True)
     write_status_phase("starting")        # 原子写(与各线程并发写共用一把锁)
@@ -602,6 +631,23 @@ def exec_spray(motion_path, run_dir=None, speed=None):
         return {"err": "机器人未启动 — 请先点【启动机器人】"}
     if not motion_path or not os.path.exists(motion_path):
         return {"err": f"动作文件不存在: {motion_path}"}
+    # V2 双姿态执行防护(兜底): sim 启动现已永远预挂 --height, 此守卫只防手撸 CLI/
+    # 异常路径; trajectory_meta 在 run_dir(动作路径需上溯三层, 旧代码少算一层从未生效)
+    try:
+        _rd = JOB.get("run_dir") or os.path.dirname(
+            os.path.dirname(os.path.dirname(motion_path)))
+        _tmeta = os.path.join(_rd, "trajectory_meta.json")
+        _is_dual = (os.path.exists(_tmeta)
+                    and json.load(open(_tmeta, encoding="utf8")).get("posture") == "dual")
+    except Exception:
+        _is_dual = False
+    if _is_dual and not _ROBOT_HEIGHT:
+        return {"err": "该动作含蹲姿段, 但机器人未以蹲姿通道启动 — 请把喷涂姿态选为"
+                       "「站+蹲双姿态」后重新点【启动机器人】, 再执行"}
+    if _is_dual:
+        log("▶ 双姿态动作: 蹲姿执行通道已启用"
+            + (" (planner height + 骨盆闭环, SONIC 策略下蹲)" if ROBOT_MODE == "real"
+               else " (骨盆高 -> height_cmd, 策略下蹲)"))
     try:
         speed = EXEC_SPEED if speed is None else float(speed)
     except (TypeError, ValueError):
@@ -665,8 +711,53 @@ def exec_spray(motion_path, run_dir=None, speed=None):
         return {"err": f"执行下发失败: {ex}"}
 
 
+def open_replay():
+    """打开(必要时先生成) MuJoCo 仿真回放视频 —— 未接机器人时查看喷涂效果的主通道.
+    双姿态动作的蹲姿段只在回放里完整呈现(执行通道腿由 RL 平衡, 不下蹲)."""
+    with LOCK:
+        if JOB.get("replay_busy"):
+            return {"err": "回放生成中, 请稍候(完成后自动打开播放器)"}
+        run_dir, ver = JOB.get("run_dir"), JOB.get("motion_ver")
+        if not run_dir or not ver or not os.path.exists(
+                os.path.join(run_dir, "ufo_motion", ver, "wall_spray_motion.npz")):
+            return {"err": "尚无已生成的动作 — 请先完成轨迹与动作生成"}
+        mp4 = os.path.join(run_dir, "ufo_motion", ver, "replay_motion.mp4")
+        if os.path.exists(mp4):
+            subprocess.Popen(["xdg-open", mp4], stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+            log(f"★ 已打开仿真回放: {mp4}")
+            return {"ok": True, "opened": True}
+        JOB["replay_busy"] = True
+    threading.Thread(target=_render_replay, args=(run_dir, ver, mp4),
+                     daemon=True).start()
+    log("▶ 仿真回放渲染中(06 渲染 + 06b 合成, 约2~4分钟), 完成后自动打开播放器")
+    return {"ok": True, "rendering": True}
+
+
+def _render_replay(run_dir, ver, mp4):
+    """后台渲染回放并打开; 06 用 mujoco 环境(egl 无头渲染), 06b 用 isaaclab 环境合成."""
+    try:
+        run_stage("06 回放渲染(MuJoCo)",
+                  [MUJ_PY, "06_replay_render.py"],
+                  env={"G1W_OUT": run_dir, "MOTION_VER": ver,
+                       "MUJOCO_GL": "egl",
+                       "DISPLAY": os.environ.get("DISPLAY", ":0")}, timeout=1800)
+        run_stage("06b 回放合成(mp4+九宫格)",
+                  [ISA_PY, "06b_make_replay_video.py"],
+                  env={"G1W_OUT": run_dir, "MOTION_VER": ver}, timeout=600)
+        subprocess.Popen(["xdg-open", mp4], stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+        log(f"★ 仿真回放已生成并打开: {mp4}")
+    except Exception as ex:
+        log(f"✘ 仿真回放生成失败: {ex}")
+    finally:
+        with LOCK:
+            JOB["replay_busy"] = False
+
+
 def _p(v):
-    """registry 路径解析: 绝对原样, 相对则基于工程根(打包后随包走)."""
+    """registry 路径解析: 先展开 ~, 绝对原样, 相对则基于工程根(打包后随包走)."""
+    v = os.path.expanduser(v) if v else v
     return v if (not v or os.path.isabs(v)) else os.path.join(BASE, v)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -690,10 +781,11 @@ for _r in REGISTRY.values():                     # 模型路径相对化(打包�
 
 JOB = {"state": "idle", "stage": "", "t0": None, "log": [], "error": None,
        "metrics": {}, "artifacts": {}, "motion_ver": None, "robot": "g1",
-       "ros_mode": None}
+       "ros_mode": None, "posture": "stand", "replay_busy": False}
 LOCK = threading.Lock()
 PROC = None
 ESTOP = False          # 急停封锁标志: /api/estop 置位; start_robot/stop_robot/退出 清除
+_ROBOT_HEIGHT = False  # V2: 机器人是否以蹲姿通道(--height)启动(start_robot 设置)
 
 
 STATE_F = os.path.join(BASE, "station", "run", "last_job.json")
@@ -781,14 +873,21 @@ def stage_plan(cfg):
         os.makedirs(run_dir, exist_ok=True)
         JOB["run_dir"] = run_dir
         log(f"运行目录 {run_dir}")
-        ws_dir, ws_new = ensure_workspace(cfg["robot"], cfg["waist_deg"])
+        crouch_lo = 0.35 if cfg.get("posture") == "dual" else 0.60   # V2 蹲姿地板(实测闭环执行可稳)
+        ws_dir, ws_new = ensure_workspace(cfg["robot"], cfg["waist_deg"], crouch_lo)
         JOB["waist_deg"] = cfg["waist_deg"]
+        JOB["posture"] = cfg.get("posture", "stand")
+        if cfg.get("posture") == "dual":
+            log(f"▶ V2 双姿态模式(蹲姿地板 {crouch_lo}m): 站姿喷上半 -> 回零位过渡 "
+                f"-> 蹲姿喷下半")
         if ws_new:
-            log(f"腰限 ±{cfg['waist_deg']:.0f}°: 首次使用, 重算工作区(约3分钟)…")
-            run_stage(f"02 工作区重算(腰±{cfg['waist_deg']:.0f}°)",
+            log(f"腰限 ±{cfg['waist_deg']:.0f}°/蹲姿地板 {crouch_lo}m: 首次使用, "
+                f"重算工作区(约3分钟)…")
+            run_stage(f"02 工作区重算(腰±{cfg['waist_deg']:.0f}°, 蹲姿地板{crouch_lo})",
                       [ISA_PY, "02_g1_workspace.py"],
                       env={"G1W_OUT": ws_dir,
-                           "G1W_WAIST_RP": str(round(cfg["waist_deg"] * math.pi / 180, 6))},
+                           "G1W_WAIST_RP": str(round(cfg["waist_deg"] * math.pi / 180, 6)),
+                           "G1W_CROUCH_LO": str(crouch_lo)},
                       timeout=900)
         if _estop_check("轨迹生成(点云解析前)"):
             return
@@ -796,7 +895,8 @@ def stage_plan(cfg):
                "G1W_OUT": run_dir, "G1W_IN": ws_dir,
                "G1W_ROBOT": cfg["robot"], "G1W_MJCF": REGISTRY[cfg["robot"]]["mjcf"],
                "G1W_WAIST_RP": str(round(cfg["waist_deg"] * math.pi / 180, 6)),
-               "G1W_WAIST_DEG": str(int(round(cfg["waist_deg"])))}
+               "G1W_WAIST_DEG": str(int(round(cfg["waist_deg"]))),
+               "G1W_CROUCH_LO": str(crouch_lo)}
         if cfg.get("cloud"):
             run_stage("点云解析(墙面/距离/障碍)",
                       [ISA_PY, "11_cloud_scan.py", "--cloud", cfg["cloud"],
@@ -814,6 +914,8 @@ def stage_plan(cfg):
         cfg["d_robot"] = cfg["dist"]                   # 无点云: 标称距离即墙面距离
         if "wall_x" not in cfg:
             cfg["wall_x"] = cfg["dist"]
+        if cfg.get("posture") == "dual":
+            cfg.setdefault("crouch_top", 0.65)      # V2 用户定稿: 0.55/0.65 行归蹲姿带
         json.dump(cfg, open(os.path.join(run_dir, "cfg.json"), "w", encoding="utf8"),
                   ensure_ascii=False, indent=1)
         if _estop_check("轨迹生成(03 规划前)"):
@@ -844,10 +946,11 @@ def stage_motion(cfg):
     注: state=motion 已由 /api/approve 在锁内置位(防快速双击并发起两个动作线程)."""
     t0 = time.time()
     try:
-        ver = f"v5_run{datetime.datetime.now().strftime('%H%M%S')}"
+        ver = f"v{'6' if cfg.get('posture') == 'dual' else '5'}_run{datetime.datetime.now().strftime('%H%M%S')}"
         JOB["motion_ver"] = ver
         run_dir = JOB.get("run_dir") or RUN
-        _ws_dir, _ = ensure_workspace(cfg["robot"], cfg.get("waist_deg", 5.0))
+        crouch_lo = 0.35 if cfg.get("posture") == "dual" else 0.60
+        _ws_dir, _ = ensure_workspace(cfg["robot"], cfg.get("waist_deg", 5.0), crouch_lo)
         if _estop_check("动作生成(05 导出前)"):
             return
         env = {"MOTION_VER": ver, "G1W_ROBOT": cfg["robot"],
@@ -855,7 +958,8 @@ def stage_motion(cfg):
                "G1W_CFG": os.path.join(run_dir, "cfg.json"),
                "G1W_OUT": run_dir, "G1W_IN": _ws_dir,
                "G1W_WAIST_RP": str(round(cfg.get("waist_deg", 5.0) * math.pi / 180, 6)),
-               "G1W_WAIST_DEG": str(int(round(cfg.get("waist_deg", 5.0))))}
+               "G1W_WAIST_DEG": str(int(round(cfg.get("waist_deg", 5.0)))),
+               "G1W_CROUCH_LO": str(crouch_lo)}
         run_stage("05 动作导出(增量MJCF-IK+NN种子)", [MUJ_PY, "05_export_ufo_motion.py"], env)
         if _estop_check("动作生成(05b 时序图前)"):
             return
@@ -883,12 +987,20 @@ def stage_motion(cfg):
         except Exception as ex:
             log(f"基座补偿指标读取失败: {ex}")
         if cfg.get("ros"):
-            from ros_bridge import emit_run
-            r = emit_run(cfg["robot"], traj_dir=run_dir,
-                         motion_dir=mdir, out_base=run_dir)
-            JOB["ros_mode"] = r["mode"]
-            JOB["artifacts"]["ros"] = r
-            log(f"★ ROS topics 输出完成: {r['mode']}")
+            # ROS 输出桥要读 npz(需要 numpy), 站点主进程是系统 python(无 numpy) ->
+            # 子进程用 isaaclab 解释器跑, 结果落 ros_emit_result.json 回读
+            res_f = os.path.join(run_dir, "ros_emit_result.json")
+            try:
+                run_stage("ROS topic 输出",
+                          [ISA_PY, "ros_bridge.py", "--robot", cfg["robot"],
+                           "--traj", run_dir, "--motion", mdir, "--out", run_dir],
+                          env, timeout=300)
+                r = json.load(open(res_f, encoding="utf8"))
+                JOB["ros_mode"] = r["mode"]
+                JOB["artifacts"]["ros"] = r
+                log(f"★ ROS topics 输出完成: {r['mode']}")
+            except Exception as ex:
+                log(f"⚠ ROS 输出失败(不影响动作使用): {ex}")
         json.dump(dict(robot=cfg.get("robot"), dist=cfg.get("dist"),
                        pitch=cfg.get("pitch"), cloud=cfg.get("cloud"),
                        waist_deg=cfg.get("waist_deg"),
@@ -925,8 +1037,15 @@ def _traj_summary(tj):
     rows = tj.get("row_params", [])
     return dict(points=tj.get("n_points"), rows=len(rows),
                 z_w=[round(r["z_w"], 3) for r in rows],
+                stroke_dir=tj.get("stroke_dir", "horizontal"),
+                columns=len(tj.get("columns") or []),
+                stroke_geom_ok=tj.get("stroke_geom_ok"),
+                zones=[r.get("zone") or "stand" for r in rows],
                 angles=[r["angle_deg"] for r in rows],
                 stroke_u=tj.get("uniform_stroke_u"),
+                posture=tj.get("posture", "stand"),
+                crouch_rows=((tj.get("stations") or {}).get("crouch_rows", 0)),
+                h_min_row=tj.get("h_min_row"),
                 angle_range=([round(v, 1) for v in tj["angle_achieved_deg"]]
                              if tj.get("angle_achieved_deg") else None),
                 angle_ok=tj.get("angle_rule_ok"),
@@ -1009,6 +1128,7 @@ class H(BaseHTTPRequestHandler):
             cfg = dict(robot=body.get("robot", "g1"), dist=float(body["dist"]),
                        pitch=float(body.get("pitch", 0.10)),
                        waist_deg=float(body.get("waist_deg", 5.0)),
+                       posture=("dual" if body.get("posture") == "dual" else "stand"),
                        h_top=body.get("h_top"), cloud=body.get("cloud"),
                        ros=bool(body.get("ros")))
             with LOCK:
@@ -1037,6 +1157,8 @@ class H(BaseHTTPRequestHandler):
                 JOB.update(state="motion", error=None)
             threading.Thread(target=stage_motion, args=(cfg,), daemon=True).start()
             self._send(200, {"ok": True})
+        elif u.path == "/api/open_replay":
+            return self._send(200, open_replay())
         elif u.path == "/api/package":
             r = package()
             self._send(200, r)
@@ -1079,7 +1201,8 @@ class H(BaseHTTPRequestHandler):
             self._send(200, {"ok": True, "robot": robot})
         elif u.path == "/api/robot/start":
             try:
-                return self._send(200, start_robot())
+                return self._send(200, start_robot(
+                    posture=("dual" if body.get("posture") == "dual" else "stand")))
             except Exception as ex:
                 return self._send(500, {"err": str(ex)})
         elif u.path == "/api/estop":
@@ -1192,6 +1315,8 @@ class H(BaseHTTPRequestHandler):
         wd = float(b.get("waist_deg", 5))
         if wd not in (5.0, 10.0, 15.0, 20.0):
             return f"腰限档位仅支持 5/10/15/20°, 收到 {wd}°"
+        if b.get("posture") not in (None, "stand", "dual"):
+            return f"喷涂姿态仅支持 stand/dual, 收到 {b.get('posture')!r}"
         d = float(b.get("dist", 0))
         lo, hi = r["stance_band_m"]
         if not (lo - 1e-9 <= d <= hi + 1e-9):
@@ -1271,10 +1396,12 @@ def np_deg(x):
 WS_CACHE = os.path.join(BASE, "output", "ws_cache")
 
 
-def ensure_workspace(robot, waist_deg):
-    """按腰限角度缓存工作区; 首次遇到该角度时重算 02(约3分钟), 之后秒级命中.
+def ensure_workspace(robot, waist_deg, crouch_lo=0.60):
+    """按(腰限角度, 蹲姿地板)缓存工作区; 首次遇到该组合重算 02(约3分钟), 之后秒级命中.
+    V2 双姿态: 蹲姿地板 0.40(实测 height_sweep 策略可稳到 0.29, 留臂负载裕量).
     返回 (ws_dir, created)."""
-    d = os.path.join(WS_CACHE, f"{robot}_rp{int(waist_deg)}")
+    d = os.path.join(WS_CACHE,
+                     f"{robot}_rp{int(waist_deg)}_c{int(round(crouch_lo * 100))}")
     os.makedirs(d, exist_ok=True)
     if not os.path.exists(os.path.join(d, "g1_workspace.npz")):
         for f in ("wall_section.npz", "wall_section_meta.json"):
@@ -1477,6 +1604,7 @@ background:rgba(255,255,255,.05);color:var(--text3);border:1px solid var(--line)
 .chip.on{color:#0b1510;background:var(--ok);border-color:transparent}
 .chip.cur{outline:2px solid rgba(41,211,145,.55);outline-offset:1px}
 #logbox summary{cursor:pointer;color:var(--text2);font-size:12.5px;padding:2px 0 6px;user-select:none}
+#loglog{max-height:340px;overflow-y:auto;scrollbar-width:thin;white-space:pre-wrap;word-break:break-all}
 #b1{position:relative;overflow:hidden;padding:14px;font-size:15.5px;
 background:linear-gradient(180deg,#1478f8,#0060d0);
 box-shadow:0 1px 0 rgba(255,255,255,.15) inset,0 4px 18px rgba(0,112,243,.4)}
@@ -1618,6 +1746,12 @@ details summary{cursor:pointer;color:var(--text2)}
   </div>
   <label>腰 roll/pitch 限位档位 (即选即用)</label>
   <select id=waist onchange="markStale();renderChips()"></select>
+  <label style="margin-top:8px">喷涂姿态 (V2 新增)</label>
+  <select id=posture onchange="markStale();localStorage.setItem('spray_posture',this.value)">
+    <option value=stand>站姿单一 (v5 · 0.55~1.45m)</option>
+    <option value=dual>站+蹲双姿态 (V2 · ≈0.20~1.5m · 先站后蹲)</option>
+  </select>
+  <div class=small style="margin-top:4px;color:var(--warn)">双姿态执行需以本模式点【启动机器人】(自动启用蹲姿通道: 骨盆高→height_cmd, 策略下蹲)</div>
   <div class=sec>场景输入</div>
   <label>点云图 (可选 · 墙面拟合+障碍自动避让)</label>
   <input id=cloud type=file accept=.ply,.pcd,.npy,.txt,.csv>
@@ -1642,6 +1776,8 @@ details summary{cursor:pointer;color:var(--text2)}
       <option value=0.5>速度 0.5× (半速复核)</option>
       <option value=0.25>速度 0.25× (慢速)</option>
     </select>
+    <button id=bReplay onclick=doOpenReplay() style="display:none;margin-top:8px;font-size:15px;padding:12px"
+      title="生成(如缺)并打开 MuJoCo 仿真回放视频 —— 未接机器人时查看喷涂效果的主通道, 含双姿态蹲姿段">▶ 打开仿真回放 (MuJoCo · 含蹲姿)</button>
   </div>
   <div id=inspect_sec></div>
 </div>
@@ -1654,6 +1790,7 @@ async function boot(){
   $('robot').innerHTML = Object.entries(init.robots).map(([k,v])=>`<option value=${k}>${v.name}</option>`).join('');
   $('waist').innerHTML = [5,10,15,20].map(d=>`<option value=${d}>±${d}°</option>`).join('');
   $('waist').value='5';
+  { const sp=localStorage.getItem('spray_posture'); if(sp) $('posture').value=sp; } // 刷新不丢姿态选择
   loadRobotModel($('robot').value); renderChips();
   const nn = init.nn['g1'];
   $('nn_badge').innerHTML = nn&&nn.deployed ? `NN-IK: g1 已部署 (数据 ${nn.n_data})` : 'NN-IK: 未部署(回退快速IK)';
@@ -1692,7 +1829,7 @@ async function doPlan(){
   if(upFile==null && $('cloud').files.length){ /*未上传完*/ }
   tPlan=performance.now();
   const r=await fetch('/api/plan',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({robot:$('robot').value,dist:+$('dist').value,pitch:+$('pitch').value,waist_deg:+$('waist').value,cloud:upFile,ros:$('ros').checked})});
+    body:JSON.stringify({robot:$('robot').value,dist:+$('dist').value,pitch:+$('pitch').value,waist_deg:+$('waist').value,posture:$('posture').value,cloud:upFile,ros:$('ros').checked})});
   const j=await r.json(); if(j.err) alert(j.err);
 }
 function countUp(el){
@@ -1706,7 +1843,22 @@ function buildInspect(s){
   const fmap=Object.fromEntries(((s.figs&&s.figs.length?s.figs:init.figs)||[]).map(x=>[x.name,x.url]));
   const t=s.metrics.traj, m=s.metrics.motion||null, c=s.metrics.cloud||null;
   const w=t.stroke_u? (t.stroke_u[1]-t.stroke_u[0]).toFixed(3):'-';
-  const mono=(t.z_w||[]).every((v,i,a)=>i===0||v>a[i-1]);
+  // z_w 单调按“带”分段校验: 站姿带内递增 -> 换带(蹲姿从头喷) -> 蹲姿带内递增。
+  // 双姿态跨带回落是设计使然, 整条全局递增的旧判据会误报“叠层异常”。
+  const zw=t.z_w||[]; let zn=t.zones||[];
+  if(zw.length&&zn.length!==zw.length){
+    // 旧摘要无逐行 zone: z_w 显著回落(>0.05m)处视为站->蹲换带, 其后均为蹲带
+    // (执行序为先整段站姿带再整段蹲姿带, 回落只出现在换带首行)
+    let band='stand';
+    zn=zw.map((v,i)=>{ if(i>0&&v<zw[i-1]-0.05) band='crouch'; return band; });
+  }
+  let mono=true;
+  for(let i=1;i<zw.length;i++){
+    if(zn[i]&&zn[i]!==zn[i-1]) continue;          // 带边界: 允许回落
+    if(!(zw[i]>zw[i-1])){mono=false;break;}
+  }
+  const isV=t.stroke_dir==='vertical';
+  const bands={}; (zn.length?zn:['stand']).forEach(z=>bands[z]=(bands[z]||0)+1);
   const caps={'base_comp_report.png':'基座扰动补偿验证(世界系锁定)','fig_wall_path_2d.png':'墙面之字形(含点云背景/障碍框)','fig_robot_path_2d.png':'腕心轨迹与指向(点云背景)','fig_3d_scene.png':'3D 全景','cloud_report.png':'你的点云报告'};
   const names=['fig_wall_path_2d.png','fig_robot_path_2d.png','fig_3d_scene.png','base_comp_report.png'];
   if(c) names.push('cloud_report.png');
@@ -1715,8 +1867,11 @@ function buildInspect(s){
     `<div class=sumitem>行角 <b>${(t.angles||[]).join('/')}</b></div>`,
     `<div class=sumitem>等宽 <b>${w} m</b> (u ${t.stroke_u?t.stroke_u.map(x=>x.toFixed(3)).join('~'):''})</div>`,
     `<div class=sumitem>实测夹角 <b>${t.angle_range?t.angle_range.map(x=>x.toFixed(1)).join('~'):'-'}°</b> ${t.angle_ok?'<span class=badge-ok></span>':'<span class=badge-bad></span>'}</div>`,
-    `<div class=sumitem>z_w 叠层 <b>${mono?'单调':'异常'}</b>${mono?'<span class=badge-ok></span>':'<span class=badge-bad></span>'}</div>`];
+    (isV
+      ? `<div class=sumitem>竖直列 <b>${t.columns??'-'} 列</b> u极差=0${t.stroke_geom_ok?'<span class=badge-ok></span>':'<span class=badge-bad></span>'}</div>`
+      : `<div class=sumitem>z_w 带内叠层 <b>${mono?'单调':'异常'}</b>${mono?'<span class=badge-ok></span>':'<span class=badge-bad></span>'}</div>`)];
   if(m&&m.frames) sum.push(`<div class=sumitem>动作 <b>${m.frames}</b> 帧 / ${m.duration_s}s / 峰速 ${m.max_vel} rad/s</div>`);
+  sum.splice(1,0,`<div class=sumitem>姿态 <b>${t.posture==='dual'?'站+蹲双姿态':'站姿单一'}</b>${t.posture==='dual'?` (蹲带 ${t.crouch_rows??'-'} 行 · 行下限 ${t.h_min_row!=null?t.h_min_row.toFixed(2):'-'}m)`:''}</div>`);
   const b=s.metrics.base_comp;
   if(b) sum.push(`<div class=sumitem>基座扰动锁定 <b>${b.nc_mm}→${b.lock_mm}mm</b> ${b.lock_mm<=8?'<span class=badge-ok></span>':'<span class=badge-bad></span>'}</div>`,
                  `<div class=sumitem>补偿后夹角 <b>${b.ang_min}°</b> / 腰限位 ${b.waist_ok?'保持':'超限!'}</div>`);
@@ -1807,7 +1962,8 @@ async function doExitRobot(){
   toast(j.exited? '已退出程序 (部署进程已结束)' : '退出: 当前无运行中的进程');
 }
 async function doStartRobot(){
-  const j=await (await fetch('/api/robot/start',{method:'POST'})).json();
+  const j=await (await fetch('/api/robot/start',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({posture:($('posture')||{}).value||'stand'})})).json();
   if(j.err){ toast(j.err); return; }
   // 启动机器人 = 新会话起点: 清空旧结果与作废标记, 界面回到干净初始态
   _stale=false; _inspShown=0; _sig=null;
@@ -1845,6 +2001,15 @@ async function doExec(){
     else toast(`已下发执行(×${spd}) — 机器人开始按轨迹喷涂`);
   }catch(e){ toast('执行调用失败: '+e); }
 }
+async function doOpenReplay(){
+  try{
+    const r=await fetch('/api/open_replay',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    const j=await r.json();
+    if(j.err) toast(j.err);
+    else if(j.rendering) toast('回放渲染中(约2~4分钟), 完成自动打开播放器 — 进度看运行日志');
+    else toast('已打开仿真回放');
+  }catch(e){ toast('打开仿真回放失败: '+e); }
+}
 function toast(msg){
   const t=document.createElement('div'); t.className='toast'; t.textContent=msg;
   document.body.appendChild(t); setTimeout(()=>t.remove(),5000);
@@ -1879,9 +2044,13 @@ setInterval(async()=>{
   const busy=s.state==='planning'||s.state==='motion';
   if(s.state==='planning') _stale=false;
   const eff=(_stale&&['inspect','ready','error'].includes(s.state))?'idle':s.state;
-  const lb=document.getElementById('logbox'); if(lb) lb.open = s.state==='error';
+  // 日志框: 失败时自动展开一次; 其余时间绝不强制开合(用户手动展开的不许被轮询合上)
+  const lb=document.getElementById('logbox');
+  if(lb){ if(s.state==='error'){ lb.open=true; window._logAuto=true; }
+          else if(window._logAuto && s.state!=='error'){ window._logAuto=false; } }
   if(s.waist_deg!=null) $('robot_badge').textContent =
-    '机器人: '+$('robot').value+' · 生效腰限 ±'+s.waist_deg+'°';
+    '机器人: '+$('robot').value+' · 生效腰限 ±'+s.waist_deg+'°'
+    +(s.posture==='dual'?' · 站+蹲双姿态':'');
   $('state').innerHTML = {idle:_stale?'待机 — 输入已变更，请重新 ① 生成轨迹':'待机',
     planning:'生成轨迹中',inspect:'<span class=warn>待检查</span> — 在下方轨迹检查区确认',
     motion:'生成动作中',ready:'<span class=ok>动作就绪</span> — 复核无误后选速度点【执行动作】',
@@ -1900,7 +2069,8 @@ setInterval(async()=>{
               playing:`喷涂执行中 ${Math.round((rb.progress||0)*100)}%`, done:'本轮执行完成'};
   const rcol={stopped:'', starting:'warn', standing:'ok', playing:'warn', done:'ok'}[rph]||'';
   $('robot_stat').innerHTML = `<span class=${rcol}>${rmap[rph]||rph}</span>`+
-    (rb.done_runs?` <span class=small>已完成 ${rb.done_runs} 轮</span>`:'');
+    (rb.done_runs?` <span class=small>已完成 ${rb.done_runs} 轮</span>`:'')+
+    (rb.impact_err?` <span class=small>落点误差 均值${(rb.impact_err.mean*100).toFixed(1)}cm / p95 ${(rb.impact_err.p95*100).toFixed(1)}cm${Math.abs(rb.impact_err.p95)>0.08?' ⚠':''}</span>`:'');
   const rstep=rb.running? ((rph==='playing'||rph==='executing')?'active':'done') : 'cur';
   renderSteps(eff, rstep);
   // —— 流程门槛: 机器人未启动时, 禁止选文件/改参数/生成轨迹 ——
@@ -1935,8 +2105,11 @@ setInterval(async()=>{
   if(_stale && $('metrics').innerHTML) $('metrics').innerHTML='';
   const ib=$('insp_btns');
   if(ib) ib.style.display = ((s.state==='inspect'||s.state==='ready')&&!_stale) ? 'block':'none';
-  $('loglog').textContent = (s.log||[]).join('\\n');
-  $('loglog').scrollTop = 1e9;
+  const ll=$('loglog');
+  if(ll){ // 贴底时才自动跟滚(用户上翻阅读时不抢滚动); 失败时强制滚到底露错误
+    const stick = ll.scrollTop + ll.clientHeight >= ll.scrollHeight - 30;
+    ll.textContent = (s.log||[]).join('\\n');
+    if(stick || s.state==='error') ll.scrollTop = ll.scrollHeight; }
   // 点云为可选输入(后端契约): 未上传点云也可生成轨迹, 仅要求机器人已启动
   const ready2go = (s.robot||{}).running
                    && !['planning','motion'].includes(s.state);
@@ -1953,6 +2126,7 @@ setInterval(async()=>{
     bAp.style.display = (!ready && s.state==='inspect' && !_stale)? 'block':'none';
     bEx.style.display = ready? 'block':'none';
     if(bSp) bSp.style.display = ready? 'block':'none';
+    { const bRp=$('bReplay'); if(bRp) bRp.style.display = ready? 'block':'none'; }
     if(ready){
       const rok=(s.robot||{}).running, rplaying=(s.robot||{}).phase==='playing';
       bEx.disabled=(!rok)||rplaying;

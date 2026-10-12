@@ -24,10 +24,11 @@ def _ver_key(name):
     return int(m.group(1)) if m else -1
 
 
-_vdirs = [os.path.basename(d) for d in glob.glob(os.path.join(BASE, "output/ufo_motion/v*"))]
+_OUT06 = os.environ.get("G1W_OUT", os.path.join(BASE, "output"))
+_vdirs = [os.path.basename(d) for d in glob.glob(os.path.join(_OUT06, "ufo_motion/v*"))]
 VER = os.environ.get("MOTION_VER") or (max(_vdirs, key=lambda d: (_ver_key(d), d))
                                        if _vdirs else "v1")
-FR = os.path.join(BASE, "output", "ufo_motion", VER, "replay_frames")
+FR = os.path.join(_OUT06, "ufo_motion", VER, "replay_frames")
 os.makedirs(FR, exist_ok=True)
 
 model = mujoco.MjModel.from_xml_path(MJCF)
@@ -35,7 +36,7 @@ data = mujoco.MjData(model)
 renderer = mujoco.Renderer(model, 480, 640)
 
 # 动作文件由 VER 拼出(不再独立取 sorted 最新, 避免与显式 MOTION_VER 错位)
-_npz = os.path.join(BASE, "output", "ufo_motion", VER, "wall_spray_motion.npz")
+_npz = os.path.join(_OUT06, "ufo_motion", VER, "wall_spray_motion.npz")
 assert os.path.exists(_npz), f"动作文件不存在: {_npz} (先运行 05, 或用 MOTION_VER 指定版本)"
 motion = np.load(_npz)
 print("回放动作:", _npz)

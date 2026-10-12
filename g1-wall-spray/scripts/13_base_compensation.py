@@ -62,6 +62,13 @@ def main():
                              t["rob_y_r"].astype(float),
                              t["rob_z"].astype(float)])      # 基座系(标称)腕心目标
     N = len(q0)
+    # V2 双姿态: IK 骨盆界限按点分(蹲姿区 0.60~0.70 / 过渡段 0.60~0.79), 纯站姿轨迹 pb=None(legacy)
+    zone = t["zone"].astype(str) if "zone" in t.files else np.array(["stand"] * N)
+    kind_t = t["kind"].astype(str)
+    DUAL13 = bool((zone == "crouch").any())
+    pb = (np.array([P03.PELVIS_RANGE["trans"] if k == "transition"
+                    else P03.PELVIS_RANGE[z] for k, z in zip(kind_t, zone)], float)
+          if DUAL13 else None)
     # 扰动时间轴: 轨迹点是路径采样(约0.4s/点 @0.05m/s), 不是30Hz帧; 按相邻点欧氏
     # 距离/统一速度累积得到真实时间(旧版按30Hz算, 扰动周期与附加速度虚高约12倍)
     SPEED = 0.05                                             # 与 05 导出一致的统一速度
@@ -104,14 +111,15 @@ def main():
         d_B[i] = R.T @ d_W[i]
     d_B /= np.linalg.norm(d_B, axis=1, keepdims=True)
     qf, pf, e1, e2, cv = P03.batch_ik(q0.copy(), pz0.copy(), p_B, d_B,
-                                      "stand", iters=250)     # 整批: q0 即好种子(扰动小)
+                                      "stand", iters=250, pb=pb)  # 整批: q0 即好种子(扰动小)
     q1[cv] = qf[cv]; pz1[cv] = pf[cv]
     n_ik = int(cv.sum())
     for i in np.where(~cv)[0]:                            # 残余: 邻点热启动
         seed = q1[i - 1] if i and cv[i - 1] else q0[i]
         qf2, pf2, _, _, cv2 = P03.batch_ik(seed[None].copy(),
                                            np.array([pz1[i]]), p_B[i:i+1], d_B[i:i+1],
-                                           "stand", iters=400)
+                                           "stand", iters=400,
+                                           pb=(pb[i:i+1] if DUAL13 else None))
         if cv2[0]:
             q1[i], pz1[i] = qf2[0], float(pf2[0]); n_ik += 1
     # 60°守卫(批量): 世界系角<60 的 stroke 点 -> 世界目标朝垂直偏+0.8° 反投影重解
@@ -134,7 +142,8 @@ def main():
             dB2[k] = R.T @ dW2[k]
         dB2 /= np.linalg.norm(dB2, axis=1, keepdims=True)
         qf3, pf3, _, _, cv3 = P03.batch_ik(q1[low].copy(), pz1[low], p_B[low], dB2,
-                                           "stand", iters=90, ax_tol=0.02)
+                                           "stand", iters=90, ax_tol=0.02,
+                                           pb=(pb[low] if DUAL13 else None))
         _, ax3 = P03.fk_wrist(qf3, pf3)
         for k, i in enumerate(low):
             if not cv3[k]:
@@ -164,6 +173,7 @@ def main():
     waist_ok = bool((np.abs(q1[:, 1]) <= _wlim + 1e-6).all()
                     and (np.abs(q1[:, 2]) <= _wlim + 1e-6).all())
     rep = dict(
+        姿态=("站+蹲双姿态(蹲姿区骨盆0.60~0.70, 过渡段自由)" if DUAL13 else "站姿单一"),
         扰动=dict(平移x=f"±{a.dx*100:.0f}cm", 平移y="±2cm", 平移z="±0.8cm",
                   yaw=f"±{np.degrees(a.dyaw):.1f}°", roll_pitch=f"±{np.degrees(a.drp):.1f}°"),
         无补偿=dict(世界腕心误差max_mm=round(float(err_nc.max() * 1000), 1),

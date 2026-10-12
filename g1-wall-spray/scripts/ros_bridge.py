@@ -163,8 +163,15 @@ def main():
     ap.add_argument("--robot", default="g1")
     ap.add_argument("--traj", default=os.path.join(BASE, "output"))
     ap.add_argument("--motion", default=None)
+    ap.add_argument("--out", default=None, help="输出根(记录目录/结果json的父目录)")
     a = ap.parse_args()
-    r = emit_run(a.robot, a.traj, a.motion)
+    r = emit_run(a.robot, a.traj, a.motion, out_base=a.out)
+    if a.out:      # 站点子进程模式: 结果落盘回读(主进程系统python无numpy, 不能import本模块)
+        try:
+            json.dump(r, open(os.path.join(a.out, "ros_emit_result.json"), "w",
+                              encoding="utf8"), ensure_ascii=False, indent=1)
+        except Exception:
+            pass
     print(json.dumps(r, ensure_ascii=False, indent=1))
 
 
