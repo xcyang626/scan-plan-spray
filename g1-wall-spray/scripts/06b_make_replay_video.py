@@ -39,24 +39,28 @@ mp4 = os.path.join(OUT, "replay_motion.mp4")
 imageio.mimwrite(mp4, frames, fps=15, quality=8, macro_block_size=8)
 print(f"[写出] replay_motion.mp4 {len(frames)} 帧 @15fps")
 
-# ---- 九宫格总览: 均匀抽 24 帧, 6x4, side+front 上下并排 ----
+# ---- 总览条: 均匀抽 12 帧, 4x3, side|front 左右并排(横幅单元格) ----
+# 注: 单元格内 side/front 若上下叠会把整图拼成竖版(882x1044), 与 README 里
+# 横版场景图并排时高矮悬殊留大片空白 —— 左右并排后整图约 3:1 横幅条
 idx = np.linspace(0, len(side) - 1, 12).astype(int)
 sw, sh = Image.open(side[0]).size
 fw, fh = Image.open(front[0]).size
 tw, th = sw // 3, sh // 3
 tf_w, tf_h = fw // 3, fh // 3
 cols, rows = 4, 3
-sheet = Image.new("RGB", (cols * tw + (cols + 1) * 6, rows * (th + tf_h + 26) + 6), "white")
+cw = tw + tf_w + 4                       # 单元格宽 = side|front 横排
+ch = max(th, tf_h) + 26
+sheet = Image.new("RGB", (cols * cw + (cols + 1) * 6, rows * ch + 6), "white")
 d = ImageDraw.Draw(sheet)
 for k, fi in enumerate(idx):
     r, c = divmod(k, cols)
-    x = 6 + c * (tw + 6)
-    y = 6 + r * (th + tf_h + 26)
+    x = 6 + c * (cw + 6)
+    y = 6 + r * ch
     im_s = Image.open(side[fi]).resize((tw, th), Image.LANCZOS)
     im_f = Image.open(front[fi]).resize((tf_w, tf_h), Image.LANCZOS)
-    sheet.paste(im_s, (x, y + 18))
-    sheet.paste(im_f, (x + (tw - tf_w) // 2, y + 18 + th + 4))
-    d.text((x + 4, y + 3), f"t={fi * 2 / 30:.1f}s", fill="black")
+    sheet.paste(im_s, (x, y + 20))
+    sheet.paste(im_f, (x + tw + 4, y + 20))
+    d.text((x + 4, y + 4), f"t={fi * 2 / 30:.1f}s", fill="black")
 cs = os.path.join(OUT, "fig_replay_contactsheet.png")
 sheet.save(cs)
-print(f"[写出] fig_replay_contactsheet.png ({cols}x{rows}, 12 时刻)")
+print(f"[写出] fig_replay_contactsheet.png ({cols}x{rows}, 12 时刻, 横幅条)")

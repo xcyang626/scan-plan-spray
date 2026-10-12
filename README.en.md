@@ -144,12 +144,17 @@ A single-file Python web workstation (stdlib HTTP + embedded three.js 3D preview
 
 **Current status (V3 final, full-band spray verified on the physical G1, 2026-10-12)**: stand band 8 rows over 0.75–1.45 m → five-segment slow squat (max descent 0.13 m/s; segment-gated height channel keeps the standing phase free of mode flapping) → crouch band 4 rows over 0.35–0.65 m, ×1.0 full run in 155.6 s; two-level soft e-stop and a 0.5× low-speed lane. Crouch-row placement accuracy (no pelvis-pitch feedback yet) is the main remaining gap. A dated capability timeline lives in [g1-wall-spray/README_版本迭代.md](g1-wall-spray/README_版本迭代.md) (Chinese).
 
-<p>
-<img src="g1-wall-spray/media/fig_3d_scene.png" width="49%"/>
-<img src="g1-wall-spray/media/fig_replay_contactsheet.png" width="49%"/>
+<p align="center">
+<img src="g1-wall-spray/media/fig_3d_scene.png" width="72%"/><br/>
+<i>Dual-posture spray scene (blue = 8-row stand band, green = 4-row crouch band, grey = transition)</i>
 </p>
 
-MuJoCo replay (current V3 dual-posture motion — stand band, five-segment squat transition, crouch band; the same motion executed on the physical G1):
+<p align="center">
+<img src="g1-wall-spray/media/fig_replay_contactsheet.png" width="98%"/><br/>
+<i>MuJoCo replay overview (left = side view / right = front view, 12 timestamps: stand band → squat transition → crouch band)</i>
+</p>
+
+Replay video (the same motion executed on the physical G1, ×1.0 full run in 155.6 s):
 
 <video src="g1-wall-spray/media/replay_motion.mp4" controls muted width="60%"></video>
 

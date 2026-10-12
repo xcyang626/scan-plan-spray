@@ -146,12 +146,17 @@ cat README.md            # 按「快速上手」五步：标定 → MoveIt2 仿�
 
 **当前状态（V3 定稿，2026-10-12 实机全带喷涂验证）**：站姿 8 行 0.75–1.45 m → 五段过渡缓慢下蹲（最大降速 0.13 m/s，蹲姿通道分段门控保证站立段零模式翻转）→ 蹲姿 4 行 0.35–0.65 m，物理 G1 上 ×1.0 全程 155.6 s；两级软急停 + 0.5× 低速复核通道。蹲姿段落点精度（缺骨盆俯仰反馈）为当前主要短板。按日期的能力演进见 [g1-wall-spray/README_版本迭代.md](g1-wall-spray/README_版本迭代.md)。
 
-<p>
-<img src="g1-wall-spray/media/fig_3d_scene.png" width="49%"/>
-<img src="g1-wall-spray/media/fig_replay_contactsheet.png" width="49%"/>
+<p align="center">
+<img src="g1-wall-spray/media/fig_3d_scene.png" width="72%"/><br/>
+<i>双姿态喷涂场景（蓝=站姿带 8 行，绿=蹲姿带 4 行，灰=过渡）</i>
 </p>
 
-MuJoCo 回放（当前 V3 双姿态动作，站姿喷上部 → 五段过渡下蹲 → 蹲姿喷下部，即实机执行的同款）：
+<p align="center">
+<img src="g1-wall-spray/media/fig_replay_contactsheet.png" width="98%"/><br/>
+<i>MuJoCo 回放总览（左=侧视 / 右=正视，12 个时刻：站姿喷上部 → 下蹲过渡 → 蹲姿喷下部）</i>
+</p>
+
+回放视频（与实机执行同款动作，×1.0 全程 155.6 s）：
 
 <video src="g1-wall-spray/media/replay_motion.mp4" controls muted width="60%"></video>
 
