@@ -22,7 +22,7 @@
 
 Two complete technical tracks for the same task — **automatic line-tracing / spraying on walls**:
 
-- **Humanoid track (Unitree G1)**: cabin point-cloud registration → spray station & stance planning → constant-width zigzag trajectories with per-point IK → a web workstation → whole-body control execution, with the control policy based on NVIDIA **GEAR-SONIC** and one-switch sim/real modes.
+- **Humanoid track (Unitree G1)**: cabin point-cloud registration → spray station & stance planning → **dual-posture (stand + crouch)** constant-width zigzag trajectories with per-point IK → a web workstation → whole-body control execution, with the control policy based on NVIDIA **GEAR-SONIC** and one-switch sim/real modes (full-band spray verified on the physical G1).
 - **Robot-arm track (OpenArm v1, 7-DOF)**: zero calibration → simulation → real robot, pushed through three layers (MPC / reinforcement learning / ILC), cutting one 36-waypoint run from ~300 s down to **143.6 s** with zero e-stops.
 
 The four modules are independent and each runs on its own. `g1-wall-spray` consumes exactly the output of `pointcloud-registration`, and its workspace computation inherits the method from `station-planning`.
@@ -35,7 +35,7 @@ This repository is an archival record of that work: every module keeps its runna
 |---|---|---|
 | [pointcloud-registration](pointcloud-registration/) | Register a grayscale robot scan against a semantic reference map + **label transfer**, hand-written in pure numpy | `python register_and_label.py` |
 | [station-planning](station-planning/) | **Spray cell decomposition (BCD) and stance planning** on Monte-Carlo reachability | `station_planning.m` (MATLAB) |
-| [g1-wall-spray](g1-wall-spray/) | G1 wall-spraying **web workstation + whole-body control** (policy based on GEAR-SONIC) | `./启动工作站.sh` → `127.0.0.1:8090` |
+| [g1-wall-spray](g1-wall-spray/) | G1 wall-spraying **web workstation + whole-body control** (policy based on GEAR-SONIC; stand+crouch dual posture, verified on the physical G1) | `./启动工作站.sh` → `127.0.0.1:8090` |
 | [openarm-zigzag](openarm-zigzag/) | OpenArm 7-DOF **calibration → simulation → real robot**, with MPC/RL/ILC | see the module [README](openarm-zigzag/README.en.md) |
 
 ## Results at a glance
@@ -106,9 +106,10 @@ A pure-Python reachability version is provided at `workspace/ws_calc.py` (Tiango
 
 ```bash
 cd g1-wall-spray
+cp station/env.json station/env.local.json   # fill local interpreters / GR00T path / robot_mode (gitignored)
 ./启动工作站.sh          # open http://127.0.0.1:8090
-# Web flow: pick robot/stance/row spacing → ① plan trajectory → ② confirm motion → ③ export package
-# Sim/real switch: robot_mode in station/env.json ("sim" / "real")
+# Web flow: ① start robot (test the soft e-stop) → ② pick cloud/stance/posture, plan → ③ confirm motion → ④ execute (0.5× available)
+# Sim/real switch: robot_mode in station/env.local.json ("sim" / "real")
 ```
 
 **openarm-zigzag** (Ubuntu 24.04 + ROS 2 Jazzy; the calibration tool runs hardware-free on vcan0)
@@ -139,14 +140,16 @@ Monte-Carlo FK on the Tiangong 3.0 URDF yields the wrist reachability (alpha-sha
 
 ### g1-wall-spray — web workstation + whole-body control based on SONIC
 
-A single-file Python web workstation (stdlib HTTP + embedded three.js 3D preview) chains cloud parsing, trajectory planning, motion export and execution packaging. The **whole-body control policy is based on NVIDIA GEAR-SONIC** (the official GR00T-WholeBodyControl stack): lower-body balance is handled by the SONIC policy, and the upper body is injected as 17 joints @50 Hz with velocity feedforward through the official `zmq_planner_sender` protocol. MuJoCo simulation and the real DDS link share one planning chain — switching is one field in `env.json`.
+A single-file Python web workstation (stdlib HTTP + embedded three.js 3D preview) chains cloud parsing, trajectory planning, motion export and execution dispatch. The **whole-body control policy is based on NVIDIA GEAR-SONIC** (the official GR00T-WholeBodyControl stack): lower-body balance is handled by the SONIC policy, and the upper body is injected as 17 joints @50 Hz with velocity feedforward through the official `zmq_planner_sender` protocol. MuJoCo simulation and the real DDS link share one planning chain — switching is one field in `env.local.json`.
+
+**Current status (V3 final, full-band spray verified on the physical G1, 2026-10-12)**: stand band 8 rows over 0.75–1.45 m → five-segment slow squat (max descent 0.13 m/s; segment-gated height channel keeps the standing phase free of mode flapping) → crouch band 4 rows over 0.35–0.65 m, ×1.0 full run in 155.6 s; two-level soft e-stop and a 0.5× low-speed lane. Crouch-row placement accuracy (no pelvis-pitch feedback yet) is the main remaining gap. A dated capability timeline lives in [g1-wall-spray/README_版本迭代.md](g1-wall-spray/README_版本迭代.md) (Chinese).
 
 <p>
 <img src="g1-wall-spray/media/fig_3d_scene.png" width="49%"/>
 <img src="g1-wall-spray/media/fig_replay_contactsheet.png" width="49%"/>
 </p>
 
-MuJoCo replay (v5 standing constant-width zigzag, 307 points):
+MuJoCo replay (standing-only v5, 307 points; the current dual-posture stand+crouch flow is in the module README):
 
 <video src="g1-wall-spray/media/replay_motion.mp4" controls muted width="60%"></video>
 

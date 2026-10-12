@@ -22,7 +22,7 @@
 
 同一个任务——**让机器人在壁面上自动走线 / 喷涂**——的两条完整技术线：
 
-- **人形机器人线（宇树 G1）**：舱室点云配准 → 喷涂工位与站位点规划 → 等宽之字形轨迹 + 逐点 IK → 网页工作站 → 全身控制执行（策略基于 NVIDIA **GEAR-SONIC**），MuJoCo 仿真与实机一键切换；
+- **人形机器人线（宇树 G1）**：舱室点云配准 → 喷涂工位与站位点规划 → **站+蹲双姿态**等宽之字形轨迹 + 逐点 IK → 网页工作站 → 全身控制执行（策略基于 NVIDIA **GEAR-SONIC**），MuJoCo 仿真与物理 G1 实机一键切换（全带喷涂已实机验证）；
 - **机械臂线（基于 OpenArm v1 的七轴臂）**：零点标定 → 仿真 → 真机，MPC / 强化学习 / ILC 三层推进，把一次 36 路点走线从 ~300 s 压到 **143.6 s**，全程零急停。
 
 四个模块相互独立、均可单独运行；其中 `g1-wall-spray` 的点云输入就是 `pointcloud-registration` 的输出，工作区计算方法承自 `station-planning`。
@@ -35,7 +35,7 @@
 |---|---|---|
 | [pointcloud-registration](pointcloud-registration/) | 黑白机器人扫描点云 ↔ 语义参考地图的**配准 + 语义标签传播**，纯 numpy 手写 | `python register_and_label.py` |
 | [station-planning](station-planning/) | 喷涂**工位区域划分（BCD）与站位点规划**，可达域蒙特卡洛 | `station_planning.m`（MATLAB） |
-| [g1-wall-spray](g1-wall-spray/) | G1 壁面喷涂**网页工作站 + 全身控制**（策略基于 GEAR-SONIC） | `./启动工作站.sh` → `127.0.0.1:8090` |
+| [g1-wall-spray](g1-wall-spray/) | G1 壁面喷涂**网页工作站 + 全身控制**（策略基于 GEAR-SONIC；站+蹲双姿态，实机全带已验证） | `./启动工作站.sh` → `127.0.0.1:8090` |
 | [openarm-zigzag](openarm-zigzag/) | OpenArm 七轴**标定 → 仿真 → 真机**全链路，MPC/RL/ILC | 见模块 [README](openarm-zigzag/README.md) |
 
 ## 成绩单
@@ -108,9 +108,10 @@ run('station_planning.m')
 
 ```bash
 cd g1-wall-spray
+cp station/env.json station/env.local.json   # 填本机解释器/GR00T 路径与 robot_mode(不入库)
 ./启动工作站.sh          # 打开 http://127.0.0.1:8090
-# 网页流程：选机器人/站位/行距 → ① 生成轨迹 → ② 确认生成动作 → ③ 导出执行包
-# 仿真/实机切换：station/env.json 的 robot_mode（"sim" / "real"）
+# 网页流程：① 启动机器人（急停测试）→ ② 选点云/站位/姿态生成轨迹 → ③ 确认生成动作 → ④ 执行(可 0.5×)
+# 仿真/实机切换：station/env.local.json 的 robot_mode（"sim" / "real"）
 ```
 
 **openarm-zigzag**（Ubuntu 24.04 + ROS 2 Jazzy；标定工具支持 vcan0 无硬件全流程）
@@ -141,14 +142,16 @@ cat README.md            # 按「快速上手」五步：标定 → MoveIt2 仿�
 
 ### g1-wall-spray — 网页工作站 + 基于 SONIC 的全身控制
 
-单文件 Python 网页工作站（标准库 HTTP 服务 + 内嵌 three.js 3D 预览）串起点云解析、轨迹规划、动作导出、执行打包。**全身控制策略基于 NVIDIA GEAR-SONIC**（GR00T-WholeBodyControl 官方栈）：下肢平衡由 SONIC 策略承担，上肢以 17 关节 @50 Hz + 速度前馈经官方 `zmq_planner_sender` 协议注入。MuJoCo 仿真与实机 DDS 共享同一条规划链，切换只改 `env.json` 一个字段。
+单文件 Python 网页工作站（标准库 HTTP 服务 + 内嵌 three.js 3D 预览）串起点云解析、轨迹规划、动作导出、执行下发。**全身控制策略基于 NVIDIA GEAR-SONIC**（GR00T-WholeBodyControl 官方栈）：下肢平衡由 SONIC 策略承担，上肢以 17 关节 @50 Hz + 速度前馈经官方 `zmq_planner_sender` 协议注入。MuJoCo 仿真与实机 DDS 共享同一条规划链，切换只改 `env.local.json` 一个字段。
+
+**当前状态（V3 定稿，2026-10-12 实机全带喷涂验证）**：站姿 8 行 0.75~1.45 m → 五段过渡缓慢下蹲（最大降速 0.13 m/s，蹲姿通道分段门控保证站立段零模式翻转）→ 蹲姿 4 行 0.35~0.65 m，物理 G1 上 ×1.0 全程 155.6 s；两级软急停 + 0.5× 低速复核通道。蹲姿段落点精度（缺骨盆俯仰反馈）为当前主要短板。按日期的能力演进见 [g1-wall-spray/README_版本迭代.md](g1-wall-spray/README_版本迭代.md)。
 
 <p>
 <img src="g1-wall-spray/media/fig_3d_scene.png" width="49%"/>
 <img src="g1-wall-spray/media/fig_replay_contactsheet.png" width="49%"/>
 </p>
 
-MuJoCo 回放（v5 站姿等宽之字形，307 点全程）：
+MuJoCo 回放（站姿版 v5，307 点；当前双姿态站+蹲全带流程见模块 README）：
 
 <video src="g1-wall-spray/media/replay_motion.mp4" controls muted width="60%"></video>
 
