@@ -71,3 +71,4 @@ python workspace/ws_calc.py
 本模块回答"机器人**站在哪、够得着哪**"；`../g1-wall-spray/` 的
 `02_g1_workspace.py` 把同一套可达域方法移植到 G1（距墙三平面取交集，
 消化定位误差），`03_plan_trajectories.py` 再在其上生成之字形轨迹。
+
