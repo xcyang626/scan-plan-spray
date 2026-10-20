@@ -76,7 +76,9 @@ cd g1_wall_spray && ./启动工作站.sh     # 打开 http://127.0.0.1:8090
 
 ### 3. 部署进程自动化（2026-10-12 起无需人工按键）
 网页「启动机器人」后自动完成（`AUTO_START_ROBOT`）：
-- 拉起 `g1_deploy_onnx_ref <iface> ... --input-type zmq --output-type zmq --zmq-host localhost --zmq-port 5556`
+- 拉起 `g1_deploy_onnx_ref <iface> ... --input-type zmq --output-type zmq --zmq-host localhost --zmq-port 5556
+  --takeover-blend-s 2.0`（接管混合：启动控制瞬间从实测姿态平滑过渡到策略输出，消除网页启动的剧烈抖动；
+  时长可在 env.json 用 `takeover_blend_s` 调，0=回官方硬切换）
 - 经守护进程发 GR00T `command(start=True, planner=True)` —— 启动控制（机器人回
   初始站姿）+ 进入 planner 模式，随后自动挂**保持流**（50Hz 保持实测姿态，防
   planner 静默时 C++ 回退参考舞蹈动作）。

@@ -18,6 +18,18 @@ import numpy as np
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+# per-robot 数据采样配置(legacy 6维小模型): 腕平面带x / 横向带y(右臂可达不对称) /
+# 腕心离地z带 / qsub种子过滤带okp / 站姿种子骨盆pz / 工作区npz文件名(与ensure_workspace同名)
+# pb_bands: DLS 骨盆带按目标z分段(双姿态机器人): 低段蹲带高段站带, 单值单解防回归坍缩
+# (t3 带内实测: stand y -0.60..+0.35, z 0.90..1.83; 蹲带 pz 0.43 起 h0.2 行可行)
+ROBOT_CFG = {
+    "g1":        dict(x=(0.30, 0.38), y=(-0.36, 0.36), z=(0.72, 1.28),
+                      okp=(0.25, 0.42), pz=0.78, ws="g1_workspace.npz"),
+    "tiangong3": dict(x=(0.46, 0.54), y=(-0.45, 0.32), z=(0.30, 1.60),
+                      okp=(0.41, 0.59), pz=0.98, ws="tiangong_workspace.npz",
+                      pb_bands=[(0.85, (0.53, 0.75)), (9.99, (0.96, 1.005))]),   # 蹲带下限=05平面模型膝限位地板
+}
+
 
 def load_plan03():
     spec = importlib.util.spec_from_file_location(
@@ -28,52 +40,71 @@ def load_plan03():
     return m
 
 
-def gen_dataset(P03, n, rng):
-    """采样喷涂工作区目标 -> DLS 真解 (输入6维, 输出10维+pz)."""
+def gen_dataset(P03, n, rng, cfg):
+    """采样喷涂工作区目标 -> DLS 真解 (输入6维, 输出10维+pz). 采样带按 ROBOT_CFG.
+    双姿态机器人(pb_bands)按目标z分段独立采集: 每带自己的单支流形链(蹲低站高),
+    跨带共用一条链会让高段解被低段跳支过滤丢弃, 回归被蹲姿支主导."""
     from scipy.spatial import cKDTree
-    ws = np.load(os.environ.get("G1W_WS", os.path.join(BASE, "output", "g1_workspace.npz")), allow_pickle=True)
+    ws = np.load(os.environ.get("G1W_WS", os.path.join(BASE, "output", cfg["ws"])), allow_pickle=True)
     qsub = np.concatenate([ws[f"right_{m}_y60_qsub"].astype(float)
                            for m in ("stand", "crouch")], 0)      # (M,11)
     endsub = np.concatenate([ws[f"right_{m}_y60_endsub"].astype(float)
                              for m in ("stand", "crouch")], 0)    # (M,4)
-    okp = (endsub[:, 0] > 0.25) & (endsub[:, 0] < 0.42)           # 腕平面带内
+    okp = (endsub[:, 0] > cfg["okp"][0]) & (endsub[:, 0] < cfg["okp"][1])   # 腕平面带内
     qsub, pos = qsub[okp], endsub[okp, :3]
     tree = cKDTree(pos)
+    pb_bands = cfg.get("pb_bands") or [(9.99, None)]
+    # 每带的目标 z 区间 = (上一带 zmax, 本带 zmax) ∩ cfg["z"]
+    segs, z_prev = [], cfg["z"][0]
+    for zmax, pb in pb_bands:
+        lo = max(cfg["z"][0], z_prev); hi = min(cfg["z"][1], zmax)
+        if hi > lo:
+            segs.append((int(n * (hi - lo) / (cfg["z"][1] - cfg["z"][0])), (lo, hi), pb))
+        z_prev = max(z_prev, zmax)
 
-    x = rng.uniform(0.30, 0.38, n)
-    y = rng.uniform(-0.36, 0.36, n)
-    z = rng.uniform(0.72, 1.28, n)   # 腕心离地高(与03同约定; 骨盆高由DLS自优化)
-    phi = np.radians(rng.uniform(-32.0, 32.0, n))
-    p_star = np.column_stack([x, y, z])
-    d_star = np.column_stack([np.cos(phi), np.zeros(n), np.sin(phi)])
-    sp = np.lexsort((z, y, x))                     # 空间排序: 邻接目标=同支邻域(x主键,补上x)
-    p_star, d_star = p_star[sp], d_star[sp]
-
-    # 单支流形采集: 邻接播种 + 连续性过滤(与上一保留解差<0.6rad) -> 数据落在
-    # 同一支解流形片上, 消除多支平均导致的回归坍缩
-    Q = np.zeros((n, 10)); PZ = np.zeros(n); OK = np.zeros(n, bool)
+    P_all, D_all, Q_all, PZ_all = [], [], [], []
     B = 2000
-    seed_q, seed_pz, last_q = None, None, None
     t0 = time.time()
-    for s in range(0, n, B):
-        e = min(s + B, n)
-        if seed_q is None:
-            j = tree.query(p_star[s:e], k=1)[1]
-            seed_q = qsub[j][:, :10].copy(); seed_pz = qsub[j][:, 10].copy()
-        else:
-            seed_q = np.repeat(last_q[None], e - s, 0)
-            seed_pz = np.full(e - s, 0.78)
-        qf, pf, e1, e2, cv = P03.batch_ik(seed_q.copy(), seed_pz.copy(),
-                                          p_star[s:e], d_star[s:e], "stand", iters=220)
-        for k in range(e - s):
-            if not cv[k]:
-                continue
-            if last_q is not None and np.abs(qf[k] - last_q).max() > 0.6:
-                continue                       # 跳支: 丢弃, 维持单支流形
-            Q[s + k], PZ[s + k], OK[s + k] = qf[k], pf[k], True
-            last_q = qf[k]
-    print(f"[数据] 单支流形保留 {OK.sum()}/{n} ({time.time()-t0:.0f}s)")
-    return p_star[OK], d_star[OK], Q[OK], PZ[OK]
+    for n_seg, z_rng, pb_band in segs:
+        x = rng.uniform(*cfg["x"], n_seg)
+        y = rng.uniform(*cfg["y"], n_seg)
+        z = rng.uniform(*z_rng, n_seg)
+        phi = np.radians(rng.uniform(-32.0, 32.0, n_seg))
+        p_star = np.column_stack([x, y, z])
+        d_star = np.column_stack([np.cos(phi), np.zeros(n_seg), np.sin(phi)])
+        sp = np.lexsort((y, x, z))                # 空间排序(主键z): 沿高度连续爬升,
+        p_star, d_star = p_star[sp], d_star[sp]   # 臂伸展连续变化 -> 单支流形更纯
+        Q = np.zeros((n_seg, 10)); PZ = np.zeros(n_seg); OK = np.zeros(n_seg, bool)
+        seed_q, seed_pz, last_q = None, None, None
+        for s in range(0, n_seg, B):
+            e = min(s + B, n_seg)
+            if seed_q is None:
+                j = tree.query(p_star[s:e], k=1)[1]
+                seed_q = qsub[j][:, :10].copy(); seed_pz = qsub[j][:, 10].copy()
+            else:
+                seed_q = np.repeat(last_q[None], e - s, 0)
+                seed_pz = np.full(e - s, (pb_band[0] + pb_band[1]) / 2 if pb_band else cfg["pz"])
+            pb = None
+            if pb_band:
+                pb = np.tile(np.array(pb_band, float), (e - s, 1))
+            qf, pf, e1, e2, cv = P03.batch_ik(seed_q.copy(), seed_pz.copy(),
+                                              p_star[s:e], d_star[s:e], "stand",
+                                              iters=220, pb=pb)
+            for k in range(e - s):
+                if not cv[k]:
+                    continue
+                if last_q is not None and np.abs(qf[k] - last_q).max() > 0.6:
+                    continue                   # 跳支: 丢弃, 维持单支流形
+                Q[s + k], PZ[s + k], OK[s + k] = qf[k], pf[k], True
+                last_q = qf[k]
+        P_all.append(p_star[OK]); D_all.append(d_star[OK])
+        Q_all.append(Q[OK]); PZ_all.append(PZ[OK])
+        print(f"[数据] 段z{z_rng} pz带{pb_band}: 单支保留 {OK.sum()}/{n_seg} "
+              f"({time.time()-t0:.0f}s)")
+    P = np.vstack(P_all); D = np.vstack(D_all); Q = np.vstack(Q_all)
+    PZ = np.concatenate(PZ_all)
+    print(f"[数据] 合计单支流形保留 {len(P)}/{n} ({time.time()-t0:.0f}s)")
+    return P, D, Q, PZ
 
 
 def train(X, Q, epochs, dev):
@@ -115,30 +146,45 @@ def predict(net, X, qm, qs, xm, xs, dev):
     return y * qs + qm
 
 
-def evaluate(P03, net, qm, qs, xm, xs, dev):
-    """真实 307 轨迹目标: NN种子 vs MC种子 收敛率@小iters (提速证据)."""
+def evaluate(P03, net, qm, qs, xm, xs, dev, cfg):
+    """真实轨迹目标(G1W_TRAJ 可指定): NN种子 vs MC种子 收敛率@小iters (提速证据)."""
     try:
-        tz = np.load(os.path.join(BASE, "output", "trajectory.npz"), allow_pickle=True)
+        tz = np.load(os.environ.get("G1W_TRAJ",
+                                    os.path.join(BASE, "output", "trajectory.npz")),
+                     allow_pickle=True)
         d = tz["axis"].astype(float)
-        p_rel = np.column_stack([                      # 与03同约定: 腕心离地高
-            tz["rob_xyz"][:, 0] - (P03.X_FACE - P03.D_ROBOT),
-            tz["rob_y_r"].astype(float),
-            tz["rob_z"].astype(float)])
+        if cfg is ROBOT_CFG["g1"]:
+            p_rel = np.column_stack([                  # 旧口径: 世界系 rob_xyz 换算
+                tz["rob_xyz"][:, 0] - (P03.X_FACE - P03.D_ROBOT),
+                tz["rob_y_r"].astype(float),
+                tz["rob_z"].astype(float)])
+        else:
+            p_rel = np.column_stack([                  # 与03同约定: x=腕平面, z=离地高
+                np.full(len(d), P03.D_ROBOT - P03.D_WRIST),
+                tz["rob_y_r"].astype(float),
+                tz["rob_z"].astype(float)])
         assert len(p_rel) == len(d) > 10
     except Exception as e:
         print(f"[评估] trajectory.npz 不可用({e}), 跳过真实轨迹评估"); return None
-    ws = np.load(os.environ.get("G1W_WS", os.path.join(BASE, "output", "g1_workspace.npz")), allow_pickle=True)
+    ws = np.load(os.environ.get("G1W_WS", os.path.join(BASE, "output", cfg["ws"])), allow_pickle=True)
     qsub = np.concatenate([ws[f"right_{m}_y60_qsub"].astype(float)
                            for m in ("stand", "crouch")], 0)
     from scipy.spatial import cKDTree
     res = {}
+    pb_bands = cfg.get("pb_bands")          # dual 轨迹: 蹲/站段目标各用对应骨盆带评估
     q_nn = predict(net, np.column_stack([p_rel, d]), qm, qs, xm, xs, dev)
     for it in (10, 30, 60):
-        _, _, _, _, cv_nn = P03.batch_ik(q_nn.copy(), np.full(len(q_nn), 0.78),
-                                         p_rel, d, "stand", iters=it)
-        _, _, _, _, cv_mc = P03.batch_ik(qsub[np.random.default_rng(0).choice(
-            len(qsub), len(p_rel))][:, :10].copy(),
-            np.full(len(p_rel), 0.78), p_rel, d, "stand", iters=it)
+        if pb_bands:
+            # 逐样本骨盆带+带中点种子(z<带的分界用蹲带, 否则站带)
+            pb = np.array([next(b for zm, b in pb_bands if z <= zm) for z in p_rel[:, 2]])
+            pzs = pb.mean(1)
+        else:
+            pb, pzs = None, np.full(len(q_nn), cfg["pz"])
+        _, _, _, _, cv_nn = P03.batch_ik(q_nn.copy(), pzs, p_rel, d, "stand",
+                                         iters=it, pb=pb)
+        sel = np.random.default_rng(0).choice(len(qsub), len(p_rel))
+        _, _, _, _, cv_mc = P03.batch_ik(qsub[sel][:, :10].copy(), pzs,
+                                         p_rel, d, "stand", iters=it, pb=pb)
         res[it] = (float(cv_nn.mean()), float(cv_mc.mean()))
         print(f"[评估] iters={it}: NN种子收敛率 {cv_nn.mean():.1%} vs 随机MC种子 {cv_mc.mean():.1%}")
     return res
@@ -326,6 +372,9 @@ def main():
     P03 = load_plan03()
     rng = np.random.default_rng(7)
     if a.universal:
+        if a.robot != "g1":
+            sys.exit("--universal 目前仅支持 g1(采样带按G1运动学全域硬编码); "
+                     "其他机器人用 legacy 6维小模型")
         # V2.1d 通用大模型: 构型空间采样(默认, 全域一次覆盖) / 任务空间采样(旧法)
         print(f"[训练] 设备 {dev}, 通用大模型(运动学全域采样) {a.robot}")
         X8, Q = gen_dataset_universal(P03, a.n, rng)
@@ -362,10 +411,14 @@ def main():
                   ensure_ascii=False, indent=1)
         print(f"[部署] {out}\n[部署] 统计 {out.replace('.npz','_stats.json')}")
         return
+    cfg = ROBOT_CFG.get(a.robot)
+    if cfg is None:
+        cfg = ROBOT_CFG["g1"]
+        print(f"[警告] 未知机器人 {a.robot}, 采样带回退 g1 配置")
     print(f"[训练] 设备 {dev}, 机器人 {a.robot}")
-    X, D, Q, PZ = gen_dataset(P03, a.n, rng)
+    X, D, Q, PZ = gen_dataset(P03, a.n, rng, cfg)
     net, (qm, qs, xm, xs), _hist = train(np.column_stack([X, D]), Q, a.epochs, dev)
-    ev = evaluate(P03, net, qm, qs, xm, xs, dev)
+    ev = evaluate(P03, net, qm, qs, xm, xs, dev, cfg)
 
     out_dir = os.path.join(BASE, "station", "nn_ik")
     os.makedirs(out_dir, exist_ok=True)

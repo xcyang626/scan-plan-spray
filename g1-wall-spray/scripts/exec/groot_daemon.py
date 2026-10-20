@@ -34,13 +34,14 @@ import socket
 import sys
 import threading
 import time
+from collections import deque
 
 import numpy as np
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 BASE = os.path.dirname(os.path.dirname(_HERE))
 GROOT_ROOT = os.environ.get(
-    "GROOT_ROOT", "/home/yang/桌面/轨迹规划/GR00T-WholeBodyControl")
+    "GROOT_ROOT", os.path.expanduser("~/桌面/轨迹规划/GR00T-WholeBodyControl"))
 if GROOT_ROOT not in sys.path:
     sys.path.insert(0, GROOT_ROOT)
 if _HERE not in sys.path:
@@ -112,6 +113,139 @@ def pelvis_h_from_q29(q29):
         return None
 
 
+# ---------------- 腿式里程计(2026-10-19: SONIC 行走闭环位移反馈) ----------------
+# G1 低层控制模式固件不提供里程计(g1_debug 无位移字段, C++ 无速度估计), 但 5557
+# 调试流有关节编码器+IMU —— 腿式里程计: 支撑脚世界位置不动, 骨盆位移 =
+# -支撑脚在体坐标下的位移(按 IMU yaw 旋到世界系), 逐帧积分。比开环时间积分
+# 准一个量级, 行走指令据此闭环(走-量-停, 欠补过退)。
+def _rot_axis(ax, a):
+    c, s = math.cos(a), math.sin(a)
+    if ax == 'x':
+        return np.array([[1, 0, 0], [0, c, -s], [0, s, c]])
+    if ax == 'y':
+        return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]])
+    return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+
+
+def _quat2rot(q4):
+    """wxyz 四元数 -> 旋转矩阵。"""
+    w, x, y, z = (float(v) for v in q4)
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+        [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+        [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)]])
+
+
+# G1 腿链逐级规格(自 MJCF g1-mode_13_15.xml 逐项核对, 2026-10-19): 每级 =
+# (关节轴, 相对父级杆件偏移, 固定姿态四元数 wxyz|None)。链内有 ±10° 固定
+# 转角与横向杆偏置, 简单 L1/L2 两连杆 FK 的位移差分误差可到 4cm(实测对模型
+# 验证), 必须带全链。
+_LEG_CHAIN_L = [
+    ("y", (0.0, 0.064452, -0.1027), None),                       # hip_pitch_link
+    ("x", (0.0, 0.052, -0.030465), (0.99617869, 0.0, -0.08733857, 0.0)),
+    ("z", (0.025001, 0.0, -0.12412), None),                      # hip_yaw_link
+    ("y", (-0.078273, 0.0021489, -0.17734), (0.99617869, 0.0, 0.08733857, 0.0)),
+    ("y", (0.0, -0.00009445, -0.30001), None),                   # ankle_pitch_link
+    ("x", (0.0, 0.0, -0.017558), None),                          # ankle_roll_link
+]
+_LEG_CHAIN_R = [                                                  # 右腿=y 镜像
+    ("y", (0.0, -0.064452, -0.1027), None),
+    ("x", (0.0, -0.052, -0.030465), (0.99617869, 0.0, -0.08733857, 0.0)),
+    ("z", (0.025001, 0.0, -0.12412), None),
+    ("y", (-0.078273, -0.0021489, -0.17734), (0.99617869, 0.0, 0.08733857, 0.0)),
+    ("y", (0.0, 0.00009445, -0.30001), None),
+    ("x", (0.0, 0.0, -0.017558), None),
+]
+
+
+def foot_in_base(qleg, side="L"):
+    """单腿 6 关节(mujoco序) -> 脚心在骨盆系下的位置(踝 roll link 下 38mm
+    估计点)。髋相对骨盆常值偏移已在链首, Δ 差分与积分都用同一函数, 自洽。"""
+    chain = _LEG_CHAIN_L if side == "L" else _LEG_CHAIN_R
+    R = np.eye(3)
+    p = np.zeros(3)
+    for i, (ax, off, q4) in enumerate(chain):
+        p = p + R @ np.asarray(off)
+        if q4 is not None:
+            R = R @ _quat2rot(q4)
+        R = R @ _rot_axis(ax, float(qleg[i]))
+    return p + R @ np.array([0.0, 0.0, -_ANKLE_Z])
+
+
+def _yaw_from_quat(wxyz):
+    """IMU 四元数(w,x,y,z) -> 偏航角 rad(行走近乎朝墙, yaw≈0)。"""
+    try:
+        w, x, y, z = (float(v) for v in wxyz)
+        return math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+    except Exception:
+        return 0.0
+
+
+# ---------------- 遥测环形缓冲(2026-10-19: 出问题后能回看"之前的数值") ----------------
+# 常驻 50Hz×120s 环形缓冲(里程计/骨盆高/支撑脚/腿关节/yaw) + 指令与任务事件
+# 打点; 异常(取消/错误/行走停滞)或手动触发时 dump 最近 120s -> npz+events.json
+# (纯 numpy/json, 零额外依赖), 站点侧收到事件后自动分析出图并给参数建议。
+_TELE_HZ, _TELE_SPAN_S = 50.0, 120.0
+_TELE_CAP = int(_TELE_HZ * _TELE_SPAN_S)
+
+
+class Telemetry:
+    def __init__(self, cap=_TELE_CAP):
+        self.t = np.zeros(cap)
+        self.odom = np.zeros((cap, 2))
+        self.pelvis_h = np.full(cap, np.nan)
+        self.yaw = np.zeros(cap)
+        self.leg_q = np.zeros((cap, 12))
+        self.sup = np.zeros(cap, dtype=np.int8)       # bit0=左支撑 bit1=右支撑
+        self.head, self.count, self.cap = 0, 0, cap
+        self.events = deque(maxlen=4000)              # (time.time(), kind, dict)
+        self._lock = threading.Lock()
+
+    def sample(self, ts, odom, pelvis_h, yaw, leg_q, sup_mask):
+        with self._lock:
+            i = self.head
+            self.t[i] = ts
+            self.odom[i] = odom[:2]
+            self.pelvis_h[i] = pelvis_h if pelvis_h is not None else np.nan
+            self.yaw[i] = yaw
+            self.leg_q[i] = leg_q
+            self.sup[i] = sup_mask
+            self.head = (i + 1) % self.cap
+            self.count = min(self.count + 1, self.cap)
+
+    def event(self, kind, **kw):
+        with self._lock:
+            self.events.append((time.time(), kind, kw))
+
+    def dump(self, reason):
+        """落盘最近 _TELE_CAP 帧 + 事件表; 返回 (npz路径, json路径)。"""
+        out_dir = os.path.join(BASE, "output", "telemetry")
+        os.makedirs(out_dir, exist_ok=True)
+        name = "tele_" + time.strftime("%Y%m%d_%H%M%S")
+        with self._lock:
+            if self.count:
+                idx = (np.arange(self.count) + self.head - self.count) % self.cap
+                data = dict(t=self.t[idx].copy(), odom_x=self.odom[idx, 0].copy(),
+                            odom_y=self.odom[idx, 1].copy(),
+                            pelvis_h=self.pelvis_h[idx].copy(),
+                            yaw=self.yaw[idx].copy(), leg_q=self.leg_q[idx].copy(),
+                            sup=self.sup[idx].copy())
+            else:
+                data = dict(t=np.zeros(0), odom_x=np.zeros(0), odom_y=np.zeros(0),
+                            pelvis_h=np.zeros(0), yaw=np.zeros(0),
+                            leg_q=np.zeros((0, 12)), sup=np.zeros(0, np.int8))
+            evs = list(self.events)
+        npz_p = os.path.join(out_dir, name + ".npz")
+        json_p = os.path.join(out_dir, name + ".json")
+        np.savez(npz_p, **data)
+        json.dump(evs, open(json_p, "w", encoding="utf8"), ensure_ascii=False)
+        return npz_p, json_p
+
+
+_ODOM_LIFT_M = 0.03          # 抬脚 >3cm 视为摆动腿(非支撑)
+_ODOM_STEP_CAP_M = 0.05      # 单帧位移上限(防解码毛刺跳变)
+
+
 # ---------------- V2.1g 真机任务空间慢环: 走线水平度(腕心高度)修正 ----------------
 # 仿真 v6 伺服的慢环移植: 真机反馈(q29)只有关节角无底座位姿 —— 站/蹲时底座近似
 # 竖直朝墙(SONIC 平衡), 以 腿IK反解骨盆高 + 实测上肢关节FK 合成腕心世界位姿,
@@ -143,7 +277,7 @@ class FeedbackReader:
     """订阅部署调试输出(5557/g1_debug)读 body_q_measured —— 机器人实际关节角.
     用途: ①保持实测姿态(零瞬态启动) ②执行时与指令同步记录, 定位映射/跟踪问题."""
 
-    def __init__(self, host="localhost", port=5557):
+    def __init__(self, host="localhost", port=5557, telemetry=None):
         import zmq
         import msgpack
         self._zmq_mod = zmq
@@ -157,7 +291,44 @@ class FeedbackReader:
         self.ts = 0.0
         self.lock = threading.Lock()
         self.on_sample = None                         # 回调(q29, ts) —— 记录器挂这里
+        # 腿式里程计(世界系 xy, m; 行走闭环用): 支撑脚不动 -> Δbase = -Δfoot
+        self.odom = np.zeros(2)                       # [x, y] 世界系(y+=左)
+        self.odom_n = 0                               # 已积分样本数(置信度)
+        self._odom_prev = None                        # (feet[2], sup(set), yaw)
+        self.telemetry = telemetry                    # 遥测采样钩子(可选)
         threading.Thread(target=self._loop, daemon=True).start()
+
+    def odom_reset(self):
+        with self.lock:
+            self.odom[:] = 0.0
+            self._odom_prev = None
+
+    def _odom_step(self, q, quat):
+        """一帧里程计积分: 调用于持有 self.lock 的 _loop 内。"""
+        try:
+            feet = (foot_in_base(q[0:6], "L"), foot_in_base(q[6:12], "R"))
+            zmin = min(f[2] for f in feet)
+            sup = [i for i, f in enumerate(feet) if f[2] < zmin + _ODOM_LIFT_M]
+            yaw = _yaw_from_quat(quat) if quat else 0.0
+            self._last_sup_mask = (1 if 0 in sup else 0) | (2 if 1 in sup else 0)
+            self._last_yaw = yaw
+            cy, sy = math.cos(yaw), math.sin(yaw)
+            prev = self._odom_prev
+            if prev is not None:
+                pfeet, psup = prev[0], prev[1]
+                ds = []
+                for i in sup:
+                    if i in psup:                     # 连续支撑才可信(切脚瞬态跳过)
+                        d = -(feet[i][:2] - pfeet[i][:2])
+                        if np.hypot(*d) < _ODOM_STEP_CAP_M:
+                            ds.append(np.array([cy * d[0] - sy * d[1],
+                                                sy * d[0] + cy * d[1]]))
+                if ds:
+                    self.odom += np.mean(ds, axis=0)
+                    self.odom_n += 1
+            self._odom_prev = (feet, sup, yaw)
+        except Exception:
+            self._odom_prev = None                    # 坏帧: 重建支撑基准
 
     def _loop(self):
         zmq = self._zmq_mod
@@ -172,6 +343,13 @@ class FeedbackReader:
                         with self.lock:
                             self.q29 = np.asarray(q, float)
                             self.ts = now
+                            self._odom_step(self.q29, m.get("base_quat"))
+                            if self.telemetry is not None:
+                                self.telemetry.sample(
+                                    now, self.odom, pelvis_h_from_q29(self.q29),
+                                    getattr(self, "_last_yaw", 0.0),
+                                    self.q29[0:12],
+                                    getattr(self, "_last_sup_mask", 0))
                         if self.on_sample:
                             try:
                                 self.on_sample(self.q29, now)
@@ -211,6 +389,7 @@ class Daemon:
         self.hold_position = None                 # 最近保持姿态(SONIC 序), blend 重跑用
         self._gen = 0                             # 流代数: 旧线程不得清掉新线程的状态
         self.feedback = None                      # FeedbackReader(懒创建, 读 5557)
+        self.telemetry = Telemetry()              # 常驻环形遥测(异常时 dump)
         self._rec = None                          # 记录器状态(指令+实测同步记录)
         self._rec_lock = threading.Lock()
         self.t0 = time.time()
@@ -220,7 +399,8 @@ class Daemon:
             try:
                 self.feedback = FeedbackReader(
                     host="localhost",
-                    port=int(_env_json().get("debug_port", 5557)))
+                    port=int(_env_json().get("debug_port", 5557)),
+                    telemetry=self.telemetry)
             except Exception as ex:
                 emit({"event": "fatal", "err": f"反馈订阅创建失败: {ex}"})
         return self.feedback
@@ -329,10 +509,12 @@ class Daemon:
         return {"ok": True, "path": path, "sent_frames": len(sent_q),
                 "meas_frames": len(meas_q)}
 
-    def _do_stream(self, motion, rate, speed, blend_s, mjcf, gen):
+    def _do_stream(self, motion, rate, speed, blend_s, mjcf, gen, once=False):
         """官方算法: 50Hz 时间采样 + 梯度速度 + 结束保持末姿 + 取消时 5×hold。
         全程只发 planner 话题(上肢 17 关节, SONIC 交错序) —— 下肢归 SONIC 平衡策略,
         绝不发 planner=False(会切模式触发 TriggerSafetyReset)。
+        once=True: 单站播完(官方 5×hold 收尾)即返回 —— 多工位接力线程内联调用,
+        不进入无限保持(保持期由接力状态机接管行走/下一站)。
         V2 蹲姿通道(数据驱动): 动作 root_z 最低 <0.72 时逐帧携带 planner height
         (期望骨盆高, 与上肢目标同一条消息, C++ 端进策略观测); 骨盆高用 5557 实测
         q29 经腿部平面几何反解, 外环比例纠偏(与仿真 runner --height 同口径:
@@ -436,6 +618,12 @@ class Daemon:
                               "gun_angle_off_max": round(
                                   90.0 - st["ang_min"]
                                   if st["n_ang"] else 0.0, 1)})
+                        if once:                   # 接力单站: 收尾即让出通道
+                            for _ in range(5):
+                                self._send_upper(hold_position + off17_last,
+                                                 np.zeros(17))
+                                time.sleep(0.02)
+                            break
                 elif phase == "blend":
                     alpha = min(1.0, (now - blend_start) / blend_s)
                     alpha = alpha * alpha * (3.0 - 2.0 * alpha)
@@ -541,6 +729,12 @@ class Daemon:
                 emit({"event": "stream_cancelled", "note": "已按官方退出序列保持末姿"})
         except Exception as ex:
             emit({"event": "stream_error", "err": f"{type(ex).__name__}: {ex}"})
+            try:
+                npz_p, json_p = self.telemetry.dump("stream_error")
+                emit({"event": "telemetry_dumped", "reason": "stream_error",
+                      "npz": npz_p, "json": json_p})
+            except Exception:
+                pass
         finally:
             if self._gen == gen:
                 self.streaming = False
@@ -584,7 +778,235 @@ class Daemon:
 
     def cancel_stream(self):
         self.cancel_evt.set()
+        self.telemetry.event("cancel", streaming=self.streaming)
+        try:                                        # 急停/手动停止: 自动留现场
+            npz_p, json_p = self.telemetry.dump("cancel")
+            emit({"event": "telemetry_dumped", "reason": "cancel",
+                  "npz": npz_p, "json": json_p})
+        except Exception:
+            pass
         return {"ok": True, "cancelled": self.streaming}
+
+    # ---------- SONIC 行走(2026-10-19 实机多工位): planner 运动指令 ----------
+    def _walk(self, dy, v, gen, settle_s=2.5, t0_margin=0.8, sign=1.0):
+        """SONIC 位移(2026-10-19 定稿: 腿式里程计闭环)。脉冲式 走-量-停:
+        每段命令 ≤BURST_S 即停, 停稳后读里程计, 距目标欠 TOL 以上续走、过冲
+        反向退 —— 不再依赖"时间×速度"开环估算。里程计不可用(无 5557 反馈/
+        积分样本不足)时回退开环(t0_margin 步态死区裕量)。失效安全不变:
+        线程死→断流→部署端 1s 收不到 planner 消息自停。"""
+        v = min(max(float(v), 0.2), 0.8)            # SLOW_WALK 官方速度域
+        fb = self._ensure_feedback()
+        _odom_ok = bool(fb is not None and fb.odom_n >= 10)
+        t0 = time.perf_counter()
+        tmo = float(dy) / v * 4.0 + 25.0            # 总超时(闭环含停稳测量)
+
+        def _send_mv(on, dir=1.0):
+            with self.send_lock:
+                self.pub.planner_locomotion(
+                    (gb.MODE_SLOW_WALK if on else gb.MODE_IDLE),
+                    ((0.0, float(sign) * dir, 0.0) if on else (0.0, 0.0, 0.0)),
+                    (1.0, 0.0, 0.0), speed=(v if on else -1.0))
+
+        def _idle5():
+            for _ in range(5):
+                _send_mv(False)
+                time.sleep(0.033)
+
+        def _progress():
+            """沿目标方向的已走距离(m, 里程计世界 y×sign)。"""
+            with fb.lock:
+                return float(sign * fb.odom[1])
+
+        emit({"event": "walk_started", "dy": round(float(dy), 3), "v": v,
+              "mode": ("odom-closed-loop" if _odom_ok else "open-loop-fallback"),
+              "t0_margin": (0.0 if _odom_ok else round(float(t0_margin), 2)),
+              "est_s": round(float(dy) / v
+                             + (0.0 if _odom_ok else max(0.0, float(t0_margin))), 1)})
+        _tele = self.telemetry
+        _tele.event("walk_start", dy=round(float(dy), 4), v=v,
+                    mode=("odom" if _odom_ok else "open"), sign=float(sign))
+        _dump_reason = None
+        try:
+            if _odom_ok:
+                fb.odom_reset()
+                BURST_S, GATE_M, TOL_M = 0.7, 0.05, 0.035
+                _stall, _last = 0, 0.0
+                while not self.cancel_evt.is_set() and self._gen == gen:
+                    p = _progress()
+                    if abs(dy - p) <= TOL_M:
+                        break
+                    d = 1.0 if p < dy else -1.0      # 欠走正向 / 过冲反向退
+                    _tele.event("cmd_mv_on", dir=float(sign * d), v=v,
+                                p=round(p, 4))
+                    tb = time.perf_counter()
+                    nxt = tb
+                    while (time.perf_counter() - tb) < BURST_S:
+                        if self.cancel_evt.is_set() or self._gen != gen:
+                            break
+                        p = _progress()
+                        if (d > 0 and p >= dy - GATE_M) or \
+                           (d < 0 and p <= dy + GATE_M):
+                            break                    # 提前收臂, 给减速留距离
+                        _send_mv(True, d)
+                        nxt += 1.0 / 30.0
+                        s = nxt - time.perf_counter()
+                        time.sleep(s if s > 0 else 0.0)
+                    _idle5()
+                    _tele.event("cmd_mv_off", p=round(_progress(), 4))
+                    time.sleep(0.8)                  # 停稳再量(里程计含惯性段)
+                    p2 = _progress()
+                    if abs(p2 - _last) < 0.01:
+                        _stall += 1                  # 走不动(卡住/托底)
+                    else:
+                        _stall = 0
+                    _last = p2
+                    if _stall >= 3:
+                        _dump_reason = "walk_stall"
+                        break
+                    if (time.perf_counter() - t0) > tmo:
+                        _dump_reason = "walk_timeout"
+                        break
+                walked = _progress()
+                measured = True
+            else:
+                t_walk = max(0.0, float(t0_margin)) + float(dy) / v
+                nxt = time.perf_counter()
+                while (not self.cancel_evt.is_set() and self._gen == gen):
+                    el = time.perf_counter() - t0
+                    if el >= t_walk or el > tmo:
+                        break
+                    _send_mv(True)
+                    nxt += 1.0 / 30.0
+                    s = nxt - time.perf_counter()
+                    time.sleep(s if s > 0 else 0.0)
+                walked = min(v * max(0.0, (time.perf_counter() - t0)
+                                     - max(0.0, float(t0_margin))), float(dy))
+                measured = False
+            _cancelled = self.cancel_evt.is_set()
+            _idle5()
+            _tele.event("walk_done", dy=round(float(dy), 4),
+                        walked=round(float(walked), 4), measured=measured,
+                        cancelled=_cancelled,
+                        held_s=round(time.perf_counter() - t0, 2))
+            emit({"event": "walk_done", "dy": round(float(dy), 3),
+                  "walked_est": round(float(walked), 3), "measured": measured,
+                  "cancelled": _cancelled,
+                  "held_s": round(time.perf_counter() - t0, 2)})
+            if _dump_reason:                     # 走不动/超时: 留现场供回看分析
+                npz_p, json_p = _tele.dump(_dump_reason)
+                emit({"event": "telemetry_dumped", "reason": _dump_reason,
+                      "npz": npz_p, "json": json_p})
+            if settle_s > 0 and not _cancelled and self._gen == gen:
+                emit({"event": "walk_settle", "settle_s": settle_s})
+                time.sleep(settle_s)
+        except Exception as ex:
+            emit({"event": "stream_error", "err": f"walk: {ex}"})
+            try:
+                npz_p, json_p = _tele.dump("walk_exception")
+                emit({"event": "telemetry_dumped", "reason": "walk_exception",
+                      "npz": npz_p, "json": json_p})
+            except Exception:
+                pass
+
+    def _busy_guard(self):
+        """接力/行走与轨迹流互斥: 执行中(且非保持态)拒绝新任务。"""
+        if self.streaming and not self.holding:
+            return {"ok": False, "err": "busy",
+                    "note": "任务执行中, 请等本轮完成或先停止"}
+        if self.streaming and self.holding:         # 保持态让位(官方 B 重跑语义)
+            self._gen += 1
+            if self.stream_thread is not None:
+                self.stream_thread.join(timeout=2.0)
+        return None
+
+    def start_walk(self, dy, v=0.25, settle_s=2.5, t0_margin=0.8):
+        """单段行走(测试原语): 独立验证 SONIC 位移指令的实机跟踪(量出实际位移
+        可反算步态死区校准 t0_margin), 也供页面【补走】修正站位。dy<0=右移。"""
+        _sign = -1.0 if float(dy) < 0 else 1.0
+        busy = self._busy_guard()
+        if busy:
+            return busy
+        self.cancel_evt.clear()
+        self._gen += 1
+        gen = self._gen
+        self.streaming = True
+        self.holding = False
+
+        def _th():
+            try:
+                self._walk(abs(float(dy)), v, gen, settle_s, t0_margin,
+                           sign=_sign)
+            finally:
+                if self._gen == gen:
+                    self.streaming = False
+                    self.holding = False
+        self.stream_thread = threading.Thread(target=_th, daemon=True)
+        self.stream_thread.start()
+        return {"ok": True, "dy": dy, "v": v, "settle_s": settle_s,
+                "note": "SONIC 单段位移(SLOW_WALK, 开环时间积分+步态死区裕量)"}
+
+    def start_relay(self, motion, walk_list, speed=1.0, walk_v=0.25,
+                    settle_s=2.5, rate=50.0, blend_s=1.0, mjcf=None, band=None,
+                    walk_t0=0.8):
+        """多工位接力(实机): 每站 _do_stream(once) → 停稳 → SONIC 左移 walk_list[k]
+        → 停稳 → 下一站; 全部完成 relay_done。行走后用 5557 实测上肢作下站
+        blend 起点(从实际姿态平滑进轨迹, 不从陈旧保持姿猛拉)。"""
+        if not os.path.exists(motion):
+            return {"ok": False, "err": f"动作文件不存在: {motion}"}
+        wl = [float(v) for v in (walk_list or [])]
+        if not wl or any(not (0.05 < d < 1.5) for d in wl):
+            return {"ok": False, "err": f"步距列表异常(每段需 0.05~1.5m): {wl}"}
+        busy = self._busy_guard()
+        if busy:
+            return busy
+        self.cancel_evt.clear()
+        self._gen += 1
+        gen = self._gen
+        self.streaming = True
+        self.holding = False
+        n = 1 + len(wl)
+
+        def _th():
+            try:
+                for k in range(1, n + 1):
+                    if self.cancel_evt.is_set() or self._gen != gen:
+                        break
+                    emit({"event": "relay_station", "station_idx": k,
+                          "stations_total": n, "band": band,
+                          "walk_dy_planned": (wl[k - 1] if k > 1 else wl[0])})
+                    self._do_stream(motion, float(rate), float(speed),
+                                    float(blend_s), mjcf, gen, once=True)
+                    self.streaming = True           # _do_stream finally 会清, 接力续占
+                    if self.cancel_evt.is_set() or self._gen != gen:
+                        break
+                    if k < n:
+                        emit({"event": "relay_phase", "phase": "station_done",
+                              "station_idx": k, "stations_total": n})
+                        time.sleep(settle_s)        # 喷完先停稳
+                        if self.cancel_evt.is_set() or self._gen != gen:
+                            break
+                        self._walk(wl[k - 1], walk_v, gen, settle_s=settle_s,
+                                   t0_margin=walk_t0)
+                        self.streaming = True
+                        if self.cancel_evt.is_set() or self._gen != gen:
+                            break
+                        fb = self._ensure_feedback()
+                        p17, _q = (fb.upper17_sonic(max_wait=1.0) if fb
+                                   else (None, None))
+                        self.hold_position = (np.asarray(p17, float)
+                                              if p17 is not None else None)
+                if not self.cancel_evt.is_set() and self._gen == gen:
+                    emit({"event": "relay_done", "stations_total": n})
+            finally:
+                if self._gen == gen:
+                    self.streaming = False
+                    self.holding = False
+        self.stream_thread = threading.Thread(target=_th, daemon=True)
+        self.stream_thread.start()
+        return {"ok": True, "stations": n, "walk_list": wl,
+                "walk_v": walk_v, "settle_s": settle_s,
+                "note": f"实机多工位接力: {n} 站喷涂 + SONIC 行走"
+                        f"({len(wl)} 段左移, 开环位移, 人工监护随时急停)"}
 
     # ---------- 保持流(官方终端2语义: start 后持续发安全站姿) ----------
     def start_hold(self, pose17=None, motion=None, mjcf=None, from_robot=True):
@@ -687,6 +1109,31 @@ class Daemon:
             return self.record_stop(req.get("path"))
         if cmd == "cancel":
             return self.cancel_stream()
+        if cmd == "telemetry_dump":            # 手动抓取现场(最近 120s)
+            try:
+                npz_p, json_p = self.telemetry.dump("manual")
+                emit({"event": "telemetry_dumped", "reason": "manual",
+                      "npz": npz_p, "json": json_p})
+                return {"ok": True, "npz": npz_p, "json": json_p,
+                        "samples": self.telemetry.count}
+            except Exception as ex:
+                return {"ok": False, "err": f"dump 失败: {ex}"}
+        if cmd == "walk":                 # 单段行走(SONIC 位移指令实机测试原语)
+            return self.start_walk(float(req.get("dy", 0.3)),
+                                   float(req.get("v", 0.25)),
+                                   float(req.get("settle_s", 2.5)),
+                                   float(req.get("t0_margin", 0.8)))
+        if cmd == "relay":                # 多工位接力: 每站 stream + SONIC 行走
+            return self.start_relay(req.get("motion"),
+                                    req.get("walk_list") or [],
+                                    float(req.get("speed", 1.0)),
+                                    float(req.get("walk_v", 0.25)),
+                                    float(req.get("settle_s", 2.5)),
+                                    float(req.get("rate", 50.0)),
+                                    float(req.get("blend_s", 1.0)),
+                                    req.get("mjcf"),
+                                    req.get("band"),
+                                    float(req.get("walk_t0", 0.8)))
         return {"ok": False, "err": f"未知 cmd: {cmd}"}
 
 

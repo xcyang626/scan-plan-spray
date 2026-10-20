@@ -9,14 +9,23 @@ import os, glob, re
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BASE06 = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_VER_DIR = os.path.join(os.environ.get("G1W_OUT", os.path.join(BASE06, "output")),
+                        "ufo_motion", os.environ.get("MOTION_VER") or "")
 try:
     import json as _json
-    _m = _json.load(open(os.path.join(BASE06, "station", "robot_registry.json"),
-                         encoding="utf8"))["g1"]["mjcf"]
+    _REG = _json.load(open(os.path.join(BASE06, "station", "robot_registry.json"),
+                           encoding="utf8"))
+    _ROBOT = "g1"
+    _meta_p = os.path.join(_VER_DIR, "motion_meta.json")
+    if os.path.exists(_meta_p):
+        _ROBOT = _json.load(open(_meta_p, encoding="utf8")).get("robot", "g1")
+    _m = _REG[_ROBOT].get("mjcf") or _REG["g1"]["mjcf"]
     _m = os.path.expanduser(_m)        # registry 允许 ~/.cache/... 写法
     MJCF = _m if os.path.isabs(_m) else os.path.join(BASE06, _m)
 except Exception:
+    _ROBOT = "g1"
     MJCF = os.path.join(BASE06, "models", "g1_mjcf", "g1-mode_13_15.xml")
+print("回放机器人:", _ROBOT, "场景:", MJCF)
 
 
 def _ver_key(name):
@@ -51,8 +60,12 @@ def set_cam(azimuth, elevation, distance, lookat):
     c.lookat[:] = lookat
     return c
 
-cam_side = set_cam(90, 5, 2.6, (0.15, 0.0, 0.55))     # 侧视(机器人面向+x)
-cam_front = set_cam(180, 8, 2.6, (0.2, 0.0, 0.55))    # 斜前视
+if _ROBOT == "tiangong3":      # 天工更高(骨盆~1.0m), 拉远抬视点
+    cam_side = set_cam(90, 6, 3.4, (0.15, 0.0, 0.80))
+    cam_front = set_cam(180, 9, 3.4, (0.2, 0.0, 0.80))
+else:
+    cam_side = set_cam(90, 5, 2.6, (0.15, 0.0, 0.55))     # 侧视(机器人面向+x)
+    cam_front = set_cam(180, 8, 2.6, (0.2, 0.0, 0.55))    # 斜前视
 
 n_out = 0
 for i in range(0, T, 2):

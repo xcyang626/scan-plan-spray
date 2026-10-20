@@ -31,7 +31,8 @@ import time
 
 import numpy as np
 
-GROOT_ROOT = os.environ.get("GROOT_ROOT", "/home/yang/桌面/轨迹规划/GR00T-WholeBodyControl")
+GROOT_ROOT = os.environ.get("GROOT_ROOT",
+                            os.path.expanduser("~/桌面/轨迹规划/GR00T-WholeBodyControl"))
 sys.path.insert(0, GROOT_ROOT)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from arm_task_servo import (ArmTaskServo, JLO as C_JLO, JHI as C_JHI,   # noqa: E402
@@ -166,6 +167,23 @@ class SprayController:
         self.log_path = log_path
         self.log = []          # 播放期: (t_play, qpos, cmd_q10)
         self._motion_path = motion_path
+        # ---- 双工位接力任务(2026-10-13): 触发文件 stations>1 时,
+        # 播放①→停稳→loco_cmd 左移 walk_dy(闭环到位)→停稳→播放②(同一动作, 带随基座平移).
+        # +y=机器人左手边(官方遥控 a 键 loco_cmd[1]+=0.1). ----
+        self.stations_total = 1
+        self.station_idx = 1
+        self.mphase = "idle"               # idle | settle | walk
+        self._after_settle = None          # settle 结束后: "walk" | "play"
+        self.m_t0 = 0.0
+        self.walk_dy = 0.51                # 单站喷涂带宽(触发文件可覆盖)
+        self.walk_v = 0.25                 # 左移速度 m/s (>0.05 才切 walk 策略)
+        self.settle_s = 2.5
+        self.walk_y0 = 0.0
+        self.walk_done = 0.0
+        self.walk_list = []                # 多工位逐站步距(空=统一 walk_dy)
+        self.band = None                   # [u0,u1] 本站在墙面上的带宽范围(状态回显)
+        self.path_log = []                 # [t, x, y] 骨盆轨迹 0.2s 采样(页面俯视图)
+        self._path_t = 0.0
         self._prep_targets()   # __init__ 路径(自动模式)预算目标; 触发模式在装载时再算
 
     def _prep_targets(self):
@@ -349,8 +367,100 @@ class SprayController:
             return 0.0
         return (time.time() - self.t_play0) * self.trig_speed
 
+    # ---- 双工位接力任务 ----
+    def _mission_kw(self):
+        """write_status 的任务附加字段(页面俯视图数据源)."""
+        return dict(station_idx=self.station_idx,
+                    stations_total=self.stations_total,
+                    walk_dy_planned=round(self.walk_dy, 3),
+                    walk_dy_done=round(self.walk_done, 3),
+                    band=self.band, path=self.path_log[-600:])
+
+    def _mission_step(self):
+        """settle/walk 阶段推进(主循环每步调用). 返回 "stop" 表示摔倒要终止."""
+        if self.mphase == "idle":
+            return
+        c = self.c
+        now = time.time()
+        if self.mphase == "settle":
+            if now - self.m_t0 < self.settle_s:
+                return
+            if self._after_settle == "walk":
+                self.walk_y0 = float(c.data.qpos[1])
+                self.m_t0 = now
+                self.mphase = "walk"
+                write_status(phase="walking", **self._mission_kw())
+                print(f"[spray] 工位{self.station_idx} 喷涂完成, 开始左移 "
+                      f"{self.walk_dy:.3f}m (速度 {self.walk_v} m/s)", flush=True)
+            else:
+                self._start_next_station()
+            return
+        # walk: 持续给左移速度, 位移闭环到位/超时即停
+        with c.cmd_lock:
+            c.control_dict["loco_cmd"][0] = 0.0
+            c.control_dict["loco_cmd"][1] = float(self.walk_v)
+            c.control_dict["loco_cmd"][2] = 0.0    # 行走段不做偏航保持(策略自带朝向)
+        pz = float(c.data.qpos[2])
+        self.walk_done = float(c.data.qpos[1]) - self.walk_y0
+        tmo = self.walk_dy / max(self.walk_v, 0.05) * 2.5 + 5.0
+        if pz < self._fall_z or not np.isfinite(pz):
+            self.fallen = True
+            self._zero_loco()
+            self.mphase = "idle"
+            write_status(phase="fallen", pelvis=round(pz, 3), **self._mission_kw())
+            print("[spray] ⚠ 行走段检测到摔倒/失控, 任务终止", flush=True)
+            self.motion = None
+            self.playing = False
+            return "stop"
+        if self.walk_done >= self.walk_dy or (now - self.m_t0) > tmo:
+            self._zero_loco()
+            self.mphase = "settle"
+            self._after_settle = "play"
+            self.m_t0 = now
+            write_status(phase="settle", **self._mission_kw())
+            print(f"[spray] 左移完成: 位移 {self.walk_done:.3f}m / 目标 "
+                  f"{self.walk_dy:.3f}m, 停稳后喷下一工位", flush=True)
+
+    def _zero_loco(self):
+        with self.c.cmd_lock:
+            self.c.control_dict["loco_cmd"][:] = 0.0
+
+    def _start_next_station(self):
+        self.station_idx += 1
+        self.pz_min, self.pz_err_max, self.fallen = 9.9, 0.0, False
+        self.srv.reset()
+        self.log = []
+        self.t_play0 = time.time()
+        self.playing = True
+        self.mphase = "idle"
+        self._after_settle = None
+        print(f"[spray] ━━ 工位{self.station_idx}/{self.stations_total} 开始喷涂 "
+              f"(同一动作, 基座已平移)", flush=True)
+        write_status(phase="playing", **self._mission_kw())
+
+    def _finish_station(self, imp):
+        """非末站播放结束: 打印统计并进入 settle→walk→settle→下一站链."""
+        if imp:
+            print(f"[spray] 工位{self.station_idx} 落点误差: mean {imp['mean']:+.3f}m, "
+                  f"p95 {imp['p95']:.3f}m, max {imp['max']:.3f}m (n={imp['n']}帧)", flush=True)
+        print(f"[spray] 工位{self.station_idx} 摘要: 骨盆最低 "
+              f"{self.pz_min:.3f}m, |骨盆-动作|最大 {self.pz_err_max:.3f}m, "
+              f"摔倒 {self.fallen}", flush=True)
+        self.playing = False
+        self.t_play0 = None
+        self.mphase = "settle"
+        self._after_settle = "walk"
+        self.m_t0 = time.time()
+        if self.walk_list and self.station_idx - 1 < len(self.walk_list):
+            # 多工位最少站数规划: 下一站步距(站 i 喷完 -> walk_list[i-1])
+            self.walk_dy = self.walk_list[self.station_idx - 1]
+        write_status(phase="station_done", **self._mission_kw())
+
     # ---- 触发/计时 ----
     def maybe_start(self):
+        # 双工位任务进行中(settle/walk/下一站)不吃新触发 —— 触发文件在任务结束才删
+        if self.mphase != "idle" or self._after_settle is not None:
+            return
         # 触发模式下 motion 初始为 None(等触发文件给出), 不能因此提前返回
         if self.playing or (self.motion is None and not self.trigger):
             return
@@ -370,6 +480,32 @@ class SprayController:
                         # 与站点/daemon 同口径的安全限幅; NaN/inf 归一为实时
                         self.trig_speed = (min(max(sp, 0.05), 1.5)
                                            if np.isfinite(sp) else 1.0)
+                        # 双/多工位任务字段(stations=1 时全部无效, 单站行为不变)
+                        try:
+                            self.stations_total = max(1, int(info.get("stations", 1)))
+                        except (TypeError, ValueError):
+                            self.stations_total = 1
+                        self.station_idx = 1
+                        self.walk_done = 0.0
+                        # walk_list: 多工位最少站数规划的逐站步距(站 i 喷完左移
+                        # walk_list[i-1]); 缺省回退统一 walk_dy(旧双工位兼容)
+                        _wl = info.get("walk_list") or []
+                        try:
+                            self.walk_list = [min(max(float(v), 0.05), 2.0)
+                                              for v in _wl if np.isfinite(float(v))]
+                        except (TypeError, ValueError):
+                            self.walk_list = []
+                        if len(self.walk_list) < self.stations_total - 1:
+                            self.walk_list = []      # 长度不符按旧单值通道走
+                        _dy = float(info.get("walk_dy", self.walk_dy) or self.walk_dy)
+                        self.walk_dy = _dy if np.isfinite(_dy) and _dy > 0.05 else self.walk_dy
+                        if self.walk_list:
+                            self.walk_dy = self.walk_list[0]
+                        _v = float(info.get("walk_v", self.walk_v) or self.walk_v)
+                        self.walk_v = min(max(_v, 0.1), 0.5)
+                        _ss = float(info.get("settle_s", self.settle_s) or self.settle_s)
+                        self.settle_s = min(max(_ss, 1.0), 8.0)
+                        self.band = info.get("band")           # [u0,u1] 回显给页面
                         self.motion = load_motion(mp)
                         self._trig_fp = raw          # 消费指纹
                         self._motion_path = mp
@@ -384,9 +520,12 @@ class SprayController:
                         self.playing = True
                         self.t_play0 = time.time()
                         print(f"[spray] 收到触发, 播放 {mp} ({len(self.motion)} 帧, "
-                              f"速度×{self.trig_speed})", flush=True)
+                              f"速度×{self.trig_speed}"
+                              + (f", 接力×{self.stations_total}站, 逐站步距 "
+                                 f"{self.walk_list if self.walk_list else round(self.walk_dy, 2)}m"
+                                 if self.stations_total > 1 else "") + ")", flush=True)
                         write_status(phase="playing", motion=mp,
-                                     frames=int(len(self.motion)))
+                                     frames=int(len(self.motion)), **self._mission_kw())
                 except Exception as e:
                     print(f"[spray] 触发解析失败: {e}", flush=True)
         elif el >= self.stand_s:
@@ -422,6 +561,15 @@ class SprayController:
                     viewer = None
                 step_start = time.time()
                 self.maybe_start()
+                if self._mission_step() == "stop":
+                    break
+                # 骨盆轨迹采样(0.2s; 页面俯视图数据)
+                if step_start - self._path_t >= 0.2:
+                    self._path_t = step_start
+                    self.path_log.append(
+                        [round(step_start - self.t0, 2),
+                         round(float(c.data.qpos[0]), 3),
+                         round(float(c.data.qpos[1]), 3)])
 
                 # 腿+腰 PD (RL 输出; 腰部被轨迹覆盖)
                 leg_tau = self._pd(
@@ -477,15 +625,22 @@ class SprayController:
                 now = time.time()
                 if now - last_report > 0.5:
                     last_report = now
-                    ph = "playing" if self.playing else "standing"
+                    ph = ("playing" if self.playing else
+                          {"settle": "settle", "walk": "walking"}.get(
+                              self.mphase, "standing"))
                     prog = (self.t_play() / (len(self.motion) / TRAJ_FPS)
                             if (self.playing and self.motion is not None) else 0.0)
                     write_status(phase=ph, progress=round(float(min(prog, 1.0)), 3),
-                                 pelvis=round(float(c.data.qpos[2]), 3))
+                                 pelvis=round(float(c.data.qpos[2]), 3),
+                                 **self._mission_kw())
                 if self.playing and self.motion is not None:
                     if self.t_play() > len(self.motion) / TRAJ_FPS + 0.5:
                         if self.loop:
                             self.t_play0 = time.time()
+                        elif self.station_idx < self.stations_total:
+                            # 双工位: 非末站 → 统计+进入 settle→walk→settle→下一站
+                            imp = self._impact_stats()
+                            self._finish_station(imp)
                         elif self.trigger:
                             # 触发模式: 回到待命, 删触发文件, 等待下一次执行
                             imp = self._impact_stats()
@@ -504,7 +659,8 @@ class SprayController:
                                          pelvis_min=(round(self.pz_min, 3)
                                                      if self.pz_min < 9 else None),
                                          pelvis_err_max=round(self.pz_err_max, 3),
-                                         fallen=self.fallen, impact_err=imp)
+                                         fallen=self.fallen, impact_err=imp,
+                                         **self._mission_kw())
                             self.log = []           # 每轮统计后清空, 下一轮重新累计
                             self.runs += 1
                             self.playing = False

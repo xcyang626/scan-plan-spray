@@ -34,7 +34,7 @@ import time
 import numpy as np
 
 GROOT_ROOT = os.environ.get("GROOT_ROOT",
-                            "/home/yang/桌面/轨迹规划/GR00T-WholeBodyControl")
+                            os.path.expanduser("~/桌面/轨迹规划/GR00T-WholeBodyControl"))
 if GROOT_ROOT not in sys.path:
     sys.path.insert(0, GROOT_ROOT)
 
@@ -73,6 +73,7 @@ UPPER_BODY_IDX = [19, 20, 21] + list(range(22, 29)) + list(range(29, 36))
 # LocomotionMode::IDLE —— planner 模式下"原地站立"（下肢由机器人自身平衡）
 MODE_IDLE = 0
 MODE_IDLE_SQUAT = 4          # LocomotionMode.IDEL_SQUAT: planner 只在蹲姿系模式消费 target_height
+MODE_SLOW_WALK = 1           # LocomotionMode.SLOW_WALK: 0.1~0.8 m/s 行走模式
 
 # GR00T 原生按键（与官方 keyboard/zmq 接口一致）
 KEY_START = "]"        # 启动控制
@@ -113,6 +114,14 @@ class Publisher:
             upper_body_position=list(np.asarray(upper17, float)),
             upper_body_velocity=None if upper_vel is None else list(np.asarray(upper_vel, float)),
         ))
+
+    # ---- 官方 planner 话题: 纯运动指令(位移方向/速度/朝向, 不带上肢) ----
+    def planner_locomotion(self, mode, movement, facing, speed=-1.0, height=-1.0):
+        """movement=位移方向单位向量(朝向系), speed=m/s(-1 用模式默认),
+        facing=朝向单位向量; 不发 upper_body_position, 上肢交给策略默认动作。"""
+        self.pub.send(build_planner_message(
+            mode=int(mode), movement=movement, facing=facing,
+            speed=speed, height=height))
 
     def close(self):
         try:

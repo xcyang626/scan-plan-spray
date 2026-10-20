@@ -16,6 +16,11 @@ g1-wall-spray/station/run/
 g1-wall-spray/station/robot_status.json
 g1-wall-spray/station/robot.pid
 g1-wall-spray/station/*.fifo
+g1-wall-spray/station/*.log
+g1-wall-spray/walk_spray/log/
+
+# ---- ZCode 会话草稿/工作流运行记录（本机） ----
+.zcode/
 
 # ---- pointcloud-registration 运行输出（样例输入 ply 已入库，不放输出） ----
 pointcloud-registration/舱室点云/舱室地图机器人扫描版本.*
