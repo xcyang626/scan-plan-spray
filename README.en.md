@@ -159,6 +159,23 @@ Replay video (the same motion executed on the physical G1, ×1.0 full run in 155
 
 <video src="g1-wall-spray/media/replay_motion.mp4" controls muted width="60%"></video>
 
+**Multi-station relay (accepted in simulation, 2026-10-20)**: the wall is cut into N
+bands of one action width; each station sprays its own band, then the robot steps
+along the wall and sprays the next one. A two-station GR00T MuJoCo relay lands the
+step exactly (0.500 / 0.500 m) without falling, and station 2 keeps station 1's
+landing-height accuracy (steady-state mean -0.036 m vs -0.014 m). The residual is a
+~12 cm shift of the spray pattern along the wall (the torso tilts more after walking).
+
+<p align="center">
+<img src="g1-wall-spray/media/fig_multi_station_bands.png" width="92%"/><br/>
+<i>Multi-station band division: a 0.98 m wall covered seamlessly by 3 stations (band 0.327 m, step 0.327 m)</i>
+</p>
+
+<p align="center">
+<img src="g1-wall-spray/media/fig_multi_station_sim.png" width="98%"/><br/>
+<i>Two-station relay in simulation: base trajectory / landing-height error / along-wall pattern shift / task-servo correction</i>
+</p>
+
 ### openarm-zigzag — getting "fast" and "stable" at the same time
 
 A full-chain project on the OpenArm v1 7-DOF arm (Damiao DM motors + CAN-FD): a pure-Python reimplementation of the official calibration flow, four simulation routes (MoveIt2 / hand-written numerical IK / MuJoCo / Isaac Lab), and three real-robot routes (JTC baseline / a ros2_control MPC plugin / an RL policy with an ILC feedforward layer). Nine technical documents record the trade-offs along the way: landing published PD-tuning formulas, RL reward and time design, root-causing the 0.5–2 Hz hunting behind the 73.4 s e-stop, and taking ILC from feasibility study to real-robot acceptance.

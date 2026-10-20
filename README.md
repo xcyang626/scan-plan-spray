@@ -161,6 +161,21 @@ cat README.md            # 按「快速上手」五步：标定 → MoveIt2 仿�
 
 <video src="g1-wall-spray/media/replay_motion.mp4" controls muted width="60%"></video>
 
+**多工位接力（2026-10-20 仿真验收）**：整墙按动作带宽切成 N 条带，每站喷自己那条，
+站间走一步再喷下一站；GR00T MuJoCo 两站接力实测走位 0.500/0.500 m 精确到位、
+不摔倒，站 2 的落点高度误差与站 1 同级（稳态均值 -0.036 m vs -0.014 m），
+沿墙方向的图案偏移约 12 cm（躯干倾角在走位后变大）。
+
+<p align="center">
+<img src="g1-wall-spray/media/fig_multi_station_bands.png" width="92%"/><br/>
+<i>多工位条带划分：整墙 0.98 m → 3 站无缝覆盖（条带 0.327 m，步距 0.327 m）</i>
+</p>
+
+<p align="center">
+<img src="g1-wall-spray/media/fig_multi_station_sim.png" width="98%"/><br/>
+<i>两站接力仿真：底座轨迹 / 落点高度误差 / 沿墙图案偏移 / 任务伺服修正量</i>
+</p>
+
 ### openarm-zigzag — 把"快"和"稳"同时做出来
 
 OpenArm v1 七轴（达妙 DM 电机 + CAN-FD）上的全链路工程：纯 Python 复刻官方标定流程、四条仿真路线（MoveIt2 / 自研数值 IK / MuJoCo / Isaac Lab）、三条真机执行路线（JTC 基线 / ros2_control MPC 插件 / RL 策略 + ILC 前馈层）。9 篇技术文档记录了每一步的取舍：PD 整定的论文经验公式落地、RL 奖励与时间设计、73.4 s 急停的 0.5–2 Hz 猎振根因分析、ILC 从可行性论证到真机验收。
