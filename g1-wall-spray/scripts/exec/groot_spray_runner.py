@@ -156,6 +156,14 @@ class SprayController:
         self._fall_z = 0.35                            # 摔倒阈值(_prep_targets 按动作自适应)
         self.playing = False
         self.t_play0 = None
+        # 工位切换的姿态渐变(2026-10-20): 从**当前实测姿态**渐变到动作首帧.
+        # 原来每站直接跳到首帧 -> PD 目标瞬变, 任务伺服积分器把这段瞬态吃进去
+        # 之后一直饱和(修正量打到 0.35~0.5rad 限位), 整站喷涂被拖偏:
+        # 仿真两站接力实测 站1 落点误差 mean -0.028m / 站2 -0.311m.
+        # 真机 daemon 已有同款机制(hold_position + blend_s=1s), 仿真侧此前漏了.
+        self.blend_s = 1.0
+        self.blend_from = None
+        self.blend_t0 = 0.0
         self.trig_speed = 1.0      # 触发文件携带的速度倍率(安全限幅 [0.05,1.5])
         self.done = False
         self.runs = 0
@@ -209,7 +217,19 @@ class SprayController:
         """任务伺服补偿量(未播放/未启用时为 0): 快环 dq + 慢环下垂微调 dq_slow."""
         if not (self.task_servo and self.playing):
             return np.zeros(10)
+        if self.blend_from is not None:
+            return np.zeros(10)      # 渐变期间不叠加伺服(否则与渐变抢目标)
         return self.srv.dq + self.srv.dq_slow
+
+    def _start_play(self):
+        """开始一段喷涂播放: 先记当前实测姿态做渐变起点, 再起播."""
+        try:
+            self.blend_from = np.asarray(self.c.data.qpos, float).copy()
+        except Exception:
+            self.blend_from = None
+        self.blend_t0 = time.time()
+        self.playing = True
+        self.t_play0 = time.time()
 
     # ---- 轨迹采样 (30Hz, 线性插值) ----
     def sample(self, t, with_vel=False):
@@ -224,6 +244,15 @@ class SprayController:
             a = f - i
         i = max(0, i)
         q = (1 - a) * self.motion[i] + a * self.motion[i + 1]
+        # 工位切换渐变: 从当前实测姿态 smoothstep 到动作帧(1s); 渐变期间伺服不参与
+        if self.blend_from is not None:
+            el = time.time() - self.blend_t0
+            if el < self.blend_s:
+                al = min(max(el / self.blend_s, 0.0), 1.0)
+                al = al * al * (3.0 - 2.0 * al)          # smoothstep
+                q = (1 - al) * self.blend_from + al * q
+            else:
+                self.blend_from = None                   # 渐变结束, 伺服接管
         if not with_vel:
             return q
         v = (self.motion[i + 1] - self.motion[i]) * TRAJ_FPS   # 速度前馈 (rad/s)
@@ -364,7 +393,7 @@ class SprayController:
         # 只平移 y(行走方向): 墙面是 x 向的固定平面, x 目标必须保持**绝对**
         # 才能守住墙距; 而沿墙方向(y)喷涂图案随底座一起走, 目标要跟着平移.
         _bpos = np.asarray(c.data.qpos[0:3], float)
-        p_star = p_star + np.array([0.0, _bpos[1]])
+        p_star = p_star + np.array([0.0, _bpos[1], 0.0])
         q10_meas = np.concatenate([c.data.qpos[19:22], c.data.qpos[29:36]])
         self.srv.step(q10_m, p_star, a_star, c.data.qpos[0:3], c.data.qpos[3:7],
                       q10_meas)   # q10_meas 只进慢速微调环(0.5s低增益, 收PD下垂)
@@ -437,8 +466,7 @@ class SprayController:
         self.pz_min, self.pz_err_max, self.fallen = 9.9, 0.0, False
         self.srv.reset()
         self.log = []
-        self.t_play0 = time.time()
-        self.playing = True
+        self._start_play()          # 从当前实测姿态渐变到动作首帧
         self.mphase = "idle"
         self._after_settle = None
         print(f"[spray] ━━ 工位{self.station_idx}/{self.stations_total} 开始喷涂 "
@@ -455,6 +483,7 @@ class SprayController:
               f"摔倒 {self.fallen}", flush=True)
         self.playing = False
         self.t_play0 = None
+        self._save_log("station%d" % self.station_idx)   # 每站日志单独落盘(诊断用)
         self.mphase = "settle"
         self._after_settle = "walk"
         self.m_t0 = time.time()
@@ -524,8 +553,7 @@ class SprayController:
                             print("[spray] ⚠ 触发的动作含蹲姿段但本进程未启用蹲姿通道"
                                   "(缺 --height / --legs motion) — 蹲姿段骨盆不会下降",
                                   flush=True)
-                        self.playing = True
-                        self.t_play0 = time.time()
+                        self._start_play()      # 渐变起步(避免 PD 目标瞬变)
                         print(f"[spray] 收到触发, 播放 {mp} ({len(self.motion)} 帧, "
                               f"速度×{self.trig_speed}"
                               + (f", 接力×{self.stations_total}站, 逐站步距 "
@@ -536,9 +564,8 @@ class SprayController:
                 except Exception as e:
                     print(f"[spray] 触发解析失败: {e}", flush=True)
         elif el >= self.stand_s:
-            self.playing = True
-            self.t_play0 = time.time()
             self.srv.reset()                        # 自动模式起播: 伺服补偿清零
+            self._start_play()                      # 渐变起步
             print(f"[spray] 站立 {el:.1f}s 结束, 开始播放轨迹", flush=True)
             write_status(phase="playing", frames=int(len(self.motion)))
 
@@ -653,10 +680,12 @@ class SprayController:
                             imp = self._impact_stats()
                             print("[spray] 轨迹播放完成, 回到待命", flush=True)
                             if imp:
-                                print(f"[spray] 落点误差(实际-规划, 含底座漂移): "
+                                print(f"[spray] 落点误差(实际-规划, 墙随底座): "
                                       f"mean {imp['mean']:+.3f}m, p95 {imp['p95']:.3f}m, "
                                       f"max {imp['max']:.3f}m (n={imp['n']}帧; "
-                                      f"伺服 {self.task_servo})", flush=True)
+                                      f"伺服 {self.task_servo}; 底座 x均值 "
+                                      f"{imp.get('base_dx')} y均值 "
+                                      f"{imp.get('base_dy')})", flush=True)
                             print(f"[spray] 蹲姿执行摘要: 骨盆最低 "
                                   f"{self.pz_min if self.pz_min < 9 else float('nan'):.3f}m, "
                                   f"|骨盆-动作|最大 {self.pz_err_max:.3f}m, 摔倒 {self.fallen}",
@@ -668,6 +697,7 @@ class SprayController:
                                          pelvis_err_max=round(self.pz_err_max, 3),
                                          fallen=self.fallen, impact_err=imp,
                                          **self._mission_kw())
+                            self._save_log("final")  # 末轮日志落盘
                             self.log = []           # 每轮统计后清空, 下一轮重新累计
                             self.runs += 1
                             self.playing = False
@@ -704,9 +734,10 @@ class SprayController:
               f"|骨盆-动作|最大 {self.pz_err_max:.3f}m, 摔倒 {self.fallen} "
               f"(legs={self.legs}, gait={self.gait})", flush=True)
         if imp:
-            print(f"[spray] 落点误差(实际-规划, 含底座漂移): mean {imp['mean']:+.3f}m, "
+            print(f"[spray] 落点误差(实际-规划, 墙随底座): mean {imp['mean']:+.3f}m, "
                   f"p95 {imp['p95']:.3f}m, max {imp['max']:.3f}m (n={imp['n']}帧; "
-                  f"伺服 {self.task_servo}, 偏航保持 {self.yaw_hold})", flush=True)
+                  f"伺服 {self.task_servo}, 偏航保持 {self.yaw_hold}; 底座 x均值 "
+                  f"{imp.get('base_dx')} y均值 {imp.get('base_dy')})", flush=True)
         write_status(phase=("fallen" if self.fallen else
                             ("done" if self.done else "standing")),
                      pelvis_min=round(self.pz_min, 3) if self.pz_min < 9 else None,
@@ -714,9 +745,29 @@ class SprayController:
                      impact_err=imp)
         return self.done
 
+    def _save_log(self, tag):
+        """把本段跟踪日志落盘(<log_path>.<tag>.npz); 便于逐站对比落点/伺服."""
+        if not (self.log_path and self.log):
+            return
+        try:
+            t = np.array([x[0] for x in self.log])
+            q = np.array([x[1] for x in self.log])
+            cq = np.array([x[2] for x in self.log])
+            p = f"{self.log_path}.{tag}.npz"
+            np.savez(p, t=t, qpos=q, cmd_q10=cq)
+            print(f"[spray] 跟踪日志已存 {p} ({len(t)} 帧)", flush=True)
+        except Exception as e:
+            print(f"[spray] 跟踪日志落盘失败: {e}", flush=True)
+
     def _impact_stats(self):
         """运行末从跟踪日志算 落点高度误差(实际-规划): 任务空间的最终指标.
-        实际落点 = 实测qpos(底座+腰臂) FK 射线交墙; 规划落点 = 预算 tgt_H 插值."""
+        实际落点 = 实测qpos(底座+腰臂) FK 射线交墙; 规划落点 = 预算 tgt_H 插值.
+
+        墙平面口径: 规划(03/05)假设"墙面在底座前方 d_robot, 底座在原点", 落点高
+        tgt_H 也是按这个**相对**口径算的. 仿真里没有真实墙面, 底座还可能 x 漂
+        (平衡策略), 若拿**绝对** x=0.74 当墙, 底座一漂就把"墙距变了"算成
+        "喷歪了"(实测站2 mean -0.21m 里大部分是这个). 这里按当前底座 x + d_robot
+        取墙(与规划的相对口径一致), 底座 x 漂移另行输出 base_dx."""
         if not self.log or self.tgt_H is None:
             return None
         wall_x = float(os.environ.get("G1W_D_ROBOT", "0") or 0.74)
@@ -737,13 +788,16 @@ class SprayController:
             p_w = Rb @ p_rel + qp[k, 0:3]
             a_w = Rb @ a_rel
             if a_w[0] > 0.3:
-                dh.append(p_w[2] + (wall_x - p_w[0]) * a_w[2] / a_w[0] - h_star[k])
+                wx = qp[k, 0] + wall_x        # 墙随底座(相对口径, 同规划)
+                dh.append(p_w[2] + (wx - p_w[0]) * a_w[2] / a_w[0] - h_star[k])
         if len(dh) < 50:
             return None
         dh = np.array(dh)
         return dict(n=int(len(dh)), mean=round(float(dh.mean()), 4),
                     p95=round(float(np.percentile(np.abs(dh), 95)), 4),
-                    max=round(float(np.abs(dh).max()), 4))
+                    max=round(float(np.abs(dh).max()), 4),
+                    base_dx=round(float(qp[:, 0].mean()), 3),
+                    base_dy=round(float(qp[:, 1].mean()), 3))
 
 
 def main():
