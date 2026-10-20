@@ -24,7 +24,7 @@
   "gun_len_m": 0.12,
   "workspace_npz": "output/g1_workspace.npz",
   "motion_ver": "v5_stand_zigzag",
-  "nn_ik_file": "station/nn_ik/g1_nn_ik.npz",
+  "nn_ik_file": "station/nn_ik/g1_all_nn_ik.npz",
   "model_dir": "~/桌面/遥操/g1_model",
   "urdf_file": "g1_29dof_nohand.urdf"
  },
@@ -40,8 +40,8 @@
   },
   "waist_roll_pitch_limit_rad": 0.436,
   "pelvis_stand_m": [
-   1.0,
-   1.03
+   0.96,
+   0.987
   ],
   "stance_band_m": [
    0.86,
@@ -50,7 +50,7 @@
   "d_wrist_m": 0.51,
   "gun_len_m": 0.12,
   "workspace_npz": "output/tiangong_workspace.npz",
-  "nn_ik_file": "station/nn_ik/tiangong_nn_ik.npz",
+  "nn_ik_file": "station/nn_ik/tiangong3_rp5_nn_ik.npz",
   "model_dir": "~/桌面/tiangong3/tiangong3_web",
   "urdf_file": "tiangong3.urdf",
   "workspace_only": false,

@@ -358,6 +358,13 @@ class SprayController:
         if n < 1e-6:
             return
         a_star = a_star / n
+        # 规划目标假设底座在原点(03/05 同口径); 实测腕心用**实际底座位姿**算,
+        # 所以底座一平移, 残差里就恒含底座位移 —— 多工位接力第二站起, 积分
+        # 伺服会一路顶到 dq 饱和, 把右臂拉向**上一工位**的墙面点.
+        # 只平移 y(行走方向): 墙面是 x 向的固定平面, x 目标必须保持**绝对**
+        # 才能守住墙距; 而沿墙方向(y)喷涂图案随底座一起走, 目标要跟着平移.
+        _bpos = np.asarray(c.data.qpos[0:3], float)
+        p_star = p_star + np.array([0.0, _bpos[1]])
         q10_meas = np.concatenate([c.data.qpos[19:22], c.data.qpos[29:36]])
         self.srv.step(q10_m, p_star, a_star, c.data.qpos[0:3], c.data.qpos[3:7],
                       q10_meas)   # q10_meas 只进慢速微调环(0.5s低增益, 收PD下垂)

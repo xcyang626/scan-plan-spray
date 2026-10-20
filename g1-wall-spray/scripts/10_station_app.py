@@ -69,6 +69,13 @@ AUTO_EXEC_AFTER_MOTION = str(_ENV_JSON.get("auto_exec", "false")).lower() == "tr
 EXEC_SPEED = float(_ENV_JSON.get("exec_speed", 1.0))
 # 实机安全限幅: 执行速度倍率上下限(越界一律夹取; groot_daemon.py 端同样限幅)
 EXEC_SPEED_MIN, EXEC_SPEED_MAX = 0.05, 1.5
+# 蹲姿地板(骨盆高度下界)统一口径 —— train_nn_ik / stage_plan / stage_motion
+# 必须取同一个值: 该值编进工作区缓存目录名(g1_rp5_c35 / g1_rp5_c60), 口径
+# 不一致会把工作区分裂成两套, 站上发布的 NN 模型(按 c60 训练)与 dual 规划
+# 用的 c35 工作区对不上, 种子落在模型训练分布之外(实机蹲不下去/站不住)。
+G1_CROUCH_LO_DUAL = 0.35     # G1 双姿态(站+蹲)的蹲姿下界
+G1_CROUCH_LO_STAND = 0.60    # G1 纯站姿(不下蹲)时的下界
+T3_CROUCH_LO = 0.43           # 天工3 蹲姿地板 = 腿几何下限
 # 官方安全保持站姿(v7 首帧, SONIC 交错序) —— 启动机器人后持续保持, 防 reference 回放
 HOLD_POSE_UPPER17 = _ENV_JSON.get("hold_pose_upper17_sonic",
                                   [0.0, 0.0, 0.0, 0.2, 0.0, 0.2, 0.0, 0.0, 0.0,
@@ -83,6 +90,7 @@ class _GrootDaemon:
     def __init__(self):
         self.proc = None
         self.lock = threading.Lock()
+        self.wlock = threading.Lock()   # 写锁: id 分配 + stdin 写入必须整体原子
         self._id = 0
         self._wait = {}          # id -> [Event, response]
 
@@ -101,9 +109,10 @@ class _GrootDaemon:
                 except Exception:
                     continue
                 rid = m.get("id")
-                if rid is not None and rid in self._wait:
-                    self._wait[rid][1] = m
-                    self._wait[rid][0].set()
+                _w = self._wait.get(rid) if rid is not None else None
+                if _w is not None:       # 超时已被回收的 id 直接忽略(不抛 KeyError 中断读线程)
+                    _w[1] = m
+                    _w[0].set()
                 elif m.get("event"):
                     _daemon_event(m)
         except Exception:
@@ -143,17 +152,19 @@ class _GrootDaemon:
         """发请求并等应答; 守护进程不在运行则直接失败(不自动拉起, 避免递归)."""
         if not self.alive():
             return {"ok": False, "err": "daemon-not-running"}
-        with self.lock:
+        ev = threading.Event()
+        # 写锁内完成 id 分配 + 写 + flush: /api/walk、/api/telemetry/dump 等并发
+        # 调用若在锁外写, 两个线程的半行会交错进管道, daemon 解析错乱
+        with self.wlock:
             self._id += 1
             rid = self._id
-        ev = threading.Event()
-        self._wait[rid] = [ev, None]
-        try:
-            self.proc.stdin.write(json.dumps({"id": rid, "cmd": cmd, **kw}) + "\n")
-            self.proc.stdin.flush()
-        except Exception as ex:
-            self._wait.pop(rid, None)
-            return {"ok": False, "err": f"write-failed: {ex}"}
+            self._wait[rid] = [ev, None]
+            try:
+                self.proc.stdin.write(json.dumps({"id": rid, "cmd": cmd, **kw}) + "\n")
+                self.proc.stdin.flush()
+            except Exception as ex:
+                self._wait.pop(rid, None)
+                return {"ok": False, "err": f"write-failed: {ex}"}
         if not ev.wait(timeout):
             self._wait.pop(rid, None)
             return {"ok": False, "err": f"timeout-{timeout:.0f}s"}
@@ -166,6 +177,19 @@ _DAEMON = _GrootDaemon()
 _RELAY = {"station_idx": 1, "stations_total": 0, "band": None,
           "walk_dy_planned": 0.0, "walk_dy_done": 0.0}
 _RELAY_ACTIVE = False
+_RELAY_LOCK = threading.Lock()   # _RELAY 由守护事件线程与 HTTP 工作线程并发读写
+
+
+def _relay_update(**kw):
+    """_RELAY 整体加锁更新(混写会拼出跨来源的脏快照)."""
+    with _RELAY_LOCK:
+        _RELAY.update(kw)
+
+
+def _relay_snapshot():
+    """_RELAY 的一致性快照(整份拷贝, 不与并发写入交错)."""
+    with _RELAY_LOCK:
+        return dict(_RELAY)
 
 
 def _analyze_telemetry(npz_p, json_p):
@@ -282,49 +306,52 @@ def _daemon_event(m):
             + (" [蹲姿通道: planner height + 骨盆闭环]" if m.get("height_channel") else ""))
     elif ev == "relay_station":                    # 实机多工位: 第 k 站开始喷涂
         _RELAY_ACTIVE = True
-        _RELAY.update(station_idx=int(m.get("station_idx", 1)),
+        _relay_update(station_idx=int(m.get("station_idx", 1)),
                       stations_total=int(m.get("stations_total", 0)),
                       band=m.get("band"),
                       walk_dy_planned=float(m.get("walk_dy_planned") or 0.0),
                       walk_dy_done=0.0)
-        _n, _k = _RELAY["stations_total"], _RELAY["station_idx"]
+        _snap = _relay_snapshot()
+        _n, _k = _snap["stations_total"], _snap["station_idx"]
         log(f"▶ 实机接力 第 {_k}/{_n} 站喷涂开始"
-            + (f" (下一站左移 {_RELAY['walk_dy_planned']:.3f}m)" if _k < _n else " (末站)"))
-        write_status_phase("playing", progress=0.0, **_RELAY)
+            + (f" (下一站左移 {_snap['walk_dy_planned']:.3f}m)" if _k < _n else " (末站)"))
+        write_status_phase("playing", progress=0.0, **_snap)
     elif ev == "relay_phase" and m.get("phase") == "station_done":
-        _RELAY.update(station_idx=int(m.get("station_idx", 1)),
+        _relay_update(station_idx=int(m.get("station_idx", 1)),
                       stations_total=int(m.get("stations_total", 0)))
-        _k, _n = _RELAY["station_idx"], _RELAY["stations_total"]
+        _snap = _relay_snapshot()
+        _k, _n = _snap["station_idx"], _snap["stations_total"]
         log(f"★ 第 {_k}/{_n} 站喷涂完成 — 停稳后 SONIC 左移 "
-            f"{_RELAY['walk_dy_planned']:.3f}m")
-        write_status_phase("station_done", **_RELAY)
+            f"{_snap['walk_dy_planned']:.3f}m")
+        write_status_phase("station_done", **_snap)
     elif ev == "walk_started":
-        _RELAY.update(walk_dy_planned=float(m.get("dy") or 0.0), walk_dy_done=0.0)
+        _relay_update(walk_dy_planned=float(m.get("dy") or 0.0), walk_dy_done=0.0)
         log(f"▶ SONIC 行走: 左移 {m.get('dy')}m @ {m.get('v')}m/s "
             + ("[腿式里程计闭环: 走-量-停, 欠补过退]" if m.get("mode") == "odom-closed-loop"
                else f"[⚠ 无位移反馈, 回退开环: 命令 ~{m.get('est_s')}s 含裕量 "
                     f"{m.get('t0_margin')}s]")
             + ", 人工监护, 随时可急停)")
-        write_status_phase("walking", **_RELAY)
+        write_status_phase("walking", **_relay_snapshot())
     elif ev == "walk_done":
-        _RELAY["walk_dy_done"] = float(m.get("walked_est") or 0.0)
+        _relay_update(walk_dy_done=float(m.get("walked_est") or 0.0))
         log(f"★ 行走完成({'里程计实测' if m.get('measured') else '开环估算'}): "
             f"{m.get('walked_est')}m / 目标 {m.get('dy')}m, 用时 {m.get('held_s')}s"
             + ("" if m.get("measured") else " — 建议按标尺用【补走】修正")
             + (" (被取消)" if m.get("cancelled") else ""))
-        write_status_phase("walking", **_RELAY)
+        write_status_phase("walking", **_relay_snapshot())
     elif ev == "walk_settle":
-        write_status_phase("settle", **_RELAY)
+        write_status_phase("settle", **_relay_snapshot())
     elif ev == "relay_done":
-        log(f"★ 实机多工位接力全部完成: {_RELAY['stations_total']} 站已喷")
-        write_status_phase("standing", **_RELAY)
+        _snap = _relay_snapshot()
+        log(f"★ 实机多工位接力全部完成: {_snap['stations_total']} 站已喷")
+        write_status_phase("standing", **_snap)
         _RELAY_ACTIVE = False
     elif ev == "stream_run":
         log("blend 过渡完成, 轨迹开始")
     elif ev == "stream_progress":
         n, k = m.get("n") or 1, m.get("k") or 0
         write_status_phase("playing", progress=(k / n if n else 0.0),
-                           **(_RELAY if _RELAY_ACTIVE else {}))
+                           **(_relay_snapshot() if _RELAY_ACTIVE else {}))
     elif ev == "stream_done":
         if not _RELAY_ACTIVE:                      # 接力中站点完成由 relay_phase 接管
             write_status_phase("done", progress=1.0)
@@ -918,24 +945,34 @@ def exec_spray(motion_path, run_dir=None, speed=None, stations=1):
         trig = {"motion": motion_path, "speed": speed}
         if stations == "auto":
             # 多工位全覆盖: 站数/站距/首站带由 14 的条带划分给出
+            # (整段包 try: plan 缺 exec_hint/steps 或 steps 为空时不能抛 KeyError/
+            #  ValueError 冲出 do_POST(连接被中断), 一律回 400 错误信息)
             try:
                 _rd2 = run_dir or JOB.get("run_dir") or os.path.dirname(
                     os.path.dirname(os.path.dirname(motion_path)))
                 _p14 = json.load(open(os.path.join(_rd2, "multi_station_plan.json"),
                                       encoding="utf8"))
+                _n = int(_p14["n_stations"])
+                _steps = [float(v) for v in (_p14["steps"] or [])]
+                if not _steps:
+                    raise ValueError("steps(站距)为空")
+                _wl = [round(float(v), 3) for v in
+                       (_p14["exec_hint"].get("walk_list") or [])]
+                if len(_wl) != _n - 1:      # 步距列表长度不符: 退回等距(不静默丢弃逐站步距)
+                    _wl = [round(max(_steps), 3)] * (_n - 1)
+                band = _p14.get("first_band_actual") or _p14["exec_hint"]["band"]
+                trig.update(stations=_n,
+                            walk_dy=round(float(max(_steps)), 3),
+                            walk_list=_wl,
+                            walk_v=0.25, settle_s=2.5, band=band)
+                log(f"▶ 多工位接力(仿真): 最少 {_n} 站覆盖整墙 "
+                    f"{_p14['wall_width']:.2f}m, 智能站距 "
+                    f"{min(_steps):.3f}~{max(_steps):.3f}m"
+                    f"({len(_wl)} 段), 左移速度 0.25 m/s")
             except Exception as ex:
                 return {"err": f"多工位执行需要 multi_station_plan.json(先以"
-                               f"多工位模式完成规划): {ex}"}
-            band = _p14.get("first_band_actual") or _p14["exec_hint"]["band"]
-            _wl = _p14["exec_hint"].get("walk_list") or []
-            trig.update(stations=int(_p14["n_stations"]),
-                        walk_dy=round(float(max(_p14["steps"])), 3),
-                        walk_list=[round(float(v), 3) for v in _wl],
-                        walk_v=0.25, settle_s=2.5, band=band)
-            log(f"▶ 多工位接力(仿真): 最少 {_p14['n_stations']} 站覆盖整墙 "
-                f"{_p14['wall_width']:.2f}m, 智能站距 "
-                f"{min(_p14['steps']):.3f}~{max(_p14['steps']):.3f}m"
-                f"({_wl and len(_wl)} 段), 左移速度 0.25 m/s")
+                               f"多工位模式完成规划), 且字段须完整"
+                               f"(n_stations/steps/exec_hint): {ex}"}
         elif stations > 1:
             band = None                     # 带宽/范围从 trajectory_meta 读
             try:
@@ -1007,9 +1044,9 @@ def exec_spray(motion_path, run_dir=None, speed=None, stations=1):
             if r.get("err") == "busy":
                 return {"err": "任务执行中 — 请等本轮完成/进入保持, 或先停止"}
             return {"err": f"接力下发失败: {r.get('err')}"}
-        _RELAY.update(station_idx=1, stations_total=_n, band=_band,
+        _relay_update(station_idx=1, stations_total=_n, band=_band,
                       walk_dy_planned=_wl[0], walk_dy_done=0.0)
-        write_status_phase("playing", progress=0.0, **_RELAY)
+        write_status_phase("playing", progress=0.0, **_relay_snapshot())
         log(f"★ 实机多工位接力已启动: {_n} 站喷涂 + SONIC 行走"
             f"({len(_wl)} 段左移 {_wl[0]:.3f}~{_wl[-1]:.3f}m, 0.25m/s, "
             f"开环位移无反馈 — 全程人工监护, 随时【急停】)")
@@ -1118,7 +1155,10 @@ for _r in REGISTRY.values():                     # 模型路径相对化(打包�
 
 JOB = {"state": "idle", "stage": "", "t0": None, "log": [], "error": None,
        "metrics": {}, "artifacts": {}, "motion_ver": None, "robot": "g1",
-       "ros_mode": None, "posture": "stand", "replay_busy": False}
+       "ros_mode": None, "posture": "stand", "replay_busy": False,
+       # 下面几个键一次性登记好: 后台线程写它们时不再"新增键",
+       # /api/status 锁内 dict(JOB) 不会撞 "dictionary changed size during iteration"
+       "run_dir": None, "waist_deg": None, "stations": None, "nn_training": False}
 LOCK = threading.Lock()
 PROC = None
 ESTOP = False          # 急停封锁标志: /api/estop 置位; start_robot/stop_robot/退出 清除
@@ -1208,14 +1248,16 @@ def stage_plan(cfg):
     try:
         run_dir = os.path.join(RUNS, "run_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
         os.makedirs(run_dir, exist_ok=True)
-        JOB["run_dir"] = run_dir
         log(f"运行目录 {run_dir}")
-        crouch_lo = (REGISTRY["tiangong3"].get("crouch_lo", 0.43)
+        crouch_lo = (REGISTRY["tiangong3"].get("crouch_lo", T3_CROUCH_LO)
                      if cfg["robot"] == "tiangong3" else
-                     (0.35 if cfg.get("posture") == "dual" else 0.60))  # t3 蹲姿地板=腿几何下限; G1 dual 0.35
+                     (G1_CROUCH_LO_DUAL if cfg.get("posture") == "dual"
+                      else G1_CROUCH_LO_STAND))  # t3 蹲姿地板=腿几何下限; G1 dual 0.35
         ws_dir, ws_new = ensure_workspace(cfg["robot"], cfg["waist_deg"], crouch_lo)
-        JOB["waist_deg"] = cfg["waist_deg"]
-        JOB["posture"] = cfg.get("posture", "stand")
+        with LOCK:               # JOB 键写入纳入锁: 后台线程插键会让 /api/status
+            JOB["run_dir"] = run_dir   # 锁内 dict(JOB) 撞 "dictionary changed size"
+            JOB["waist_deg"] = cfg["waist_deg"]
+            JOB["posture"] = cfg.get("posture", "stand")
         if cfg.get("posture") == "dual":
             log(f"▶ V2 双姿态模式(蹲姿地板 {crouch_lo}m): 站姿喷上半 -> 回零位过渡 "
                 f"-> 蹲姿喷下半")
@@ -1351,12 +1393,14 @@ def stage_motion(cfg):
     t0 = time.time()
     try:
         ver = f"v{'6' if cfg.get('posture') == 'dual' else '5'}_run{datetime.datetime.now().strftime('%H%M%S')}"
-        JOB["motion_ver"] = ver
+        with LOCK:               # JOB 键写入纳入锁(同 stage_plan)
+            JOB["motion_ver"] = ver
         run_dir = JOB.get("run_dir") or RUN
-        # 蹲姿地板与 plan 同源(registry.crouch_lo), 防止缓存目录按不同地板分裂
-        crouch_lo = (REGISTRY.get(cfg["robot"], {}).get("crouch_lo", 0.60)
+        # 蹲姿地板与 plan 同源(G1_CROUCH_LO_*), 防止缓存目录按不同地板分裂
+        crouch_lo = (REGISTRY.get(cfg["robot"], {}).get("crouch_lo", T3_CROUCH_LO)
                      if cfg.get("robot") == "tiangong3" else
-                     (0.35 if cfg.get("posture") == "dual" else 0.60))
+                     (G1_CROUCH_LO_DUAL if cfg.get("posture") == "dual"
+                      else G1_CROUCH_LO_STAND))
         _ws_dir, _ = ensure_workspace(cfg["robot"], cfg.get("waist_deg", 5.0), crouch_lo)
         if _estop_check("动作生成(05 导出前)"):
             return
@@ -1427,7 +1471,8 @@ def stage_motion(cfg):
         # 动作就绪后直接下发给机器人执行(无需手动点“自动执行”)
         if AUTO_EXEC_AFTER_MOTION and _robot_pid():
             mv_npz = os.path.join(mdir, "wall_spray_motion.npz")
-            r = exec_spray(mv_npz, run_dir)
+            r = exec_spray(mv_npz, run_dir,
+                           stations=(cfg.get("stations") or JOB.get("stations")))
             if r.get("ok"):
                 log("★ 动作已自动下发给机器人执行")
             else:
@@ -1598,7 +1643,7 @@ class H(BaseHTTPRequestHandler):
             self._send(200, r)
         elif u.path == "/api/train_nn":
             robot = body.get("robot") or JOB.get("robot", "g1")
-            if robot not in REGISTRY:
+            if not isinstance(REGISTRY.get(robot), dict):   # REGISTRY 含 "_说明" 等非 dict 键
                 return self._send(400, {"err": f"未知机器人 {robot}"})
             wd = float(body.get("waist_deg", JOB.get("waist_deg", 5.0)))
             if wd not in (5.0, 10.0, 15.0, 20.0):
@@ -1613,10 +1658,16 @@ class H(BaseHTTPRequestHandler):
 
             def _train():
                 try:
-                    # 蹲姿地板与 stage_plan 同源(registry.crouch_lo), 防 train/plan
-                    # 各算一套缓存目录; 02 脚本也按机器人选(否则 t3 会跑 G1 工作区)
-                    crouch_lo = (REGISTRY.get(robot, {}).get("crouch_lo", 0.60)
-                                 if robot == "tiangong3" else 0.60)
+                    # 蹲姿地板与 stage_plan/stage_motion **完全同源**: 训练工作区必须
+                    # 与规划/执行用的工作区一致, 否则缓存目录分裂(c60 vs c35),
+                    # NN 的种子落在训练分布之外; 02 脚本也按机器人选(否则 t3 会跑
+                    # G1 工作区). 姿态取当前任务(JOB["posture"]), 与规划同一次
+                    # 选择 —— 纯站姿时同样用 0.60, 不能固定成 dual 的 0.35.
+                    _posture = JOB.get("posture", "stand")
+                    crouch_lo = (REGISTRY.get(robot, {}).get("crouch_lo", T3_CROUCH_LO)
+                                 if robot == "tiangong3" else
+                                 (G1_CROUCH_LO_DUAL if _posture == "dual"
+                                  else G1_CROUCH_LO_STAND))
                     ws_dir, ws_new = ensure_workspace(robot, wd, crouch_lo)
                     if ws_new:
                         log(f"腰限 ±{wd:.0f}°: 首次使用, 先重算工作区(约3分钟)…")
@@ -1636,7 +1687,8 @@ class H(BaseHTTPRequestHandler):
                 except Exception as ex:
                     log(f"✘ NN-IK 训练失败: {ex}")
                 finally:
-                    JOB["nn_training"] = False
+                    with LOCK:       # JOB 键写入纳入锁(同 stage_plan)
+                        JOB["nn_training"] = False
             threading.Thread(target=_train, daemon=True).start()
             self._send(200, {"ok": True, "robot": robot})
         elif u.path == "/api/robot/start":
@@ -1793,22 +1845,37 @@ class H(BaseHTTPRequestHandler):
                                      encoding="utf8"))
             except Exception:
                 sug = {}
-            nt0 = body.get("walk_t0")
-            nv = body.get("walk_v")
-            if nt0 is not None:
-                sug["walk_t0"] = round(float(nt0), 2)
-            if nv is not None:
-                sug["walk_v"] = round(float(nv), 2)
-            if not any(k in sug for k in ("walk_t0", "walk_v")):
-                return self._send(400, {"err": "无建议参数(报告里还没有行走段数据)"})
+            # 只认本次请求提供的键: 先做类型校验(非数字/非有限值直接 400),
+            # 守卫不能看合并后的 calib.json —— 否则只要 calib.json 里已有
+            # walk_t0, 空/垃圾请求体也会被放行并重写文件
+            _req = {}
+            for _k in ("walk_t0", "walk_v"):
+                if body.get(_k) is None:
+                    continue
+                try:
+                    _v = float(body[_k])
+                except (TypeError, ValueError):
+                    return self._send(400, {"err": f"{_k} 必须是数字, 收到 {body[_k]!r}"})
+                if not math.isfinite(_v):
+                    return self._send(400, {"err": f"{_k} 必须是有限数值, 收到 {body[_k]!r}"})
+                _req[_k] = round(_v, 2)
+            if not _req:
+                return self._send(400, {"err": "无建议参数(请求未提供 walk_t0/walk_v)"})
+            sug.update(_req)
             sug.setdefault("_说明", "现场报告数据建议自动写入: 下次执行生效")
             json.dump(sug, open(os.path.join(BASE, "station", "calib.json"),
                                 "w", encoding="utf8"),
                       ensure_ascii=False, indent=1)
             if "walk_t0" in sug:
-                _WALK_T0 = float(sug["walk_t0"])
+                try:                    # calib.json 被人手改坏时不至于 500
+                    _WALK_T0 = float(sug["walk_t0"])
+                except (TypeError, ValueError):
+                    pass
             if "walk_v" in sug:
-                _WALK_V = float(sug["walk_v"])
+                try:
+                    _WALK_V = float(sug["walk_v"])
+                except (TypeError, ValueError):
+                    pass
             log(f"★ 已按现场报告数据应用: " + ", ".join(
                 f"{k}={sug[k]}" for k in ("walk_t0", "walk_v") if k in sug)
                 + " (写入 station/calib.json)")
@@ -1818,12 +1885,14 @@ class H(BaseHTTPRequestHandler):
 
     def _validate(self, b):
         r0 = REGISTRY.get(b.get("robot", "g1"))
-        _no_policy = bool(r0 and r0.get("plan_no_policy"))
+        # 未知机器人先判: 否则 _no_policy=False 会先命中"机器人未启动",
+        # "未知机器人"分支永远走不到(REGISTRY 里还有 "_说明" 等非 dict 键)
+        if not isinstance(r0, dict):
+            return f"未知机器人 {b.get('robot')}"
+        _no_policy = bool(r0.get("plan_no_policy"))
         if not _robot_pid() and not _no_policy:
             return "机器人未启动 — 请先点【启动机器人】(策略就位后才能规划)"
         r = r0
-        if not r:
-            return f"未知机器人 {b.get('robot')}"
         wd = float(b.get("waist_deg", 5))
         if wd not in (5.0, 10.0, 15.0, 20.0):
             return f"腰限档位仅支持 5/10/15/20°, 收到 {wd}°"
@@ -1872,19 +1941,34 @@ class H(BaseHTTPRequestHandler):
     def _model_file(self, rel, robot=None):
         """机器人模型静态文件: 白名单=registry登记的 model_dir, 防目录穿越.
         路径形如 /model/<robot>/<file>(机器人编码在首段, mesh 请求可靠解析归属);
-        兼容旧形式 /model/<file>?robot=<key>(query), 最后才回退 JOB 当前机器人."""
+        兼容旧形式 /model/<file>?robot=<key>(query), 最后才回退 JOB 当前机器人.
+        机器人必须是 registry 里真正的 dict 条目(REGISTRY 还有 "_说明" 等说明键,
+        命中会取到字符串 -> info["model_dir"] 抛 TypeError -> 500);
+        未知机器人一律 400, 不能静默换成 JOB 的机器人(否则请求不存在的机器人
+        却返回别的机器人的 mesh)."""
         import urllib.parse
         rel = urllib.parse.unquote(rel)
         parts = rel.split("/", 1)              # 新形式: <robot>/<file>
-        if len(parts) == 2 and parts[0] in REGISTRY:
+        _seg = parts[0] if len(parts) == 2 else None
+        if _seg is not None and _seg in REGISTRY:
             robot, rel = parts[0], parts[1]
-        info = REGISTRY.get(robot) or REGISTRY.get(JOB.get("robot", "g1")) or next(
-            v for k, v in REGISTRY.items() if not k.startswith("_"))
+        if robot is not None:
+            info = REGISTRY.get(robot)
+            if not isinstance(info, dict):
+                return self._send(400, {"err": f"未知机器人 {robot}"})
+        else:
+            # 无机器人线索: 回退 JOB 当前机器人(再退第一个登记条目)
+            info = REGISTRY.get(JOB.get("robot", "g1"))
+            if not isinstance(info, dict):
+                info = next(v for k, v in REGISTRY.items() if not k.startswith("_"))
         base = os.path.realpath(info["model_dir"])
         p = os.path.realpath(os.path.join(base, rel))
         if not p.startswith(base + os.sep) and p != base:
             return self._send(403, {"err": "forbidden"})
         if not os.path.exists(p):
+            if _seg is not None and robot is None:
+                # 首段不是登记的机器人名, 且按回退机器人也找不到文件 -> 未知机器人
+                return self._send(400, {"err": f"未知机器人 {_seg}"})
             return self._send(404, {"err": "no file"})
         ct = {".urdf": "application/xml", ".xml": "application/xml",
               ".STL": "application/octet-stream", ".stl": "application/octet-stream",
@@ -2754,8 +2838,9 @@ setInterval(async()=>{
   const sig=s.state+'|'+JSON.stringify(s.metrics||{})+'|'+(s.run_dir||'');
   const sigChanged = window._sig!==sig;
   if(sigChanged) window._sig=sig;
+  const rb=(s.robot||{});     // 会话机器人状态(会话身份, 非产物机器人)
   {   // 机器人相关 UI: 每次轮询都刷新(轻量), 保证门槛/按钮即时跟随
-    const rb=(s.robot||{}); const rph=rb.phase||(rb.running?'starting':'stopped');
+    const rph=rb.phase||(rb.running?'starting':'stopped');
     renderMission(rb);
   window._robotPhase = rb.running? rph : 'stopped';
   // 文案分机器人: 跟随**会话身份**(rb.robot, 实际启动的机器人)而非产物机器人 jrobot ——
@@ -2832,7 +2917,8 @@ setInterval(async()=>{
   const bEx=$('bExec'), bAp=$('bApprove'), bSp=$('exec_speed');
   if(bEx && bAp){
     const ready=(s.state==='ready') && !_stale;
-    const t3 = jrobot==='tiangong3';
+    const t3 = rb.robot==='tiangong3';   // 跟随会话身份(非产物机器人 jrobot):
+                                        // "G1 策略栈 + 天工3 规划产物" 也要能执行
     bAp.style.display = (!ready && s.state==='inspect' && !_stale)? 'block':'none';
     bEx.style.display = (ready && !t3)? 'block':'none';
     if(bSp) bSp.style.display = (ready && !t3)? 'block':'none';

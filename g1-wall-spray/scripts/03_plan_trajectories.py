@@ -141,19 +141,21 @@ JLO = np.array([j[3] for j in CHAIN]); JHI = np.array([j[4] for j in CHAIN])
 # ±30/60° 腰yaw档建立, 冗余该由手臂消化 —— 腰yaw硬限 ±35°(档位+裕量).
 _WYAW_MAX = np.deg2rad(float(os.environ.get("G1W_WAIST_YAW_MAX", "45")))
 JLO[0] = -_WYAW_MAX; JHI[0] = _WYAW_MAX
-PELVIS_RANGE = {"stand": (0.96, 1.005) if _ROBOT_ID == "tiangong3"
-                else (0.77, 0.79)}       # 站姿(G1 v5 口径; 天工腿几何上限1.005=直腿,
-                                       # 下限0.96=轻屈膝够到底部60°下倾行, 实测pz 0.969~0.99)
+PELVIS_RANGE = {"stand": (T3.PELVIS_STAND_LO, T3.PELVIS_STAND_TOP)
+                if _ROBOT_ID == "tiangong3"
+                else (0.77, 0.79)}       # 站姿(G1 v5 口径; 天工站姿带由腿几何上限推导
+                                       # (tiangong3_kinematics), 下限0.96=轻屈膝够到
+                                       # 底部60°下倾行, 实测pz 0.969~0.99)
 if _ROBOT_ID == "tiangong3":             # V3 t3 双姿态(0-2m KPI): 蹲姿地板=腿FK几何下限
     _CLO_T3 = float(os.environ.get("G1W_CROUCH_LO", "0")) or 0.53   # 平面腿模型膝限位地板
     # (02b全链P2=0.426靠hip非平面自由度; 05真机下发是平面解, 膝限位2.531→地板≈0.529)
     PELVIS_RANGE.update({"crouch": (_CLO_T3, 0.70),   # 深蹲带: h0.2~0.7 行(实验 pz 0.43 可行)
-                         "trans": (_CLO_T3, 1.005)})  # 站<->蹲过渡(骨盆自由穿越至直腿)
+                         "trans": (_CLO_T3, T3.PELVIS_STAND_TOP)})  # 站<->蹲过渡(骨盆自由穿越至直腿)
 else:
     PELVIS_RANGE.update({                            # V2 双姿态增补:
         "crouch": (float(os.environ.get("G1W_CROUCH_LO", "0")) or 0.60, 0.70),  # 蹲姿地板=02 同源(实测可稳到0.29)
         "trans": (float(os.environ.get("G1W_CROUCH_LO", "0")) or 0.60, 0.79)})  # 站<->蹲过渡段(骨盆自由穿越)
-_PZ_SEED = float(sum(PELVIS_RANGE["stand"]) / 2)   # 站姿带中点(g1 0.78 / t3 1.015): NN种子骨盆初值
+_PZ_SEED = float(sum(PELVIS_RANGE["stand"]) / 2)   # 站姿带中点(g1 0.78 / t3 ~0.974): NN种子骨盆初值
 
 
 def rotx(a):

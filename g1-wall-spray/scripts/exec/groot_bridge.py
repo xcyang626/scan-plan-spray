@@ -115,13 +115,23 @@ class Publisher:
             upper_body_velocity=None if upper_vel is None else list(np.asarray(upper_vel, float)),
         ))
 
-    # ---- 官方 planner 话题: 纯运动指令(位移方向/速度/朝向, 不带上肢) ----
-    def planner_locomotion(self, mode, movement, facing, speed=-1.0, height=-1.0):
-        """movement=位移方向单位向量(朝向系), speed=m/s(-1 用模式默认),
-        facing=朝向单位向量; 不发 upper_body_position, 上肢交给策略默认动作。"""
+    # ---- 官方 planner 话题: 纯运动指令(位移方向/速度/朝向) ----
+    def planner_locomotion(self, mode, movement, facing, speed=-1.0, height=-1.0,
+                           upper17=None):
+        """movement=位移方向单位向量(朝向系), speed=m/s(-1 用模式默认), facing=朝向单位向量.
+
+        upper17: 可选的**上肢 17 关节目标(SONIC 交错序)**. 必须传!
+        接收端 zmq_manager.hpp 每收到一条 planner 消息就执行
+        `has_upper_body_control_ = msg.upper_body_position.has_value()` ——
+        缺这个字段就把上肢控制权交回部署端的 reference 动作(官方演示用的
+        舞蹈/踢腿), 实机上表现为手臂突然回落到参考动作而不是停在当前姿态.
+        行走/静默期间同样要带上, 否则走两步手臂就"跳舞"."""
+        kw = {}
+        if upper17 is not None:
+            kw["upper_body_position"] = list(np.asarray(upper17, float))
         self.pub.send(build_planner_message(
             mode=int(mode), movement=movement, facing=facing,
-            speed=speed, height=height))
+            speed=speed, height=height, **kw))
 
     def close(self):
         try:

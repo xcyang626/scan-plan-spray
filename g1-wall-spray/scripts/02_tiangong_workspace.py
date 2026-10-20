@@ -2,10 +2,13 @@
 """步骤2b: 天工3 (Tiangong3) 工作区域蒙特卡洛计算 —— 逻辑直接复用 02_g1_workspace.
 
 差异仅在机器人常数(来自 tiangong3_kinematics.py 的 URDF 程序化提取):
-  - 站姿骨盆 ~1.02m(直腿FK), 蹲姿带由天工腿FK采样;
-  - 腕平面: 天工臂长(肩前平举腕心 ~0.51m), 标称离墙 d_robot=0.90m,
-    腕平面 x_w = d_robot-0.40 ± 0.04 -> (0.46,0.50,0.54);
+  - 站姿骨盆 ~1.02m(直腿FK), 蹲姿带与 03 同口径(骨盆 0.53~0.70m);
+  - 腕平面: 天工臂长(肩前平举腕心**前向** ~0.51m, 见 T3.d_wrist_nominal),
+    标称离墙 d_robot=0.90m, 腕平面 x_w = d_robot-0.40 ± 0.04 -> (0.46,0.50,0.54);
   - 覆盖网格按天工 KPI 扩到 y±1.0m / z 0~2.3m (原地覆盖 0~2m).
+  喷涂质量判据与 G1 **同口径**: 垂直=枪轴与法向≤15°, 倾斜=≤55°(占据网格再按
+  30° 过滤); 倾角过滤在**样本分类阶段**就做, 不能只在网格里做(否则 perp 网格
+  会把所有倾角样本都收进去, 系统性高估"垂直行"的可行范围).
 腰部 yaw 档位仍 ±30°/±60°(03 规划同口径); 输出键名与 02 一致(right_stand_y30...).
 
 输出: $G1W_OUT/tiangong_workspace.npz + fig_tiangong_workspace.png
@@ -26,16 +29,18 @@ fk_chain, rotx, roty, rotz = ws_g1.fk_chain, ws_g1.rotx, ws_g1.roty, ws_g1.rotz
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.environ.get("G1W_OUT", os.path.join(BASE, "output"))
-_CROUCH_LO = float(os.environ.get("G1W_CROUCH_LO", "0")) or 0.62
+# 蹲姿地板: 与 03_plan_trajectories.py 的天工分支同源(注册表 crouch_lo=0.53)
+_CROUCH_LO = float(os.environ.get("G1W_CROUCH_LO", "0")) or 0.53
 
 WAIST, ARM_R, ARM_L, LEG_R = T3.WAIST, T3.ARM_R, T3.ARM_L, T3.LEG_R
 
-PELVIS_STAND = (0.96, 1.005)             # 腿几何上限1.005直腿; 下限0.96轻屈膝(与03同带)
+PELVIS_STAND = (T3.PELVIS_STAND_LO, T3.PELVIS_STAND_TOP)   # 站姿骨盆带(与 03 同源; 单一真源在 tiangong3_kinematics)
 SOLE_TO_ANKLE = T3.SOLE_TO_ANKLE
 X_PLANES = (0.46, 0.50, 0.54)            # 腕平面: 离墙 0.86/0.90/0.94m(标称0.90)
 PLANE_TOL = 0.03
 COS_PERP = np.cos(np.deg2rad(15))
-TILT_GRID = 30.0
+COS_TILT = np.cos(np.deg2rad(55))   # 倾斜采样上限(超集), 占据网格再按 TILT_GRID 过滤
+TILT_GRID = 30.0                    # 倾斜判据: 与墙面法向≤30° <=> 与墙面夹角≥60°(喷涂质量)
 AXIS_DOWN_Z = -0.02
 Y_RNG = (-1.00, 1.00)
 Z_RNG = (0.0, 2.30)
@@ -86,15 +91,20 @@ def sample_workspace(arm, yaw_range, pelvis_range, n=4_000_000, seed=7, nq_sub=2
     res = {}
     for x_w in X_PLANES:
         mp = np.abs(p_end[:, 0] - x_w) < PLANE_TOL
+        # 倾角过滤在样本分类阶段做(与 G1 02 同口径):
+        #   垂直 = 枪轴与墙面法向≤15°;  倾斜 = ≤55°(网格再按 30° 收窄)
+        # 旧版只在 occ_grid 里对 tilt_d/tilt_u 过滤, perp 网格收了全部倾角样本,
+        # 导致"垂直行"可行范围被系统性高估.
+        perp = mp & (axis[:, 0] >= COS_PERP)
+        tdn = mp & (axis[:, 0] >= COS_TILT) & (axis[:, 2] < AXIS_DOWN_Z)
+        tup = mp & (axis[:, 0] >= COS_TILT) & (axis[:, 2] > -AXIS_DOWN_Z)
         res[x_w] = dict(
-            perp=np.stack([p_end[mp][:, 1], p_end[mp][:, 2],
-                           np.degrees(tilt[mp])], 1),
-            tilt_d=np.stack([p_end[(mp) & (axis[:, 2] < AXIS_DOWN_Z)][:, 1],
-                             p_end[(mp) & (axis[:, 2] < AXIS_DOWN_Z)][:, 2],
-                             np.degrees(tilt[(mp) & (axis[:, 2] < AXIS_DOWN_Z)])], 1),
-            tilt_u=np.stack([p_end[(mp) & (axis[:, 2] > -AXIS_DOWN_Z)][:, 1],
-                             p_end[(mp) & (axis[:, 2] > -AXIS_DOWN_Z)][:, 2],
-                             np.degrees(tilt[(mp) & (axis[:, 2] > -AXIS_DOWN_Z)])], 1),
+            perp=np.stack([p_end[perp][:, 1], p_end[perp][:, 2],
+                           np.degrees(tilt[perp])], 1),
+            tilt_d=np.stack([p_end[tdn][:, 1], p_end[tdn][:, 2],
+                             np.degrees(tilt[tdn])], 1),
+            tilt_u=np.stack([p_end[tup][:, 1], p_end[tup][:, 2],
+                             np.degrees(tilt[tup])], 1),
         )
     res['q_sub'] = np.column_stack([q[sub_idx], pz[sub_idx]])
     res['end_sub'] = np.column_stack([p_end[sub_idx][:, :3], tilt[sub_idx]])
@@ -134,8 +144,10 @@ def main():
 
     p2, p10 = sample_crouch_pelvis()
     crouch_lo = max(p2, _CROUCH_LO)
-    PELVIS_CROUCH = (crouch_lo, 1.00)
-    print(f"[蹲姿采样范围] 骨盆 {PELVIS_CROUCH}; 站姿 {PELVIS_STAND}")
+    # 蹲姿带与 03 同口径: (crouch_lo, 0.70) —— 旧版是 (crouch_lo, 1.00), 把站姿
+    # 也算进"蹲姿"网格, 而 03 只按 0.53~0.70 判可行 -> 网格系统性偏乐观.
+    PELVIS_CROUCH = (crouch_lo, 0.70)
+    print(f"[蹲姿采样范围] 骨盆 {PELVIS_CROUCH} (03 同口径 0.70 上限); 站姿 {PELVIS_STAND}")
     print(f"[站位] 天工标称离墙 0.90m, 腕平面 x_w∈[{X_PLANES[0]},{X_PLANES[2]}] "
           f"(站位保证带 0.86~0.94m)")
 
@@ -171,8 +183,12 @@ def main():
                 all_stats[key] = dict(
                     y_ext=y_ext, z_solid=zr, z_band=z_band,
                     n_perp=int(g_perp.sum()), n_td=int(g_td.sum()), n_tu=int(g_tu.sum()))
-                print(f"[{key:16s}] 垂直保证区 y[{y_ext[0]:+.2f},{y_ext[1]:+.2f}] "
-                      f"z实心[{zr[0]:.2f},{zr[1]:.2f}] 段带内z[{z_band[0]:.2f},{z_band[1]:.2f}] "
+                # 网格可能为空(无可行样本): y_ext/z_band 为 None, 打印时不能直接下标
+                _ys = f"y[{y_ext[0]:+.2f},{y_ext[1]:+.2f}]" if y_ext else "y[空]"
+                _zb = (f"段带内z[{z_band[0]:.2f},{z_band[1]:.2f}]" if z_band
+                       else "段带内z[空]")
+                print(f"[{key:16s}] 垂直保证区 {_ys} "
+                      f"z实心[{zr[0]:.2f},{zr[1]:.2f}] {_zb} "
                       f"格数 perp={g_perp.sum()} td={g_td.sum()} tu={g_tu.sum()}")
                 saved[f"{key}_perp"] = g_perp
                 saved[f"{key}_tiltd"] = g_td

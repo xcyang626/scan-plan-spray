@@ -34,6 +34,39 @@ STRIP_COLORS = ["#2f6fdb", "#e07b2a", "#2fa36b", "#c23a7a", "#8a6ad2",
                 "#0f9bb0", "#b0922e", "#d24f4f", "#5f8f3a", "#7a5fd0",
                 "#35bfc0", "#c46a2e"]
 
+# 实机 relay(exec/groot_daemon.py)接受的步距区间: 0.05 < d < 1.5
+STEP_MIN, STEP_MAX = 0.05, 1.5
+
+
+def _band_pair(su, name):
+    """[u0,u1] 校验: 必须是两个数字, 否则给清晰报错(不要抛裸 TypeError)."""
+    if su is None:
+        raise ValueError(f"{name} 缺失 —— 需要 [u0,u1] 两个数字")
+    try:
+        lo, hi = float(su[0]), float(su[1])
+    except (TypeError, IndexError, KeyError, ValueError):
+        raise ValueError(f"{name} 格式不对: {su!r} —— 需要 [u0,u1] 两个数字")
+    return lo, hi
+
+
+def _check_step(d, what="步距"):
+    """步距范围校验(实机 relay 口径: 0.05 < d < 1.5)."""
+    if not (STEP_MIN < d < STEP_MAX):
+        raise ValueError(
+            f"{what} {d:.3f}m 超出实机允许区间 ({STEP_MIN}~{STEP_MAX}m; "
+            f"exec/groot_daemon.py 拒绝该步距) —— 请检查墙宽与站数划分")
+    return d
+
+
+def _load_json(path):
+    with open(path, encoding="utf8") as f:
+        return json.load(f)
+
+
+def _save_json(path, obj):
+    with open(path, "w", encoding="utf8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=1)
+
 
 def _load_cloud_pts(cloud_path):
     """借 11_cloud_scan 的加载器读点云(支持 ply/pcd 等); 失败返回 None."""
@@ -56,8 +89,23 @@ def plan_strips(wall_u, w_band, s_min=0.30):
       均分 s = W/N 即达到该下界, 且每站条带宽 = 动作带宽 = s(单一动作)
       校验 s >= 0.30(用户下限); 墙过窄导致无解时明确报错。
     返回 (N, steps[], stations[])。"""
-    u0, u1 = float(wall_u[0]), float(wall_u[1])
+    if wall_u is None:
+        raise ValueError("墙范围 wall_u 缺失 —— 请重新上传点云跑 11_cloud_scan.py")
+    try:
+        u0, u1 = float(wall_u[0]), float(wall_u[1])
+    except (TypeError, IndexError, KeyError, ValueError):
+        raise ValueError(f"墙范围 wall_u 格式不对: {wall_u!r} —— 需要 [u0,u1] 两个数字")
     W = u1 - u0
+    if W <= 0:
+        raise ValueError(f"墙宽异常: wall_u=[{u0:.3f},{u1:.3f}] 宽 {W:.3f}m <= 0 —— "
+                         f"请检查点云/11_cloud_scan 的墙面范围")
+    if w_band is None:
+        raise ValueError("最大等宽带缺失 —— 03 未成功或 trajectory_meta 无 "
+                         "uniform_stroke_u")
+    w_band = float(w_band)
+    if not (w_band > 0):
+        raise ValueError(f"最大等宽带异常: {w_band:.3f}m <= 0 —— 03 未成功或 "
+                         f"trajectory_meta 的 uniform_stroke_u 不对, 请重跑 03")
     if W <= w_band + 1e-9:                    # 单站覆盖
         steps = [round(W, 4)]
     else:
@@ -72,6 +120,8 @@ def plan_strips(wall_u, w_band, s_min=0.30):
         steps[-1] = round(W - sum(steps[:-1]), 4)      # 数值闭合(吸收舍入)
     if min(steps) < s_min - 5e-3:
         raise ValueError(f"条带宽 {min(steps):.3f}m < 单站最小 {s_min}m")
+    for s in steps:                           # 实机 relay 步距区间保护
+        _check_step(s, "条带宽度(=逐站步距)")
     stations, acc = [], u0
     for i, s in enumerate(steps):
         stations.append(dict(
@@ -83,19 +133,25 @@ def plan_strips(wall_u, w_band, s_min=0.30):
 
 
 def make_plan(run_dir, s_min=0.30):
-    cfg = json.load(open(os.path.join(run_dir, "cfg.json"), encoding="utf8"))
-    meta = json.load(open(os.path.join(run_dir, "trajectory_meta.json"),
-                          encoding="utf8"))
+    cfg = _load_json(os.path.join(run_dir, "cfg.json"))
+    meta = _load_json(os.path.join(run_dir, "trajectory_meta.json"))
     su = meta.get("uniform_stroke_u") or meta.get("stroke_u")
     if not su:
         raise ValueError("trajectory_meta 缺 uniform_stroke_u —— 先跑 03")
-    w_band = float(su[1]) - float(su[0])
+    su_lo, su_hi = _band_pair(su, "trajectory_meta.uniform_stroke_u")
+    w_band = su_hi - su_lo
+    if not (w_band > 0):
+        raise ValueError(f"最大等宽带异常: uniform_stroke_u=[{su_lo:.3f},{su_hi:.3f}] "
+                         f"宽 {w_band:.3f}m <= 0 —— 请重跑 03")
     # 墙范围: 有点云用整墙 wall_u(多工位覆盖对象=完整点云)
     rep_p = os.path.join(run_dir, "cloud_report.json")
     if not (os.path.exists(rep_p) and cfg.get("cloud")):
         raise ValueError("多工位全覆盖需要点云(wall_u) —— 请上传点云后重新规划")
-    rep = json.load(open(rep_p, encoding="utf8"))
+    rep = _load_json(rep_p)
     wall_u = rep.get("wall_u") or rep.get("stroke_u")
+    if wall_u is None:
+        raise ValueError("cloud_report.json 缺 wall_u/stroke_u(整墙横向范围) —— "
+                         "请重新上传点云跑 11_cloud_scan.py")
     n, steps, stations = plan_strips(wall_u, w_band, s_min=s_min)
     # 带宽贴合(V3 用户定稿: 每站喷自己条带的宽度, 不重叠不防缝):
     # 首站规划带 = 条带±0.045 外扩(补偿 03 两端内收 0.04 + 5mm 数值余量),
@@ -111,13 +167,14 @@ def make_plan(run_dir, s_min=0.30):
         first_plan_band=[round(s0[0] - 0.045, 4), round(s0[1] + 0.045, 4)],
         stations=stations,
         exec_hint=dict(stations=n, walk_list=[round(s, 4) for s in steps[:-1]],
-                       band=[round(float(su[0]), 3), round(float(su[1]), 3)],
-                       sim_only=True),
+                       # 首站条带(与 stations[0]["strip"] 同口径; 不再写阶段A的
+                       # 整墙等宽带 —— 未跑 --update 时消费端拿到的必须是首站带)
+                       band=[round(s0[0], 4), round(s0[1], 4)],
+                       used_by="仿真+实机(10_station_app.py 的多工位触发都消费本文件)"),
         note=f"最少 {n} 站无缝覆盖整墙 {round(sum(steps),3)}m: 每站喷自己条带 "
              f"{min(steps):.3f}~{max(steps):.3f}m(带宽独立贴合, 不重叠; "
              f"防缝后续按需引入)")
-    json.dump(plan, open(os.path.join(run_dir, "multi_station_plan.json"), "w",
-                         encoding="utf8"), ensure_ascii=False, indent=1)
+    _save_json(os.path.join(run_dir, "multi_station_plan.json"), plan)
     return plan
 
 
@@ -128,7 +185,8 @@ def _load_stroke_path(run_dir):
         return None
     import csv as _csv
     try:
-        rows = list(_csv.DictReader(open(p, encoding="utf8")))
+        with open(p, encoding="utf8") as f:
+            rows = list(_csv.DictReader(f))
         return [(float(r["u_m"]), float(r["h_m"]), r["kind"]) for r in rows]
     except Exception:
         return None
@@ -164,7 +222,7 @@ def _plot_zigzags(ax, plan, path, h_top):
 
 def plot_plan(run_dir, plan):
     """全景规划图: 点云背景 + N 条带(含各站之字形走线) + 走位箭头链 + 标注."""
-    cfg = json.load(open(os.path.join(run_dir, "cfg.json"), encoding="utf8"))
+    cfg = _load_json(os.path.join(run_dir, "cfg.json"))
     from common import setup_cn_font
     setup_cn_font()
     u0, u1 = plan["wall_u"]
@@ -197,7 +255,7 @@ def plot_plan(run_dir, plan):
     # 障碍框(11 检出)
     rep_p = os.path.join(run_dir, "cloud_report.json")
     if os.path.exists(rep_p):
-        rep = json.load(open(rep_p, encoding="utf8"))
+        rep = _load_json(rep_p)
         for o in rep.get("obstacles", []):
             ou, oh = o["u"], o["h"]
             ax.add_patch(plt.Rectangle((ou[0], oh[0]), ou[1] - ou[0], oh[1] - oh[0],
@@ -247,30 +305,51 @@ def update_after_strip_run(run_dir, s_min=0.30):
     无缝模型: 条带外扩 0.045/边, 03 两端内收 0.04/边 -> 设计上实喷带比条带宽
     +0.010m(每边 +0.005); 再叠加 03 把带边界 round 到 3 位小数(<=0.001m).
     故判据取 0.0125(设计余量 + 舍入 + 少量裕度), 用 0.010 会有一半的合法结果
-    落在公差外被判失败。"""
-    plan = json.load(open(os.path.join(run_dir, "multi_station_plan.json"),
-                          encoding="utf8"))
-    meta = json.load(open(os.path.join(run_dir, "trajectory_meta.json"),
-                          encoding="utf8"))
+    落在公差外被判失败。
+
+    中心位置判据(2026-10-20 加): 只比宽度不够 —— 阶段A(整墙)与阶段B(首站带)
+    的 u 系不同(03 按请求带重锚), 阶段B 方案若喷到墙上别处(甚至墙外)而宽度
+    恰好对上, 宽度校验照样放行, 无缝拼接直接报废。故再比中心: 偏差超过
+    容差(条带宽的 5%, 且不超过 5cm)报错, 并给出实际中心与期望中心。"""
+    plan = _load_json(os.path.join(run_dir, "multi_station_plan.json"))
+    meta = _load_json(os.path.join(run_dir, "trajectory_meta.json"))
     su = meta.get("uniform_stroke_u") or meta.get("stroke_u")
     if not su:
         raise ValueError(f"{run_dir}/trajectory_meta.json 缺 uniform_stroke_u/stroke_u, "
                          f"无法校验首站实喷带宽 —— 请先跑完 03")
-    w2 = float(su[1]) - float(su[0])
-    s0 = plan["steps"][0]
+    su_lo, su_hi = _band_pair(su, "trajectory_meta.uniform_stroke_u")
+    w2 = su_hi - su_lo
+    s0 = float(plan["steps"][0])
     if abs(w2 - s0) > 0.0125:
         raise ValueError(f"首站实喷带宽 {w2:.3f}m 与条带宽 {s0:.3f}m 偏差 "
                          f"{abs(w2 - s0) * 100:.1f}cm 超过 12.5mm "
                          f"(无缝拼接会被破坏) —— 请放宽腰限/调整站位后重试")
+    # 中心位置: 期望=首站条带中心, 实际=阶段B 实喷带中心
+    stations = plan.get("stations") or []
+    if not stations:
+        raise ValueError(f"{run_dir}/multi_station_plan.json 缺 stations —— "
+                         f"请先跑 14(阶段A)生成条带划分")
+    exp_c = float(stations[0].get("center", 0.5 * (stations[0]["strip"][0]
+                                                    + stations[0]["strip"][1])))
+    act_c = 0.5 * (su_lo + su_hi)
+    tol = min(0.05 * s0, 0.05)               # 条带宽的 5%, 且不超过 5cm
+    if abs(act_c - exp_c) > tol:
+        raise ValueError(
+            f"首站实喷带中心 {act_c:.3f}m 与规划条带中心 {exp_c:.3f}m 偏差 "
+            f"{abs(act_c - exp_c) * 100:.1f}cm 超过容差 {tol * 100:.1f}cm —— "
+            f"阶段B 的 03 必须按首站条带(first_plan_band="
+            f"{plan.get('first_plan_band')})重跑, 否则喷到墙上别处/墙外, "
+            f"无缝拼接被破坏")
     plan.update(
         band_width=round(w2, 4),
-        first_band_actual=[round(float(su[0]), 4), round(float(su[1]), 4)],
+        first_band_actual=[round(su_lo, 4), round(su_hi, 4)],
         note=f"最少 {plan['n_stations']} 站无缝覆盖整墙 {plan['wall_width']:.2f}m: "
              f"每站喷自己条带 {min(plan['steps']):.3f}~{max(plan['steps']):.3f}m "
              f"(带宽独立贴合, 实喷 {w2:.3f}m, 不重叠; 防缝后续按需引入)")
     plan["exec_hint"]["band"] = plan["first_band_actual"]
-    json.dump(plan, open(os.path.join(run_dir, "multi_station_plan.json"), "w",
-                         encoding="utf8"), ensure_ascii=False, indent=1)
+    plan["exec_hint"].pop("sim_only", None)     # 旧版产物里的过时标注
+    plan["exec_hint"]["used_by"] = "仿真+实机(10_station_app.py 的多工位触发都消费本文件)"
+    _save_json(os.path.join(run_dir, "multi_station_plan.json"), plan)
     return plan          # 出图由 main() 统一做, 避免 --update 渲染两遍
 
 
@@ -287,8 +366,7 @@ def main():
     if a.update:
         plan = update_after_strip_run(a.run, a.smin)
     elif a.fig_only:
-        plan = json.load(open(os.path.join(a.run, "multi_station_plan.json"),
-                              encoding="utf8"))
+        plan = _load_json(os.path.join(a.run, "multi_station_plan.json"))
     else:
         plan = make_plan(a.run, a.smin)
     plot_plan(a.run, plan)

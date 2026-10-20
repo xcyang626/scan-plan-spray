@@ -221,7 +221,10 @@ class Telemetry:
         """落盘最近 _TELE_CAP 帧 + 事件表; 返回 (npz路径, json路径)。"""
         out_dir = os.path.join(BASE, "output", "telemetry")
         os.makedirs(out_dir, exist_ok=True)
-        name = "tele_" + time.strftime("%Y%m%d_%H%M%S")
+        # 秒级时间戳会让同一秒内的两次 dump 互相覆盖(cancel 紧跟 walk_stall
+        # 就丢了现场) —— 加毫秒后缀.
+        name = "tele_" + time.strftime("%Y%m%d_%H%M%S") + \
+            "_%03d" % (int(time.time() * 1000) % 1000)
         with self._lock:
             if self.count:
                 idx = (np.arange(self.count) + self.head - self.count) % self.cap
@@ -238,7 +241,8 @@ class Telemetry:
         npz_p = os.path.join(out_dir, name + ".npz")
         json_p = os.path.join(out_dir, name + ".json")
         np.savez(npz_p, **data)
-        json.dump(evs, open(json_p, "w", encoding="utf8"), ensure_ascii=False)
+        with open(json_p, "w", encoding="utf8") as f:
+            json.dump(evs, f, ensure_ascii=False)
         return npz_p, json_p
 
 
@@ -263,6 +267,21 @@ except Exception:                                    # 模块缺失时优雅降�
 # (SONIC 交错序 = [腰3, Lsh_p, Rsh_p, Lsh_r, Rsh_r, ...], 见 UPPER17_FROM_BODY29)
 _Q10_TO_SONIC17 = [0, 1, 2, 4, 6, 8, 10, 12, 14, 16]
 _TRIM_COL = np.array([0.0, 0.3, 0.3, 1, 1, 1, 1, 1, 1, 1])   # 腰yaw禁用
+
+# 上肢 17(SONIC 序) 的关节限位: 只覆盖我们注入的 10 个关节(腰3+右臂7),
+# 其余 7 个(左臂)不由本进程控制, 留 ±inf 不裁剪.
+# 部署端 g1_deploy_onnx_ref.cpp 对外部注入的上肢目标**不做限位裁剪**,
+# 慢环 trim(±0.15rad)叠加到动作帧上可能顶过机械限位 —— 这里发送前先夹住.
+_U17_LO = np.full(17, -np.inf)
+_U17_HI = np.full(17, np.inf)
+if _SRV_OK:
+    _U17_LO[_Q10_TO_SONIC17] = _C_JLO
+    _U17_HI[_Q10_TO_SONIC17] = _C_JHI
+
+
+def _clip_upper17(p17):
+    """把上肢 17 目标(SONIC 序)夹到关节限位内(只夹我们注入的 10 个关节)."""
+    return np.clip(np.asarray(p17, float), _U17_LO, _U17_HI)
 
 
 def wrist_world_from_q29(q29, h_pelvis):
@@ -385,6 +404,7 @@ class Daemon:
         self.stream_thread = None
         self.cancel_evt = threading.Event()
         self.streaming = False
+        self.relaying = False                      # 接力线程在跑(跨 _do_stream 间隙)
         self.holding = False                      # 轨迹已结束, 正在持续保持末姿
         self.hold_position = None                 # 最近保持姿态(SONIC 序), blend 重跑用
         self._gen = 0                             # 流代数: 旧线程不得清掉新线程的状态
@@ -453,9 +473,25 @@ class Daemon:
         alpha = (t - times[lo]) / (times[hi] - times[lo])
         return (1.0 - alpha) * values[lo] + alpha * values[hi]
 
+    def _upper_hold(self, max_wait=0.3):
+        """行走/静默期间要保持的上肢 17 目标(SONIC 序).
+
+        优先级: 最近一次指令保持姿 → 5557 实测上肢 → 官方 v7 首帧常量.
+        必须一直带着它发 planner 消息: 接收端每条消息都会按
+        upper_body_position 是否存在重置上肢控制权, 缺字段就回放 reference 动作."""
+        if self.hold_position is not None:
+            return np.asarray(self.hold_position, float)
+        fb = self.feedback
+        if fb is not None:
+            p17, _q = fb.upper17_sonic(max_wait=max_wait, fresh_s=0.5)
+            if p17 is not None:
+                self.hold_position = np.asarray(p17, float)
+                return self.hold_position
+        return np.asarray(DEFAULT_HOLD_POSE, float)
+
     def _send_upper(self, pos17, vel17, height=-1.0, mode=None):
         with self.send_lock:
-            self.pub.planner_upper_body(pos17, upper_vel=vel17,
+            self.pub.planner_upper_body(_clip_upper17(pos17), upper_vel=vel17,
                                          height=float(height), mode=mode)
         with self._rec_lock:                       # 记录器: 记下每一条指令帧
             if self._rec is not None:
@@ -575,9 +611,12 @@ class Daemon:
             next_tick = time.perf_counter()
             # 首次执行直接跑(官方); 从保持态重跑则 1s smoothstep blend(官方 B 语义)
             blend_from = self.hold_position if self.hold_position is not None else pos[0]
-            h_blend_from = (float(np.clip(pelvis_h_from_q29(fb.q29), 0.30, 0.85))
-                            if (height_on and fb is not None and fb.q29 is not None
-                                and pelvis_h_from_q29(fb.q29)) else h_ref)
+            # 实测骨盆高取一次快照: 原来判空和取值各调一次 pelvis_h_from_q29(fb.q29),
+            # 中间可能被 FeedbackReader 换帧, 两次拿到的是不同帧的数据
+            _q29_blend = fb.q29 if (height_on and fb is not None) else None
+            _h_blend = pelvis_h_from_q29(_q29_blend) if _q29_blend is not None else None
+            h_blend_from = (float(np.clip(_h_blend, 0.30, 0.85))
+                            if _h_blend is not None else h_ref)
             phase = "blend" if self.hold_position is not None else "run"
             blend_start = time.perf_counter()
             run_start = time.perf_counter()
@@ -619,9 +658,14 @@ class Daemon:
                                   90.0 - st["ang_min"]
                                   if st["n_ang"] else 0.0, 1)})
                         if once:                   # 接力单站: 收尾即让出通道
+                            # 与取消路径同口径: 带上 height/mode, 否则蹲姿工位
+                            # 播完的瞬间会被从蹲姿弹回站立(IDLE 不消费 height)
                             for _ in range(5):
                                 self._send_upper(hold_position + off17_last,
-                                                 np.zeros(17))
+                                                 np.zeros(17),
+                                                 height=(h_cmd if seg_squat else -1.0),
+                                                 mode=(4 if (seg_squat and squat_mode)
+                                                       else None))
                                 time.sleep(0.02)
                             break
                 elif phase == "blend":
@@ -743,6 +787,12 @@ class Daemon:
     def start_stream(self, motion, rate=50.0, speed=1.0, blend_s=1.0, mjcf=None):
         """rate=50Hz/speed/blend 均为官方默认语义; speed=1.0 实时(动作本身 30Hz 导出)。"""
         speed = float(speed)
+        rate = float(rate)
+        blend_s = float(blend_s)
+        if not (math.isfinite(rate) and rate > 0.0):
+            return {"ok": False, "err": f"rate 非法(需 >0 Hz): {rate}"}
+        if not (math.isfinite(blend_s) and blend_s >= 0.0):
+            return {"ok": False, "err": f"blend_s 非法(需 >=0 s): {blend_s}"}
         if not math.isfinite(speed):      # NaN/inf 会穿透 min/max 夹取, 归一为实时
             emit({"event": "speed_clamped", "requested": speed, "applied": 1.0})
             speed = 1.0
@@ -800,12 +850,17 @@ class Daemon:
         t0 = time.perf_counter()
         tmo = float(dy) / v * 4.0 + 25.0            # 总超时(闭环含停稳测量)
 
-        def _send_mv(on, dir=1.0):
+        def _send_mv(on, dir=1.0, speed=None):
+            # 上肢目标必须跟着发: 缺 upper_body_position 时接收端会立刻把上肢
+            # 控制权交回 reference 动作(舞蹈/踢腿), 实机表现为走路时手臂乱动.
+            hold = self._upper_hold()
             with self.send_lock:
                 self.pub.planner_locomotion(
                     (gb.MODE_SLOW_WALK if on else gb.MODE_IDLE),
                     ((0.0, float(sign) * dir, 0.0) if on else (0.0, 0.0, 0.0)),
-                    (1.0, 0.0, 0.0), speed=(v if on else -1.0))
+                    (1.0, 0.0, 0.0),
+                    speed=(v if on else -1.0) if speed is None else float(speed),
+                    upper17=hold)
 
         def _idle5():
             for _ in range(5):
@@ -829,17 +884,25 @@ class Daemon:
         try:
             if _odom_ok:
                 fb.odom_reset()
-                BURST_S, GATE_M, TOL_M = 0.7, 0.05, 0.035
+                # 门限必须比容差**小**: 否则存在 (TOL, GATE] 的死区 —— 内层
+                # 触发"提前收臂"后一帧不发指令, 外层又判不满足容差, 机器人
+                # 原地不动, 连续 3 次被误判"走不动"(旧值 GATE 0.05 > TOL 0.035).
+                BURST_S, GATE_M, TOL_M = 0.7, 0.015, 0.035
+                SLOW_M, SLOW_V = 0.15, 0.15          # 末段减速接近
+                STALL_M = 0.005                      # 判定"走不动"的位移阈值
                 _stall, _last = 0, 0.0
                 while not self.cancel_evt.is_set() and self._gen == gen:
                     p = _progress()
                     if abs(dy - p) <= TOL_M:
                         break
                     d = 1.0 if p < dy else -1.0      # 欠走正向 / 过冲反向退
-                    _tele.event("cmd_mv_on", dir=float(sign * d), v=v,
+                    # 末段(距目标 <0.15m)降速接近, 避免冲过头再退回来
+                    v_cmd = v if abs(dy - p) > SLOW_M else max(SLOW_V, 0.4 * v)
+                    _tele.event("cmd_mv_on", dir=float(sign * d), v=round(v_cmd, 3),
                                 p=round(p, 4))
                     tb = time.perf_counter()
                     nxt = tb
+                    moved = False
                     while (time.perf_counter() - tb) < BURST_S:
                         if self.cancel_evt.is_set() or self._gen != gen:
                             break
@@ -847,7 +910,8 @@ class Daemon:
                         if (d > 0 and p >= dy - GATE_M) or \
                            (d < 0 and p <= dy + GATE_M):
                             break                    # 提前收臂, 给减速留距离
-                        _send_mv(True, d)
+                        _send_mv(True, d, speed=v_cmd)
+                        moved = True
                         nxt += 1.0 / 30.0
                         s = nxt - time.perf_counter()
                         time.sleep(s if s > 0 else 0.0)
@@ -855,7 +919,9 @@ class Daemon:
                     _tele.event("cmd_mv_off", p=round(_progress(), 4))
                     time.sleep(0.8)                  # 停稳再量(里程计含惯性段)
                     p2 = _progress()
-                    if abs(p2 - _last) < 0.01:
+                    # 只有"这一轮真的发过行走指令"且位移几乎为零才算走不动;
+                    # 起步加速慢时第一个脉冲可能只走几毫米, 不该判停滞.
+                    if moved and abs(p2 - _last) < STALL_M:
                         _stall += 1                  # 走不动(卡住/托底)
                     else:
                         _stall = 0
@@ -900,7 +966,9 @@ class Daemon:
                 emit({"event": "walk_settle", "settle_s": settle_s})
                 time.sleep(settle_s)
         except Exception as ex:
-            emit({"event": "stream_error", "err": f"walk: {ex}"})
+            # 行走异常用独立事件名: 站点侧按事件名分流, 报成 stream_error 会被
+            # 误判成"轨迹流错误"(其实是行走闭环炸了)
+            emit({"event": "walk_error", "err": f"walk: {ex}"})
             try:
                 npz_p, json_p = _tele.dump("walk_exception")
                 emit({"event": "telemetry_dumped", "reason": "walk_exception",
@@ -910,6 +978,12 @@ class Daemon:
 
     def _busy_guard(self):
         """接力/行走与轨迹流互斥: 执行中(且非保持态)拒绝新任务。"""
+        # relaying 覆盖接力线程在两站之间的间隙(那时 streaming 刚被 _do_stream
+        # 的 finally 清掉, 接力线程下一行才置回 —— 旧写法留了个窗口, 期间到达的
+        # 请求能通过守卫并递增 _gen 把整个接力打断).
+        if self.relaying:
+            return {"ok": False, "err": "busy",
+                    "note": "多工位接力执行中, 请等接力完成或先停止"}
         if self.streaming and not self.holding:
             return {"ok": False, "err": "busy",
                     "note": "任务执行中, 请等本轮完成或先停止"}
@@ -922,7 +996,13 @@ class Daemon:
     def start_walk(self, dy, v=0.25, settle_s=2.5, t0_margin=0.8):
         """单段行走(测试原语): 独立验证 SONIC 位移指令的实机跟踪(量出实际位移
         可反算步态死区校准 t0_margin), 也供页面【补走】修正站位。dy<0=右移。"""
-        _sign = -1.0 if float(dy) < 0 else 1.0
+        dy = float(dy)
+        # daemon 是真机最后一道防线: 步距必须自己校验, 不能只靠调用方
+        # (网页 relay 已校验 0.05~1.5m, TCP 控制口此前完全没有上限).
+        if not (math.isfinite(dy) and 0.05 < abs(dy) < 1.5):
+            return {"ok": False,
+                    "err": f"步距非法(需 0.05~1.5m, 收到 {dy})"}
+        _sign = -1.0 if dy < 0 else 1.0
         busy = self._busy_guard()
         if busy:
             return busy
@@ -934,7 +1014,7 @@ class Daemon:
 
         def _th():
             try:
-                self._walk(abs(float(dy)), v, gen, settle_s, t0_margin,
+                self._walk(abs(dy), v, gen, settle_s, t0_margin,
                            sign=_sign)
             finally:
                 if self._gen == gen:
@@ -943,7 +1023,8 @@ class Daemon:
         self.stream_thread = threading.Thread(target=_th, daemon=True)
         self.stream_thread.start()
         return {"ok": True, "dy": dy, "v": v, "settle_s": settle_s,
-                "note": "SONIC 单段位移(SLOW_WALK, 开环时间积分+步态死区裕量)"}
+                "note": "SONIC 单段位移(SLOW_WALK, 腿式里程计闭环; 无里程计时"
+                        "回退开环时间积分+步态死区裕量)"}
 
     def start_relay(self, motion, walk_list, speed=1.0, walk_v=0.25,
                     settle_s=2.5, rate=50.0, blend_s=1.0, mjcf=None, band=None,
@@ -953,6 +1034,12 @@ class Daemon:
         blend 起点(从实际姿态平滑进轨迹, 不从陈旧保持姿猛拉)。"""
         if not os.path.exists(motion):
             return {"ok": False, "err": f"动作文件不存在: {motion}"}
+        rate = float(rate)
+        blend_s = float(blend_s)
+        if not (math.isfinite(rate) and rate > 0.0):
+            return {"ok": False, "err": f"rate 非法(需 >0 Hz): {rate}"}
+        if not (math.isfinite(blend_s) and blend_s >= 0.0):
+            return {"ok": False, "err": f"blend_s 非法(需 >=0 s): {blend_s}"}
         wl = [float(v) for v in (walk_list or [])]
         if not wl or any(not (0.05 < d < 1.5) for d in wl):
             return {"ok": False, "err": f"步距列表异常(每段需 0.05~1.5m): {wl}"}
@@ -963,6 +1050,7 @@ class Daemon:
         self._gen += 1
         gen = self._gen
         self.streaming = True
+        self.relaying = True          # 覆盖两站之间的间隙(见 _busy_guard)
         self.holding = False
         n = 1 + len(wl)
 
@@ -974,8 +1062,8 @@ class Daemon:
                     emit({"event": "relay_station", "station_idx": k,
                           "stations_total": n, "band": band,
                           "walk_dy_planned": (wl[k - 1] if k > 1 else wl[0])})
-                    self._do_stream(motion, float(rate), float(speed),
-                                    float(blend_s), mjcf, gen, once=True)
+                    self._do_stream(motion, rate, float(speed),
+                                    blend_s, mjcf, gen, once=True)
                     self.streaming = True           # _do_stream finally 会清, 接力续占
                     if self.cancel_evt.is_set() or self._gen != gen:
                         break
@@ -1000,13 +1088,14 @@ class Daemon:
             finally:
                 if self._gen == gen:
                     self.streaming = False
+                    self.relaying = False
                     self.holding = False
         self.stream_thread = threading.Thread(target=_th, daemon=True)
         self.stream_thread.start()
         return {"ok": True, "stations": n, "walk_list": wl,
                 "walk_v": walk_v, "settle_s": settle_s,
                 "note": f"实机多工位接力: {n} 站喷涂 + SONIC 行走"
-                        f"({len(wl)} 段左移, 开环位移, 人工监护随时急停)"}
+                        f"({len(wl)} 段左移, 腿式里程计闭环, 人工监护随时急停)"}
 
     # ---------- 保持流(官方终端2语义: start 后持续发安全站姿) ----------
     def start_hold(self, pose17=None, motion=None, mjcf=None, from_robot=True):
@@ -1202,6 +1291,17 @@ def main():
         resp.setdefault("id", req.get("id"))
         emit(resp)
     # stdin EOF -> 站点已退出 -> 跟随退出
+    # 退出前先把当前上肢姿态连发几帧(带 upper_body_position): 部署端在 1s 内
+    # 收不到 planner 消息就会把上肢交回 reference 动作(舞蹈/踢腿), 留几帧
+    # 让部署端缓存住我们的姿态再放端口, 手臂不会"啪"地一下弹回参考动作.
+    try:
+        with dmn.send_lock:
+            hold = dmn._upper_hold(max_wait=0.2)
+            for _ in range(10):
+                dmn.pub.planner_upper_body(hold, upper_vel=np.zeros(17))
+                time.sleep(0.02)
+    except Exception:
+        pass
     try:
         with dmn.send_lock:
             dmn.pub.close()

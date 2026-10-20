@@ -30,6 +30,9 @@ SONIC 官方语义 (zmq_manager 收 planner 话题 -> MovementState, 无位置�
     (与官方键盘 handler 同款数值; 更快需换 WALK 模式, 官方对其用模式默认速度);
   - 朝向 |θ| ≤ 180° (默认, 全向可达), 步进 5°;
   - 按住才走: 松键 0.35s 即回 IDLE, 不存在"发完指令忘了停";
+  - **每条 planner 消息都带上 upper_body_position(上肢保持姿态)**: 部署端
+    每收到一条消息就按该字段是否存在重置上肢控制权, 缺字段就把上肢交回
+    reference 动作(官方演示的舞蹈/踢腿) —— 实机上表现为测试期间手臂自己动;
   - 发送端一死, 部署端 1s 超时自停; Ctrl-C / o 均补发官方 stop。
 
 运行环境: 依赖 msgpack/zmq/numpy —— 用 GR00T venv:
@@ -64,6 +67,31 @@ MODE_SLOW_WALK = 1   # 官方 LocomotionMode::SLOW_WALK
 # 官方速度语义 (keyboard_handler 同款): SLOW_WALK 钳位 [0.2, 0.8] m/s, 9/0 步进 ±0.1
 SPEED_MIN_OFFICIAL = 0.2
 
+# 上肢 17(SONIC 交错序) 的默认保持姿态: 与 station app / daemon 同源
+# (env.json 的 hold_pose_upper17_sonic, 缺失时用这个兜底).
+# **必须每条 planner 消息都带上**: 部署端每收到一条消息就按
+# upper_body_position 是否存在重置上肢控制权, 缺字段就把上肢交回 reference
+# 动作(官方演示的舞蹈/踢腿) —— 实机上表现为测试期间手臂自己动起来.
+_HOLD_FALLBACK = [0.0, 0.0, 0.0, 0.2, 0.0, 0.2, 0.0, 0.0, 0.0,
+                  0.6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+
+def _load_hold_pose():
+    """读 env.json / env.local.json 的 hold_pose_upper17_sonic(SONIC 序)."""
+    import json
+    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    d = {}
+    for name in ("env.json", "env.local.json"):
+        try:
+            with open(os.path.join(base, "station", name), encoding="utf8") as f:
+                d.update(json.load(f))
+        except Exception:
+            pass
+    p = d.get("hold_pose_upper17_sonic")
+    if isinstance(p, (list, tuple)) and len(p) == 17:
+        return [float(v) for v in p], "env.json"
+    return list(_HOLD_FALLBACK), "内置兜底常量"
+
 # 语义方向 -> 朝向系单位向量 (x 前, y 左)
 DIR_VEC = {"w": (1.0, 0.0), "s": (-1.0, 0.0), "a": (0.0, 1.0), "d": (0.0, -1.0)}
 
@@ -93,7 +121,10 @@ class DriveState:
             self.heading_deg = min(self.heading_deg + self.heading_step_deg, self.max_heading_deg)
             return True
         if ch == "9":
-            self.speed = max(self.speed - self.speed_step, SPEED_MIN_OFFICIAL)
+            # 下限取 min(官方 0.2, 用户自设上限): 用户用 --max-speed 压到更低时,
+            # 9 键不应该把速度顶回 0.2
+            lo = min(SPEED_MIN_OFFICIAL, self.max_speed)
+            self.speed = max(self.speed - self.speed_step, lo)
             return True
         if ch == "0":
             self.speed = min(self.speed + self.speed_step, self.max_speed)
@@ -193,9 +224,11 @@ def main():
         st.last_seen = {"w": time.monotonic(), "a": time.monotonic()}
         mv = st.movement_vec(time.monotonic())   # 45° 前左斜和 -> 归一化 (0,1)
         assert mv and abs(mv[0]) < 1e-9 and abs(mv[1] - 1) < 1e-9, mv
-        st.heading_deg = 50.0                     # 超限幅不会发生(键步进已限), 直读校验限幅逻辑
-        st.heading_deg = min(st.heading_deg, st.max_heading_deg)
-        assert st.heading_deg == 50.0
+        st.heading_deg = 50.0
+        st.max_heading_deg = 45.0      # 真把限幅触发一次(原来那句断言恒真)
+        st.on_key("e", 0)
+        assert st.heading_deg == 45.0, st.heading_deg
+        st.max_heading_deg = 180.0
         # 速度官方钳位: 9 降不下 0.2, 0 (配默认上限) 升不过 0.8
         st.speed, st.max_speed = 0.25, 0.8
         st.on_key("9", 0); st.on_key("9", 0)
@@ -216,8 +249,18 @@ def main():
         print(f"[自测] 朝向旋转/组合归一化/限幅 通过 —— {fmt_state(st, time.monotonic())}")
         return 0
 
-    pub = Publisher(a.host, a.port)
+    try:
+        pub = Publisher(a.host, a.port)
+    except Exception as ex:
+        print(f"[sonic-loco] ZMQ 绑定 tcp://{a.host}:{a.port} 失败: {ex}\n"
+              f"           (端口被占用? daemon 独占 5556, 与 station app 的 ZMQ 流"
+              f"同端口, 两者不可同时绑 —— 先停 station 流或让本工具独占)",
+              file=sys.stderr)
+        return 2
+    hold_pose, hold_src = _load_hold_pose()
     print(f"[sonic-loco] ZMQ PUB 绑定 tcp://{a.host}:{a.port}")
+    print(f"[sonic-loco] 上肢保持姿态: {hold_src} (每条 planner 消息都带上, "
+          f"防部署端回放 reference 动作)")
     print("[sonic-loco] w/s=+x/-x  a/d=+y/-y  q/e=朝向∓{:.0f}°(±{:.0f}°)  "
           "9/0=速度{:+.2f}  z=停  r=朝向零  x=全零  ]=启动  o=停止退出(变软)  Ctrl-C=同o".format(
               a.heading_step_deg, a.max_heading_deg, a.speed_step))
@@ -243,12 +286,18 @@ def main():
 
     def handle_char(ch, now):
         if ch == "]":
-            pub.command(start=True, stop=False, planner=True)
-            print("\n[sonic-loco] 已下发 command start (planner 模式)")
+            # 启动命令连发×3: PUB/SUB 慢加入 + LINGER 0, 单发极易丢
+            # (与 daemon / groot_bridge 的官方启用序列同款)
+            for _ in range(3):
+                pub.command(start=True, stop=False, planner=True)
+                time.sleep(0.15)
+            time.sleep(0.8)          # 等部署端订阅端接上
+            print("\n[sonic-loco] 已下发 command start ×3 (planner 模式)")
         elif ch == "o":
             # 停止按钮: 阻尼急停(全身变软+部署退出)后本工具一并退出。
             # stop 命令连发3次再退(LINGER 0 会丢未送达消息, 与 daemon 同做法)
-            pub.planner_locomotion(MODE_IDLE, [0, 0, 0], [1, 0, 0])
+            pub.planner_locomotion(MODE_IDLE, [0, 0, 0], [1, 0, 0],
+                                   upper17=hold_pose)
             st.last_seen.clear()
             for _ in range(3):
                 pub.command(start=False, stop=True, planner=False)
@@ -261,6 +310,7 @@ def main():
             st.on_key(ch, now)
 
     try:
+        eof = False
         while True:
             t0 = time.monotonic()
             deadline = t0 + interval
@@ -276,7 +326,8 @@ def main():
                     buf = os.read(sys.stdin.fileno(), 64)
                 except (BlockingIOError, InterruptedError, OSError):
                     continue
-                if not buf:               # 管道 EOF, 不再等键
+                if not buf:               # 管道 EOF: 本拍读完就整体退出
+                    eof = True
                     break
                 now = time.monotonic()
                 for ch in buf.decode("utf-8", errors="ignore"):
@@ -289,7 +340,8 @@ def main():
                 mode=(MODE_SLOW_WALK if moving else MODE_IDLE),
                 movement=(list(mv) if moving else [0.0, 0.0, 0.0]),
                 facing=list(st.facing_vec()),
-                speed=(st.speed if moving else -1.0))
+                speed=(st.speed if moving else -1.0),
+                upper17=hold_pose)
             if moving != was_moving:
                 print(f"\n[sonic-loco] {fmt_state(st, now)}")
             line = fmt_state(st, now)
@@ -298,12 +350,16 @@ def main():
                 last_line = line
                 next_heartbeat = now + 3.0
             was_moving = moving
+            if eof:                     # 管道输入结束(自动化/重定向): 退出
+                print("\n[sonic-loco] 输入流结束, 退出(未发 stop: 部署端 1s 超时自停)")
+                break
             # ---- 定拍 ----
             el = time.monotonic() - t0
             if el < interval:
                 time.sleep(interval - el)
     except KeyboardInterrupt:
-        pub.planner_locomotion(MODE_IDLE, [0, 0, 0], [1, 0, 0])
+        pub.planner_locomotion(MODE_IDLE, [0, 0, 0], [1, 0, 0],
+                               upper17=hold_pose)
         for _ in range(3):
             pub.command(start=False, stop=True, planner=False)
             time.sleep(0.15)

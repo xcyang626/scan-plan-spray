@@ -22,16 +22,56 @@ BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # 腕心离地z带 / qsub种子过滤带okp / 站姿种子骨盆pz / 工作区npz文件名(与ensure_workspace同名)
 # pb_bands: DLS 骨盆带按目标z分段(双姿态机器人): 低段蹲带高段站带, 单值单解防回归坍缩
 # (t3 带内实测: stand y -0.60..+0.35, z 0.90..1.83; 蹲带 pz 0.43 起 h0.2 行可行)
+# d_robot/d_wrist: 站位离墙标称距离 / 腕心离墙距离(同 02 / 02b 口径).
+#   腕平面x(NN输入第0维) = d_robot - d_wrist, 必须落在本机器人的 x 带内:
+#   g1  0.74-0.40=0.34 (带0.30~0.38) / t3  0.90-0.40=0.50 (带0.46~0.54).
+#   评估时若误用G1默认值(03未带G1W_CFG加载时 D_ROBOT=0.74), t3会被问到0.34m(分布外0.12~0.20m),
+#   打出的"NN种子收敛率"对天工3毫无意义.
 ROBOT_CFG = {
     "g1":        dict(x=(0.30, 0.38), y=(-0.36, 0.36), z=(0.72, 1.28),
-                      okp=(0.25, 0.42), pz=0.78, ws="g1_workspace.npz"),
+                      okp=(0.25, 0.42), pz=0.78, ws="g1_workspace.npz",
+                      d_robot=0.74, d_wrist=0.40),
     "tiangong3": dict(x=(0.46, 0.54), y=(-0.45, 0.32), z=(0.30, 1.60),
                       okp=(0.41, 0.59), pz=0.98, ws="tiangong_workspace.npz",
-                      pb_bands=[(0.85, (0.53, 0.75)), (9.99, (0.96, 1.005))]),   # 蹲带下限=05平面模型膝限位地板
+                      d_robot=0.90, d_wrist=0.40,     # 天工3: 离墙0.90, 腕心离墙0.40 -> 腕平面x=0.50
+                      # 蹲带下限=腿几何下限; 站带上限用**腿几何上限**(旧值 1.005 是按
+                      # 脚高 0.075 估的直腿上限, 脚高改实测 0.0568 后真上限 0.9992,
+                      # 站带 1.005 已够不到 -> 采样全废)
+                      pb_bands=[(0.85, (0.53, 0.75)), (9.99, (0.96, 0.987))]),
 }
 
 
-def load_plan03():
+def _resolve_stance(P03, cfg):
+    """解析站位/腕距(评估喂给NN的腕平面x来源), 返回 (d_robot, d_wrist, 来源说明).
+    顺序: G1W_CFG(本次规划实际站位) -> ROBOT_CFG 本机器人标称 -> 03 模块常量.
+    绝不能用别的机器人/G1的默认值, 否则NN被问到训练分布外输入."""
+    d_robot, src = None, ""
+    _cfgp = os.environ.get("G1W_CFG", "")
+    if _cfgp and os.path.exists(_cfgp):
+        try:
+            with open(_cfgp, encoding="utf8") as _f:
+                _c = json.load(_f)
+            if "d_robot" in _c:
+                d_robot, src = float(_c["d_robot"]), f"G1W_CFG({_cfgp})"
+        except Exception as _e:
+            print(f"[配置] G1W_CFG 读取失败({_e}), 改用 ROBOT_CFG 标称")
+    if d_robot is None:
+        if cfg.get("d_robot") is not None:
+            d_robot, src = float(cfg["d_robot"]), "ROBOT_CFG"
+        else:
+            d_robot, src = float(P03.D_ROBOT), "03默认"
+    d_wrist = float(cfg.get("d_wrist", P03.D_WRIST))
+    return d_robot, d_wrist, src
+
+
+def load_plan03(robot="g1"):
+    """加载 03 规划脚本(取其 FK / batch_ik / 关节限位).
+
+    必须先设 G1W_ROBOT: 03 按这个环境变量选运动链(天工3 = URDF 提取链, G1 = 常量链).
+    旧版没设 -> 训天工3 时竟用 **G1 的链** 去解天工的目标(腕平面 0.50m 而 G1 臂
+    只有 0.40m), IK 每次都要把整条臂拽到别的构型, 数据 99% 被"跳支"过滤丢掉,
+    训出来的模型完全不能用."""
+    os.environ["G1W_ROBOT"] = robot
     spec = importlib.util.spec_from_file_location(
         "plan03", os.path.join(BASE, "scripts", "03_plan_trajectories.py"))
     m = importlib.util.module_from_spec(spec)
@@ -45,11 +85,14 @@ def gen_dataset(P03, n, rng, cfg):
     双姿态机器人(pb_bands)按目标z分段独立采集: 每带自己的单支流形链(蹲低站高),
     跨带共用一条链会让高段解被低段跳支过滤丢弃, 回归被蹲姿支主导."""
     from scipy.spatial import cKDTree
-    ws = np.load(os.environ.get("G1W_WS", os.path.join(BASE, "output", cfg["ws"])), allow_pickle=True)
-    qsub = np.concatenate([ws[f"right_{m}_y60_qsub"].astype(float)
-                           for m in ("stand", "crouch")], 0)      # (M,11)
-    endsub = np.concatenate([ws[f"right_{m}_y60_endsub"].astype(float)
-                             for m in ("stand", "crouch")], 0)    # (M,4)
+    if n < 1:
+        raise SystemExit(f"--n 必须 >= 1 (收到 {n})")
+    with np.load(os.environ.get("G1W_WS", os.path.join(BASE, "output", cfg["ws"])),
+                 allow_pickle=True) as ws:
+        qsub = np.concatenate([ws[f"right_{m}_y60_qsub"].astype(float)
+                               for m in ("stand", "crouch")], 0)      # (M,11)
+        endsub = np.concatenate([ws[f"right_{m}_y60_endsub"].astype(float)
+                                 for m in ("stand", "crouch")], 0)    # (M,4)
     okp = (endsub[:, 0] > cfg["okp"][0]) & (endsub[:, 0] < cfg["okp"][1])   # 腕平面带内
     qsub, pos = qsub[okp], endsub[okp, :3]
     tree = cKDTree(pos)
@@ -59,8 +102,29 @@ def gen_dataset(P03, n, rng, cfg):
     for zmax, pb in pb_bands:
         lo = max(cfg["z"][0], z_prev); hi = min(cfg["z"][1], zmax)
         if hi > lo:
-            segs.append((int(n * (hi - lo) / (cfg["z"][1] - cfg["z"][0])), (lo, hi), pb))
+            segs.append((0, (lo, hi), pb))        # 样本数稍后统一分配
         z_prev = max(z_prev, zmax)
+    # 段样本数分配: 每段保底 1 个, 总数守恒 = n.
+    # (原逐段 int(n*(hi-lo)/(z1-z0)) 截断: --n 1 时两段都成 0 -> vstack 空数组 ->
+    #  train() 里 ZeroDivisionError; 且逐段截断总数 != n, n=10 时 4+5=9)
+    if not segs:
+        raise SystemExit(f"[数据] 采样带无有效 z 区间 (z={cfg['z']}, pb_bands={pb_bands})")
+    if n < len(segs):
+        print(f"[数据] 警告: n={n} < 段数 {len(segs)}, 丢弃尾部 {len(segs)-n} 段")
+        segs = segs[:n]
+    _w = np.array([hi - lo for _, (lo, hi), _ in segs], float)
+    _cnt = np.ones(len(segs), int)              # 每段保底 1
+    _rest = n - len(segs)
+    if _rest > 0:
+        _sh = _w / _w.sum() * _rest
+        _base = np.floor(_sh).astype(int)
+        _cnt += _base
+        _rem = _rest - int(_base.sum())
+        if _rem > 0:                            # 余数按小数部分从大到小补齐
+            for i in np.argsort(-(_sh - _base))[:_rem]:
+                _cnt[i] += 1
+    segs = [(int(_cnt[i]), segs[i][1], segs[i][2]) for i in range(len(segs))]
+    print(f"[数据] 分段样本数 {[s[0] for s in segs]} (合计 {sum(s[0] for s in segs)}/{n})")
 
     P_all, D_all, Q_all, PZ_all = [], [], [], []
     B = 2000
@@ -75,26 +139,46 @@ def gen_dataset(P03, n, rng, cfg):
         sp = np.lexsort((y, x, z))                # 空间排序(主键z): 沿高度连续爬升,
         p_star, d_star = p_star[sp], d_star[sp]   # 臂伸展连续变化 -> 单支流形更纯
         Q = np.zeros((n_seg, 10)); PZ = np.zeros(n_seg); OK = np.zeros(n_seg, bool)
-        seed_q, seed_pz, last_q = None, None, None
+        # ---- IK 种子: 位置最近 **且枪倾角最接近目标** 的工作区网格点 ----
+        # 旧版只按位置取最近点: 网格点自带枪倾角(perp 档 ~0°, 倾斜档 <=30°),
+        # 与目标的随机倾角(±32°)可差 0.56rad, IK 得先把枪转过去 -> |Δq vs 种子|
+        # 中位 0.67rad, 被"跳支"过滤(阈值0.6)误杀一半; 加上够不到的姿态,
+        # 整段数据 99% 被丢, 训出来的 NN 收敛率还不如随机种子(废模型).
+        _K = 16
+        _dist, _jj = tree.query(p_star, k=_K)          # (N,K)
+        _cand = qsub[_jj]                               # (N,K,11)
+        _cq = _cand[:, :, :10].reshape(-1, 10)
+        _cpz = _cand[:, :, 10].reshape(-1)
+        try:
+            _, _caxis = P03.fk_jac(_cq, _cpz)[0:2]
+        except Exception:
+            _caxis = np.tile(np.array([1.0, 0.0, 0.0]), (len(_cq), 1))
+        _caxis = np.asarray(_caxis, float).reshape(n_seg, _K, 3)
+        _cost = (1.0 - np.einsum("nkj,nj->nk", _caxis, d_star)) + 2.0 * _dist
+        _best = np.argmin(_cost, axis=1)
+        _bj = _jj[np.arange(n_seg), _best]
+        _baxis = _caxis[np.arange(n_seg), _best]
+        # 注: 不再按"网格点枪轴与目标差 >X°"过滤目标 —— 实测那样反而把 IK
+        # 本可解出的样本也丢掉(保留率 141/300 -> 71/300): 网格点的倾角只代表
+        # 那个网格位姿, IK 完全可以从别的构型转过去. 保留率由 IK 自己的收敛判定决定.
+        seed_q = qsub[_bj][:, :10].copy()
+        seed_pz = qsub[_bj][:, 10].copy()
+        last_q = None
         for s in range(0, n_seg, B):
             e = min(s + B, n_seg)
-            if seed_q is None:
-                j = tree.query(p_star[s:e], k=1)[1]
-                seed_q = qsub[j][:, :10].copy(); seed_pz = qsub[j][:, 10].copy()
-            else:
-                seed_q = np.repeat(last_q[None], e - s, 0)
-                seed_pz = np.full(e - s, (pb_band[0] + pb_band[1]) / 2 if pb_band else cfg["pz"])
+            sq = seed_q[s:e].copy()
+            spz = seed_pz[s:e].copy()
             pb = None
             if pb_band:
                 pb = np.tile(np.array(pb_band, float), (e - s, 1))
-            qf, pf, e1, e2, cv = P03.batch_ik(seed_q.copy(), seed_pz.copy(),
+            qf, pf, e1, e2, cv = P03.batch_ik(sq.copy(), spz.copy(),
                                               p_star[s:e], d_star[s:e], "stand",
                                               iters=220, pb=pb)
             for k in range(e - s):
                 if not cv[k]:
                     continue
-                if last_q is not None and np.abs(qf[k] - last_q).max() > 0.6:
-                    continue                   # 跳支: 丢弃, 维持单支流形
+                if np.abs(qf[k] - sq[k]).max() > 0.9:
+                    continue                   # 跳支: 与本点种子(工作区网格解)差太大
                 Q[s + k], PZ[s + k], OK[s + k] = qf[k], pf[k], True
                 last_q = qf[k]
         P_all.append(p_star[OK]); D_all.append(d_star[OK])
@@ -148,38 +232,52 @@ def predict(net, X, qm, qs, xm, xs, dev):
 
 def evaluate(P03, net, qm, qs, xm, xs, dev, cfg):
     """真实轨迹目标(G1W_TRAJ 可指定): NN种子 vs MC种子 收敛率@小iters (提速证据)."""
+    # 腕平面x(=NN输入第0维)按**本机器人**的站位/腕距解析, 不用G1默认值:
+    # 天工3 若用G1的 0.74-0.40=0.34m, 与训练带(0.46~0.54)差0.12~0.20m -> 分布外, 收敛率无意义
+    d_robot, d_wrist, d_src = _resolve_stance(P03, cfg)
+    x_w = d_robot - d_wrist
+    _band = cfg.get("x")
+    print(f"[评估] 腕平面x={x_w:.3f}m (d_robot={d_robot:.3f} 来源 {d_src}, "
+          f"d_wrist={d_wrist:.3f}); 训练带x={_band}")
+    if _band and not (_band[0] - 0.03 <= x_w <= _band[1] + 0.03):
+        print(f"[评估][警告] 腕平面x={x_w:.3f} 超出训练带{_band}±0.03: "
+              f"NN被问到分布外输入, 下面的收敛率不可用于该机器人")
     try:
-        tz = np.load(os.environ.get("G1W_TRAJ",
+        with np.load(os.environ.get("G1W_TRAJ",
                                     os.path.join(BASE, "output", "trajectory.npz")),
-                     allow_pickle=True)
-        d = tz["axis"].astype(float)
-        if cfg is ROBOT_CFG["g1"]:
-            p_rel = np.column_stack([                  # 旧口径: 世界系 rob_xyz 换算
-                tz["rob_xyz"][:, 0] - (P03.X_FACE - P03.D_ROBOT),
-                tz["rob_y_r"].astype(float),
-                tz["rob_z"].astype(float)])
-        else:
-            p_rel = np.column_stack([                  # 与03同约定: x=腕平面, z=离地高
-                np.full(len(d), P03.D_ROBOT - P03.D_WRIST),
-                tz["rob_y_r"].astype(float),
-                tz["rob_z"].astype(float)])
+                     allow_pickle=True) as tz:
+            d = tz["axis"].astype(float)
+            if cfg is ROBOT_CFG["g1"]:
+                p_rel = np.column_stack([              # 旧口径: 世界系 rob_xyz 换算
+                    tz["rob_xyz"][:, 0] - (P03.X_FACE - d_robot),
+                    tz["rob_y_r"].astype(float),
+                    tz["rob_z"].astype(float)])
+            else:
+                p_rel = np.column_stack([              # 与03同约定: x=腕平面, z=离地高
+                    np.full(len(d), x_w),
+                    tz["rob_y_r"].astype(float),
+                    tz["rob_z"].astype(float)])
         assert len(p_rel) == len(d) > 10
     except Exception as e:
         print(f"[评估] trajectory.npz 不可用({e}), 跳过真实轨迹评估"); return None
-    ws = np.load(os.environ.get("G1W_WS", os.path.join(BASE, "output", cfg["ws"])), allow_pickle=True)
-    qsub = np.concatenate([ws[f"right_{m}_y60_qsub"].astype(float)
-                           for m in ("stand", "crouch")], 0)
-    from scipy.spatial import cKDTree
+    with np.load(os.environ.get("G1W_WS", os.path.join(BASE, "output", cfg["ws"])),
+                 allow_pickle=True) as ws:
+        qsub = np.concatenate([ws[f"right_{m}_y60_qsub"].astype(float)
+                               for m in ("stand", "crouch")], 0)
     res = {}
     pb_bands = cfg.get("pb_bands")          # dual 轨迹: 蹲/站段目标各用对应骨盆带评估
     q_nn = predict(net, np.column_stack([p_rel, d]), qm, qs, xm, xs, dev)
+    # 骨盆带是循环不变量(与 iters 无关): 提到循环外算一次
+    if pb_bands:
+        # 逐样本骨盆带+带中点种子(z<=带的分界用蹲带, 否则站带; 目标z超过最后一段时
+        # 用最后一段兜底, 不再让 next() 抛 StopIteration 中止 main)
+        _dflt = pb_bands[-1][1]
+        pb = np.array([next((b for zm, b in pb_bands if z <= zm), _dflt)
+                       for z in p_rel[:, 2]], float)
+        pzs = pb.mean(1)
+    else:
+        pb, pzs = None, np.full(len(q_nn), cfg["pz"])
     for it in (10, 30, 60):
-        if pb_bands:
-            # 逐样本骨盆带+带中点种子(z<带的分界用蹲带, 否则站带)
-            pb = np.array([next(b for zm, b in pb_bands if z <= zm) for z in p_rel[:, 2]])
-            pzs = pb.mean(1)
-        else:
-            pb, pzs = None, np.full(len(q_nn), cfg["pz"])
         _, _, _, _, cv_nn = P03.batch_ik(q_nn.copy(), pzs, p_rel, d, "stand",
                                          iters=it, pb=pb)
         sel = np.random.default_rng(0).choice(len(qsub), len(p_rel))
@@ -305,7 +403,15 @@ def evaluate_universal(P03, net, qm, qs, xm, xs, dev):
         print("[评估] 无 trajectory.npz, 跳过"); return None
     t = np.load(tp, allow_pickle=True)
     d = t["axis"].astype(float)
-    p_rel = np.column_stack([np.full(len(d), P03.D_ROBOT - P03.D_WRIST),
+    # 通用模型只支持 g1, 腕平面x按 g1 站位/腕距解析(带外会告警)
+    _d_robot, _d_wrist, _dsrc = _resolve_stance(P03, ROBOT_CFG["g1"])
+    _x_w = _d_robot - _d_wrist
+    print(f"[评估] 通用模型(g1) 腕平面x={_x_w:.3f}m (d_robot={_d_robot:.3f} 来源 {_dsrc}, "
+          f"d_wrist={_d_wrist:.3f}); 训练带x={ROBOT_CFG['g1']['x']}")
+    if not (ROBOT_CFG["g1"]["x"][0] - 0.03 <= _x_w <= ROBOT_CFG["g1"]["x"][1] + 0.03):
+        print(f"[评估][警告] 腕平面x={_x_w:.3f} 超出训练带{ROBOT_CFG['g1']['x']}±0.03, "
+              f"下面的收敛率仅供参考")
+    p_rel = np.column_stack([np.full(len(d), _x_w),
                              t["rob_y_r"].astype(float), t["rob_z"].astype(float)])
     zone = t["zone"].astype(str) if "zone" in t.files else np.array(["stand"] * len(d))
     kind = t["kind"].astype(str)
@@ -313,10 +419,10 @@ def evaluate_universal(P03, net, qm, qs, xm, xs, dev):
                    else P03.PELVIS_RANGE[z] for k, z in zip(kind, zone)], float)
     pz_cond = t["pelvis"].astype(float)                 # 条件=规划解的骨盆
     rp = np.full(len(d), _default_rp())
-    ws = np.load(os.environ.get("G1W_WS", os.path.join(BASE, "output", "g1_workspace.npz")),
-                 allow_pickle=True)
-    qsub_all = np.vstack([ws[f"right_{m}_y60_qsub"].astype(float)
-                          for m in ("stand", "crouch")])
+    with np.load(os.environ.get("G1W_WS", os.path.join(BASE, "output", "g1_workspace.npz")),
+                 allow_pickle=True) as ws:
+        qsub_all = np.vstack([ws[f"right_{m}_y60_qsub"].astype(float)
+                              for m in ("stand", "crouch")])
 
     def _run(tag, p_r, dd, pb_, pz_, rp_):
         with torch.no_grad():
@@ -369,7 +475,7 @@ def main():
                     help="V2 通用大模型: 8维条件输入(骨盆+腰限), 一次覆盖全档×站/蹲/过渡")
     a = ap.parse_args()
     dev = "cuda" if __import__("torch").cuda.is_available() else "cpu"
-    P03 = load_plan03()
+    P03 = load_plan03(a.robot)
     rng = np.random.default_rng(7)
     if a.universal:
         if a.robot != "g1":
@@ -407,8 +513,8 @@ def main():
                                f"输入8维=[p(3,世界z),d(3),pelvis,rp], 隐层{len(Ws)-1}×512; "
                                "换蹲姿地板/站位/腰限档无需重训"),
                      eval=ev, model=out)
-        json.dump(stats, open(out.replace(".npz", "_stats.json"), "w", encoding="utf8"),
-                  ensure_ascii=False, indent=1)
+        with open(out.replace(".npz", "_stats.json"), "w", encoding="utf8") as _f:
+            json.dump(stats, _f, ensure_ascii=False, indent=1)
         print(f"[部署] {out}\n[部署] 统计 {out.replace('.npz','_stats.json')}")
         return
     cfg = ROBOT_CFG.get(a.robot)
@@ -441,8 +547,8 @@ def main():
     os.replace(tmp, out)            # 原子替换: 并发读取(03/05 hook)永不读半截文件
     stats = dict(robot=a.robot, n_data=int(len(Q)), epochs=a.epochs,
                  eval=ev, model=out)
-    json.dump(stats, open(out.replace(".npz", "_stats.json"), "w", encoding="utf8"),
-              ensure_ascii=False, indent=1)
+    with open(out.replace(".npz", "_stats.json"), "w", encoding="utf8") as _f:
+        json.dump(stats, _f, ensure_ascii=False, indent=1)
     print(f"[部署] {out}\n[部署] 统计 {out.replace('.npz','_stats.json')}")
 
 
